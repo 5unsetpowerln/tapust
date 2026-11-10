@@ -7,6 +7,13 @@
 //! rows, styles and dirty marks.
 
 pub mod cell;
+mod grid;
+mod palette;
+mod parser;
+mod style;
+mod term;
+#[cfg(test)]
+mod tests;
 
 pub use cell::{Attrs, Cell, Color, Style, StyleId, Underline, Width};
 
@@ -32,7 +39,7 @@ pub struct Palette {
 impl Default for Palette {
     /// xterm's 256 colors with a dark default foreground/background.
     fn default() -> Palette {
-        todo!()
+        palette::default_palette()
     }
 }
 
@@ -123,119 +130,128 @@ impl Dirty {
 
 /// The terminal: parser state plus the primary and alternate screens.
 pub struct Terminal {
-    // Implementation-defined.
+    parser: parser::Parser,
+    term: term::Term,
 }
 
 impl Terminal {
     /// A terminal with the given viewport size and at most
     /// `scrollback_lines` lines of scrollback on the primary screen.
     pub fn new(cols: u16, rows: u16, scrollback_lines: usize) -> Terminal {
-        let _ = (cols, rows, scrollback_lines);
-        todo!()
+        Terminal {
+            parser: parser::Parser::new(),
+            term: term::Term::new(cols.max(1) as usize, rows.max(1) as usize, scrollback_lines),
+        }
     }
 
     /// Parses PTY output and applies it. Escape and UTF-8 sequences may be
     /// split across calls.
     pub fn feed(&mut self, bytes: &[u8]) {
-        let _ = bytes;
-        todo!()
+        self.parser.advance(&mut self.term, bytes);
     }
 
     /// Resizes the viewport, reflowing the primary screen and its scrollback
     /// with the soft-wrap marks (the alternate screen is truncated or padded).
     /// Marks every row dirty.
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        let _ = (cols, rows);
-        todo!()
+        self.term.resize(cols.max(1) as usize, rows.max(1) as usize);
     }
 
     pub fn cols(&self) -> u16 {
-        todo!()
+        self.term.cols as u16
     }
 
     pub fn rows(&self) -> u16 {
-        todo!()
+        self.term.rows as u16
     }
 
     /// The cells of viewport row `y` (0 = top) with the scrollback view
     /// offset applied; exactly `cols()` cells.
     pub fn row(&self, y: u16) -> &[Cell] {
-        let _ = y;
-        todo!()
+        self.term.grid.slot_cells(self.term.view_slot(y as usize))
     }
 
     /// The grapheme cluster of a cell whose [`Cell::has_grapheme`] is set
     /// (base character followed by its combining codepoints).
     pub fn grapheme(&self, y: u16, x: u16) -> Option<&str> {
-        let _ = (y, x);
-        todo!()
+        let slot = self.term.view_slot(y as usize);
+        if !self.term.grid.slot_cells(slot).get(x as usize)?.has_grapheme() {
+            return None;
+        }
+        self.term.grid.slot_meta(slot).grapheme(x)
     }
 
     /// The style of a style id found in a cell; id 0 is [`Style::DEFAULT`].
     pub fn style(&self, id: StyleId) -> &Style {
-        let _ = id;
-        todo!()
+        self.term.styles.get(id)
     }
 
     pub fn palette(&self) -> &Palette {
-        todo!()
+        &self.term.palette
     }
 
     pub fn cursor(&self) -> Cursor {
-        todo!()
+        let t = &self.term;
+        let vy = t.y + t.view_offset;
+        Cursor {
+            x: t.x as u16,
+            y: vy.min(t.rows - 1) as u16,
+            visible: t.cursor_visible && vy < t.rows,
+            shape: t.cursor_shape,
+            blinking: t.cursor_blink,
+        }
     }
 
     pub fn modes(&self) -> Modes {
-        todo!()
+        Modes { alt_screen: self.term.alt_active, ..self.term.modes }
     }
 
     pub fn dirty(&self) -> &Dirty {
-        todo!()
+        &self.term.dirty
     }
 
     pub fn clear_dirty(&mut self) {
-        todo!()
+        self.term.clear_dirty();
     }
 
     pub fn mark_all_dirty(&mut self) {
-        todo!()
+        self.term.mark_all_dirty();
     }
 
     /// Bytes to send back to the application (DA, DSR, DECRQM, OSC color
     /// queries, ...); the caller writes them to the PTY.
     pub fn take_replies(&mut self) -> Option<Vec<u8>> {
-        todo!()
+        if self.term.replies.is_empty() { None } else { Some(std::mem::take(&mut self.term.replies)) }
     }
 
     /// The window title set with OSC 0/2.
     pub fn title(&self) -> &str {
-        todo!()
+        &self.term.title
     }
 
     /// The working directory reported with OSC 7, as a path.
     pub fn reported_cwd(&self) -> Option<&str> {
-        todo!()
+        self.term.cwd.as_deref()
     }
 
     /// True once for each BEL received since the last call.
     pub fn take_bell(&mut self) -> bool {
-        todo!()
+        std::mem::take(&mut self.term.bell)
     }
 
     /// Scrolls the view into the scrollback by `delta` lines (positive =
     /// into history). New output does not move a scrolled-back view.
     pub fn scroll_view(&mut self, delta: isize) {
-        let _ = delta;
-        todo!()
+        self.term.scroll_view(delta);
     }
 
     /// Lines the view is scrolled back (0 = live).
     pub fn view_offset(&self) -> usize {
-        todo!()
+        self.term.view_offset
     }
 
     /// Lines currently stored in the primary screen's scrollback.
     pub fn history_len(&self) -> usize {
-        todo!()
+        self.term.primary().hist_len()
     }
 }
