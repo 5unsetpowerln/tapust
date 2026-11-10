@@ -20,10 +20,9 @@ use crate::compose;
 use crate::frame::{BOLD, Frame, FrameCell, FrameCursor, UNDERLINE};
 use crate::input;
 use crate::pty::{PaneIo, Pty};
+use crate::theme;
 use crate::window::GlWindow;
 
-const FONT_FAMILY: &str = "monospace";
-const FONT_POINTS: f32 = 12.0;
 const SCROLLBACK: usize = 10_000;
 /// How often foreground process names are checked (tmux `NAME_INTERVAL`).
 const NAME_INTERVAL: Duration = Duration::from_millis(500);
@@ -86,7 +85,7 @@ fn host_name() -> String {
 
 impl App {
     pub fn new(proxy: EventLoopProxy<UserEvent>, command: Option<Vec<String>>) -> App {
-        let palette = term::Palette::default();
+        let palette = theme::palette();
         let default_bg = compose::resolve(term::Color::Default, &palette, palette.background);
         App {
             proxy,
@@ -171,7 +170,9 @@ impl App {
             None => Pty::spawn(cols, rows, cell, cwd)?,
         };
         let proxy = self.proxy.clone();
-        let io = PaneIo::start(pty, term::Terminal::new(cols, rows, SCROLLBACK), move || {
+        let mut terminal = term::Terminal::new(cols, rows, SCROLLBACK);
+        terminal.set_default_palette(self.palette.clone());
+        let io = PaneIo::start(pty, terminal, move || {
             let _ = proxy.send_event(UserEvent::Pane(id));
         })?;
         let session = self.session.as_mut().expect("session");
@@ -361,7 +362,7 @@ impl ApplicationHandler<UserEvent> for App {
         if self.window.is_some() {
             return;
         }
-        let mut window = match GlWindow::new(event_loop, FONT_FAMILY, FONT_POINTS) {
+        let mut window = match GlWindow::new(event_loop) {
             Ok(window) => window,
             Err(err) => {
                 eprintln!("tapust: cannot create the window: {err}");

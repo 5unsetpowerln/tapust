@@ -5,6 +5,7 @@ mod frame;
 mod input;
 mod pty;
 mod renderer;
+mod theme;
 mod window;
 
 use std::error::Error;
@@ -19,6 +20,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some((flag, rest)) if flag == "-e" && !rest.is_empty() => Some(rest.to_vec()),
         Some(_) => return Err("usage: tapust [-e PROGRAM [ARGS...]]".into()),
     };
+    font::register_embedded_fonts()?;
     let event_loop = EventLoop::<app::UserEvent>::with_user_event().build()?;
     let mut app = app::App::new(event_loop.create_proxy(), command);
     event_loop.run_app(&mut app)?;

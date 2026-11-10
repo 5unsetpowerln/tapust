@@ -328,14 +328,10 @@ impl Renderer {
         (self.fonts.cell_width, self.fonts.cell_height)
     }
 
-    /// Sets the drawable size in pixels and centers a grid of `cols x rows`.
-    pub fn resize(&mut self, width: u32, height: u32, cols: u16, rows: u16) {
+    /// Sets the drawable size in pixels and the padding before the grid's top-left corner.
+    pub fn resize(&mut self, width: u32, height: u32, pad: u32) {
         self.viewport = (width.max(1), height.max(1));
-        let (cw, ch) = self.cell_size();
-        self.padding = (
-            ((width as f32 - cols as f32 * cw as f32) / 2.0).max(0.0).floor(),
-            ((height as f32 - rows as f32 * ch as f32) / 2.0).max(0.0).floor(),
-        );
+        self.padding = (pad as f32, pad as f32);
         unsafe { self.gl.viewport(0, 0, width as i32, height as i32) };
     }
 

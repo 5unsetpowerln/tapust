@@ -1,9 +1,51 @@
 //! Font loading and rasterization (FreeType and fontconfig through crossfont).
 
+use std::ffi::CString;
+use std::io::{self, Write};
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+
 use crossfont::{
     BitmapBuffer, FontDesc, FontKey, GlyphKey, Rasterize, RasterizedGlyph, Rasterizer, Size, Slant,
     Style, Weight,
 };
+
+/// ghostty's default fonts, bundled: JetBrains Mono 2.304 (OFL) and Symbols
+/// Nerd Font 3.4.0 (MIT).
+const EMBEDDED: [(&str, &[u8]); 5] = [
+    ("JetBrainsMono-Regular", include_bytes!("../fonts/JetBrainsMono-Regular.ttf")),
+    ("JetBrainsMono-Bold", include_bytes!("../fonts/JetBrainsMono-Bold.ttf")),
+    ("JetBrainsMono-Italic", include_bytes!("../fonts/JetBrainsMono-Italic.ttf")),
+    ("JetBrainsMono-BoldItalic", include_bytes!("../fonts/JetBrainsMono-BoldItalic.ttf")),
+    ("SymbolsNerdFont-Regular", include_bytes!("../fonts/SymbolsNerdFont-Regular.ttf")),
+];
+
+#[link(name = "fontconfig")]
+unsafe extern "C" {
+    fn FcConfigAppFontAddFile(config: *mut libc::c_void, file: *const libc::c_uchar) -> libc::c_int;
+}
+
+/// Makes the bundled fonts visible to fontconfig, and so to crossfont,
+/// without writing them to disk: each font lives in a memfd that stays open
+/// for the life of the process and is added as an application font through
+/// its `/proc/self/fd` path.
+pub fn register_embedded_fonts() -> io::Result<()> {
+    for (name, data) in EMBEDDED {
+        let name = CString::new(name).expect("font name");
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        if fd == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        file.write_all(data)?;
+        let path = CString::new(format!("/proc/self/fd/{fd}")).expect("path");
+        if unsafe { FcConfigAppFontAddFile(std::ptr::null_mut(), path.as_ptr().cast()) } == 0 {
+            return Err(io::Error::other(format!("fontconfig rejected the bundled font {name:?}")));
+        }
+        // fontconfig and FreeType open the font by this path later; keep it open.
+        let _ = file.into_raw_fd();
+    }
+    Ok(())
+}
 
 /// Index of one of the four faces: regular, bold, italic, bold italic.
 pub type Face = usize;
