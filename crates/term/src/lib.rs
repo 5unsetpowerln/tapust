@@ -218,6 +218,14 @@ impl Terminal {
         self.term.mark_all_dirty();
     }
 
+    /// Sets the configured colors: the current palette and what OSC
+    /// 104/110/111 and RIS reset to. Marks every row dirty.
+    pub fn set_default_palette(&mut self, palette: Palette) {
+        self.term.palette = palette.clone();
+        self.term.base_palette = palette;
+        self.term.mark_all_dirty();
+    }
+
     /// Bytes to send back to the application (DA, DSR, DECRQM, OSC color
     /// queries, ...); the caller writes them to the PTY.
     pub fn take_replies(&mut self) -> Option<Vec<u8>> {

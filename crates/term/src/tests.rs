@@ -1057,3 +1057,19 @@ fn dirty_rows() {
     feed(&mut t, "\x1b[1;1Hz");
     assert!(t.dirty().is_dirty(1) && !t.dirty().is_dirty(0));
 }
+
+#[test]
+fn configured_palette_survives_resets() {
+    let mut t = Terminal::new(10, 3, 0);
+    let mut configured = Palette::default();
+    configured.foreground = Rgb { r: 1, g: 2, b: 3 };
+    configured.indexed[1] = Rgb { r: 4, g: 5, b: 6 };
+    t.set_default_palette(configured.clone());
+    assert_eq!(*t.palette(), configured);
+    t.feed(b"\x1b]4;1;rgb:ff/ff/ff\x07\x1b]10;rgb:00/00/00\x07");
+    assert_ne!(*t.palette(), configured);
+    t.feed(b"\x1b]104\x07\x1b]110\x07");
+    assert_eq!(*t.palette(), configured);
+    t.feed(b"\x1b]4;1;rgb:ff/ff/ff\x07\x1bc");
+    assert_eq!(*t.palette(), configured);
+}

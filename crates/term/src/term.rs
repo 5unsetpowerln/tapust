@@ -147,6 +147,8 @@ pub(crate) struct Term {
     pub cwd: Option<String>,
     pub bell: bool,
     pub palette: Palette,
+    /// What OSC 104/110/111 and RIS reset the palette to.
+    pub base_palette: Palette,
     last_char: u32,
 }
 
@@ -192,6 +194,7 @@ impl Term {
             cwd: None,
             bell: false,
             palette: default_palette(),
+            base_palette: default_palette(),
             last_char: 0,
         };
         t.mark_all_dirty();
@@ -937,7 +940,10 @@ impl Term {
         let replies = std::mem::take(&mut self.replies);
         let cwd = self.cwd.take();
         let bell = self.bell;
+        let base = std::mem::take(&mut self.base_palette);
         *self = Term::new(self.cols, self.rows, hist);
+        self.palette = base.clone();
+        self.base_palette = base;
         self.replies = replies;
         self.cwd = cwd;
         self.bell = bell;
@@ -1260,7 +1266,7 @@ impl Term {
                 }
             }
             104 => {
-                let def = default_palette();
+                let def = self.base_palette.clone();
                 if rest.is_empty() {
                     self.palette.indexed = def.indexed;
                 } else {
@@ -1296,8 +1302,8 @@ impl Term {
                     }
                 }
             }
-            110 => self.palette.foreground = default_palette().foreground,
-            111 => self.palette.background = default_palette().background,
+            110 => self.palette.foreground = self.base_palette.foreground,
+            111 => self.palette.background = self.base_palette.background,
             112 => self.palette.cursor = None,
             _ => {}
         }
