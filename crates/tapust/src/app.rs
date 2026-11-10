@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use mux::{Effect, KeyResult, Overlay, PaneId, Session, View};
+use mux::{ConfirmTarget, Effect, KeyResult, Overlay, PaneId, Session, View};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
@@ -64,6 +64,9 @@ pub struct App {
     size: winit::dpi::PhysicalSize<u32>,
     tab_bar: bool,
     title: String,
+    /// Panes showing ghostty's `cols x rows` overlay after a resize, until when.
+    resize_overlays: HashMap<PaneId, Instant>,
+    started: Instant,
     /// Whether the focused cursor is in the visible half of its blink.
     blink_on: bool,
     next_blink: Instant,
@@ -93,6 +96,8 @@ impl App {
             size: winit::dpi::PhysicalSize::new(1, 1),
             tab_bar: false,
             title: String::new(),
+            resize_overlays: HashMap::new(),
+            started: Instant::now(),
             blink_on: true,
             next_blink: Instant::now() + theme::BLINK,
         }
@@ -125,6 +130,9 @@ impl App {
                     if let (Some(p), Some(window)) = (self.panes.get(&pane), &self.window) {
                         p.io.shared.term.lock().resize(cols, rows);
                         let _ = p.io.pty.resize(cols, rows, window.renderer.cell_size());
+                        if self.started.elapsed() >= theme::RESIZE_OVERLAY_DELAY {
+                            self.resize_overlays.insert(pane, Instant::now() + theme::RESIZE_OVERLAY);
+                        }
                     }
                 }
                 Effect::Destroy { pane } => {
@@ -215,14 +223,19 @@ impl App {
     /// A tab's title as ghostty shows it: the active pane's terminal title,
     /// else the application name, with a magnifier while zoomed.
     fn tab_title(&self, window: &mux::WindowInfo) -> String {
-        let title = window
-            .panes
+        // A name given with rename-window overrides the title, like ghostty's
+        // "Change Tab Title"; a blank one restores the default.
+        let renamed = Some(window.name.as_str()).filter(|n| window.renamed && !n.is_empty());
+        let title = renamed.or_else(|| {
+            window
+                .panes
             .iter()
             .find(|p| p.active)
             .and_then(|p| self.panes.get(&p.pane))
-            .map(|p| p.title.as_str())
-            .filter(|t| !t.is_empty())
-            .unwrap_or("tapust");
+                .map(|p| p.title.as_str())
+                .filter(|t| !t.is_empty())
+        });
+        let title = title.unwrap_or("tapust");
         if window.zoomed { format!("\u{1f50d} {title}") } else { title.to_owned() }
     }
 
@@ -269,29 +282,107 @@ impl App {
         }
     }
 
-    /// A centered dialog-like box for a prompt or message.
+    /// Prompts become libadwaita alert dialogs as ghostty shows them, and
+    /// messages become a toast. The keys stay tmux's (`y` confirms).
     fn overlay_shapes(&mut self, overlay: &Overlay, out: &mut Vec<Shape>) {
-        let (line, caret) = match overlay {
-            Overlay::Confirm { prompt, .. } => (prompt.trim_end().to_owned(), None),
-            Overlay::Input { prompt, text, cursor } => {
-                (format!("{prompt}{text}"), Some(prompt.chars().chain(text.chars()).take(prompt.chars().count() + cursor).collect::<String>()))
-            }
-            Overlay::Message(text) => (text.clone(), None),
-        };
         let window = self.window.as_mut().expect("window");
         let scale = window.window.scale_factor();
         let px = |v: f64| (v * scale).round() as i32;
-        let text_w = window.renderer.text_width(&line, UI);
-        let line_h = window.renderer.fonts.ui_line_height;
-        let (w, h) = (text_w + px(48.0), line_h + px(32.0));
-        let (x, y) = ((self.size.width as i32 - w) / 2, (self.size.height as i32 - h) / 2);
-        out.push(Shape::Rect { x, y, w, h, color: theme::adw::DIALOG_BG, radius: px(12.0) as u16, ring: false });
-        out.push(Shape::Rect { x, y, w, h, color: theme::adw::BORDER, radius: px(12.0) as u16, ring: true });
-        out.push(Shape::Text { x: x + px(24.0), y: y + px(16.0), text: line, color: theme::adw::FG, face: UI });
-        if let Some(before) = caret {
-            let cx = x + px(24.0) + window.renderer.text_width(&before, UI);
-            out.push(Shape::Rect { x: cx, y: y + px(16.0), w: 1.max(px(1.0)), h: line_h, color: theme::adw::FG, radius: 0, ring: false });
+        let (ww, wh) = (self.size.width as i32, self.size.height as i32);
+        let r = &mut window.renderer;
+        let line_h = r.fonts.ui_line_height;
+        if let Overlay::Message(text) = overlay {
+            let (w, h) = (r.text_width(text, UI) + px(36.0), line_h + px(24.0));
+            let (x, y) = ((ww - w) / 2, wh - h - px(12.0));
+            out.push(Shape::Rect { x, y, w, h, color: theme::adw::TOAST_BG, radius: (h / 2) as u16, ring: false });
+            out.push(Shape::Rect { x, y, w, h, color: theme::adw::BORDER, radius: (h / 2) as u16, ring: true });
+            out.push(Shape::Text { x: x + px(18.0), y: y + px(12.0), text: text.clone(), color: theme::adw::FG, face: UI });
+            return;
         }
+        let (heading, body, entry, responses) = match overlay {
+            Overlay::Confirm { target: ConfirmTarget::Pane, .. } => (
+                "Close Split?",
+                "The currently running process in this split will be terminated.",
+                None,
+                [("Cancel", theme::adw::BUTTON), ("Close", theme::adw::DESTRUCTIVE)],
+            ),
+            Overlay::Confirm { target: ConfirmTarget::Window, .. } => (
+                "Close Tab?",
+                "All terminal sessions in this tab will be terminated.",
+                None,
+                [("Cancel", theme::adw::BUTTON), ("Close", theme::adw::DESTRUCTIVE)],
+            ),
+            Overlay::Input { prompt, text, cursor } => (
+                if prompt.contains("session") { "Rename Session" } else { "Change Tab Title" },
+                "Leave blank to restore the default title.",
+                Some((text.clone(), *cursor)),
+                [("Cancel", theme::adw::BUTTON), ("OK", theme::adw::SUGGESTED)],
+            ),
+            Overlay::Message(_) => unreachable!(),
+        };
+        // Word-wrap the body to the dialog's 300px content width.
+        let (dialog_w, side) = (px(300.0), px(24.0));
+        let mut lines: Vec<String> = Vec::new();
+        for word in body.split(' ') {
+            match lines.last_mut() {
+                Some(line) if r.text_width(&format!("{line} {word}"), UI) <= dialog_w - 2 * side => {
+                    line.push(' ');
+                    line.push_str(word);
+                }
+                _ => lines.push(word.to_owned()),
+            }
+        }
+        let heading_h = line_h * 136 / 100;
+        let entry_h = if entry.is_some() { px(34.0) + px(12.0) } else { 0 };
+        let message_h = px(32.0) + heading_h + px(12.0) + lines.len() as i32 * line_h + entry_h + px(9.0);
+        let button_h = line_h.max(px(24.0)) + px(20.0);
+        let dialog_h = message_h + px(12.0) + button_h + px(24.0);
+        let (x, y) = ((ww - dialog_w) / 2, (wh - dialog_h) / 2);
+        out.push(Shape::Rect { x: 0, y: 0, w: ww, h: wh, color: theme::adw::DIMMING, radius: 0, ring: false });
+        out.push(Shape::Rect { x, y, w: dialog_w, h: dialog_h, color: theme::adw::DIALOG_BG, radius: px(18.0) as u16, ring: false });
+        let center = |r: &mut crate::renderer::Renderer, text: &str, face| x + (dialog_w - r.text_width(text, face)) / 2;
+        let mut ty = y + px(32.0);
+        out.push(Shape::Text { x: center(r, heading, UI_BOLD), y: ty, text: heading.to_owned(), color: theme::adw::FG, face: UI_BOLD });
+        ty += heading_h + px(12.0);
+        for line in lines {
+            out.push(Shape::Text { x: center(r, &line, UI), y: ty, color: theme::adw::FG, face: UI, text: line });
+            ty += line_h;
+        }
+        if let Some((text, cursor)) = entry {
+            ty += px(12.0);
+            let (ex, ew, eh) = (x + side, dialog_w - 2 * side, px(34.0));
+            out.push(Shape::Rect { x: ex, y: ty, w: ew, h: eh, color: theme::adw::BUTTON, radius: px(6.0) as u16, ring: false });
+            let tx = ex + px(9.0);
+            let before: String = text.chars().take(cursor).collect();
+            let caret_x = tx + r.text_width(&before, UI);
+            out.push(Shape::Text { x: tx, y: ty + (eh - line_h) / 2, text, color: theme::adw::FG, face: UI });
+            out.push(Shape::Rect { x: caret_x, y: ty + (eh - line_h) / 2, w: px(1.0).max(1), h: line_h, color: theme::adw::FG, radius: 0, ring: false });
+        }
+        let by = y + message_h + px(12.0);
+        let bw = (dialog_w - 2 * side - px(12.0)) / 2;
+        for (i, (label, color)) in responses.into_iter().enumerate() {
+            let bx = x + side + i as i32 * (bw + px(12.0));
+            out.push(Shape::Rect { x: bx, y: by, w: bw, h: button_h, color, radius: px(12.0) as u16, ring: false });
+            let lx = bx + (bw - r.text_width(label, UI_BOLD)) / 2;
+            out.push(Shape::Text { x: lx, y: by + (button_h - line_h) / 2, text: label.to_owned(), color: theme::adw::FG, face: UI_BOLD });
+        }
+    }
+
+    /// ghostty's resize overlay: `cols x rows` centered in a pane that just changed size.
+    fn resize_overlay_shapes(&mut self, rect: mux::Rect, cols: u16, rows: u16, out: &mut Vec<Shape>) {
+        let window = self.window.as_mut().expect("window");
+        let scale = window.window.scale_factor();
+        let px = |v: f64| (v * scale).round() as i32;
+        let (cw, ch) = window.renderer.cell_size();
+        let (ox, oy) = window.renderer.grid_origin();
+        let text = format!("{cols} x {rows}");
+        let line_h = window.renderer.fonts.ui_line_height;
+        let (w, h) = (window.renderer.text_width(&text, UI) + px(16.0), line_h + px(8.0));
+        let cx = ox + rect.x as i32 * cw as i32 + (rect.w as i32 * cw as i32 - w) / 2;
+        let cy = oy + rect.y as i32 * ch as i32 + (rect.h as i32 * ch as i32 - h) / 2;
+        out.push(Shape::Rect { x: cx, y: cy, w, h, color: theme::adw::WINDOW_BG, radius: px(6.0) as u16, ring: false });
+        out.push(Shape::Rect { x: cx, y: cy, w, h, color: theme::RESIZE_OVERLAY_OUTLINE, radius: px(6.0) as u16, ring: true });
+        out.push(Shape::Text { x: cx + px(8.0), y: cy + px(4.0), text, color: theme::adw::FG, face: UI });
     }
 
     fn redraw(&mut self) {
@@ -332,6 +423,13 @@ impl App {
         shapes.clear();
         if self.tab_bar {
             self.tab_bar_shapes(&mut shapes);
+        }
+        let now = Instant::now();
+        self.resize_overlays.retain(|_, until| *until > now);
+        for pv in &view.panes {
+            if self.resize_overlays.contains_key(&pv.pane) {
+                self.resize_overlay_shapes(pv.rect, pv.rect.w, pv.rect.h, &mut shapes);
+            }
         }
         if let Some(overlay) = &view.overlay {
             self.overlay_shapes(overlay, &mut shapes);
@@ -425,7 +523,7 @@ impl ApplicationHandler<UserEvent> for App {
             self.next_blink = now + theme::BLINK;
             self.request_redraw();
         }
-        if self.session.as_ref().map(|s| s.generation()) != before {
+        if self.session.as_ref().map(|s| s.generation()) != before || self.resize_overlays.values().any(|&u| u <= now) {
             self.request_redraw();
         }
     }
@@ -433,6 +531,9 @@ impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let deadline = self.session.as_ref().and_then(|s| s.deadline());
         let mut wake = deadline.map_or(self.next_names, |d| d.min(self.next_names));
+        if let Some(&until) = self.resize_overlays.values().min() {
+            wake = wake.min(until);
+        }
         if self.focused {
             wake = wake.min(self.next_blink);
         }

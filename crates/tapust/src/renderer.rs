@@ -351,6 +351,11 @@ impl Renderer {
         }
     }
 
+    /// The grid's top-left corner in window pixels.
+    pub fn grid_origin(&self) -> (i32, i32) {
+        (self.padding.0 as i32, self.padding.1 as i32)
+    }
+
     pub fn cell_size(&self) -> (u32, u32) {
         (self.fonts.cell_width, self.fonts.cell_height)
     }

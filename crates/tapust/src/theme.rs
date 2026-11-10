@@ -52,7 +52,21 @@ pub mod adw {
     pub const SELECTED: [u8; 4] = [0xff, 0xff, 0xff, 26];
     pub const BORDER: [u8; 4] = [0xff, 0xff, 0xff, 38];
     pub const DIALOG_BG: [u8; 4] = [0x36, 0x36, 0x3a, 0xff];
+    /// The window behind a dialog: `shade_color` at twice its alpha.
+    pub const DIMMING: [u8; 4] = [0, 0, 6, 128];
+    /// A plain button or entry: `currentColor` at 10%.
+    pub const BUTTON: [u8; 4] = [0xff, 0xff, 0xff, 26];
+    /// `destructive_bg_color` (red_4) and `accent_bg_color` (blue_3).
+    pub const DESTRUCTIVE: [u8; 4] = [0xc0, 0x1c, 0x28, 0xff];
+    pub const SUGGESTED: [u8; 4] = [0x35, 0x84, 0xe4, 0xff];
+    pub const TOAST_BG: [u8; 4] = [0x50, 0x50, 0x53, 0xff];
+    pub const WINDOW_BG: [u8; 4] = [0x22, 0x22, 0x26, 0xff];
 }
+
+/// ghostty's resize overlay: shown 750 ms, not during the first 250 ms.
+pub const RESIZE_OVERLAY: std::time::Duration = std::time::Duration::from_millis(750);
+pub const RESIZE_OVERLAY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+pub const RESIZE_OVERLAY_OUTLINE: [u8; 4] = [0x55, 0x55, 0x55, 0xff];
 
 /// Tab bar geometry in pixels at scale 1: tabbox padding 6 + tab (26 + 2 * 4) + 6.
 pub const TAB_BAR_HEIGHT: f64 = 46.0;
