@@ -20,11 +20,12 @@ pub(crate) const SPLIT_OVERFLOW: &str =
 pub(crate) const SPREAD_OVERFLOW: &str =
     "can't spread out the layout (tmux 3.6 would hang or overflow the layout)";
 
-pub(crate) fn new_session(cols: u16, rows: u16) -> (Session, Vec<Effect>) {
+pub(crate) fn new_session(cols: u16, rows: u16, status: bool) -> (Session, Vec<Effect>) {
     let mut s = Session {
         name: "0".to_owned(),
         cols,
         rows,
+        status,
         winlinks: BTreeMap::new(),
         curw: 0,
         lastw: Vec::new(),
@@ -126,7 +127,7 @@ impl Session {
 
     /// Whether the client has room for the status line (`CLIENT_STATUSOFF`).
     pub(crate) fn status_lines(&self) -> u32 {
-        u32::from(self.rows > 1)
+        u32::from(self.status && self.rows > 1)
     }
 
     /// The window size the client asks for (clients_calculate_size and

@@ -780,3 +780,32 @@ fn rename_expands_formats() {
     ok(&mut s, Command::RenameWindow("#S-#I-##-#{pane_index}-#Q".to_owned()));
     assert_eq!(s.windows()[0].name, "0-0-#-0-#Q");
 }
+
+#[test]
+fn status_line_off_uses_every_row_and_still_reports_prompts() {
+    use crate::{ConfirmTarget, Effect, Key, KeyCode, KeyResult, Mods, Overlay, Session};
+    let now = std::time::Instant::now();
+    let (mut s, effects) = Session::without_status_line(80, 24);
+    assert_eq!(effects, vec![Effect::Spawn { pane: 0, cols: 80, rows: 24, cwd_of: None }]);
+    assert_eq!(s.view("").overlay, None);
+    let prefix = Key { code: KeyCode::Char('b'), mods: Mods { ctrl: true, ..Mods::default() } };
+    let plain = |c| Key { code: KeyCode::Char(c), mods: Mods::default() };
+    assert_eq!(s.key(prefix, now), KeyResult::Handled(vec![]));
+    s.key(plain('x'), now);
+    assert_eq!(
+        s.view("").overlay,
+        // confirm-before appends a space to the prompt (cmd-confirm-before.c).
+        Some(Overlay::Confirm { prompt: "kill-pane 0? (y/n) ".to_owned(), target: ConfirmTarget::Pane })
+    );
+    s.key(plain('n'), now);
+    assert_eq!(s.view("").overlay, None);
+    s.key(prefix, now);
+    s.key(plain(','), now);
+    match s.view("").overlay {
+        Some(Overlay::Input { prompt, text, cursor }) => {
+            assert_eq!(prompt, "(rename-window) ");
+            assert_eq!(cursor, text.chars().count());
+        }
+        other => panic!("expected a rename prompt, got {other:?}"),
+    }
+}

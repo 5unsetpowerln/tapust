@@ -159,6 +159,26 @@ pub struct View {
     pub status: Vec<StatusCell>,
     /// Cursor column while a prompt is being edited on the status line.
     pub prompt_cursor: Option<u16>,
+    /// The prompt or message on the status line, for clients that show it
+    /// elsewhere (always set while one is active, with or without the status line).
+    pub overlay: Option<Overlay>,
+}
+
+/// A prompt or message the status line would show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Overlay {
+    /// `confirm-before`: answered with `y`; any other key cancels.
+    Confirm { prompt: String, target: ConfirmTarget },
+    /// `command-prompt`: the label, the text being edited and the cursor position in characters.
+    Input { prompt: String, text: String, cursor: usize },
+    /// `display-message` or an error.
+    Message(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmTarget {
+    Pane,
+    Window,
 }
 
 /// A command of the model, named after the tmux command and flags it
@@ -259,6 +279,8 @@ pub struct Session {
     name: String,
     cols: u16,
     rows: u16,
+    /// tmux's `status` option.
+    status: bool,
     /// Winlinks by index; a winlink is identified by its index.
     winlinks: BTreeMap<u32, Window>,
     curw: u32,
@@ -289,7 +311,13 @@ impl Session {
     /// cells (the status line takes the last row). Returns the first pane's
     /// `Spawn` effect.
     pub fn new(cols: u16, rows: u16) -> (Session, Vec<Effect>) {
-        session::new_session(cols, rows)
+        session::new_session(cols, rows, true)
+    }
+
+    /// Like [`Session::new`] with tmux's `status` option off: the windows
+    /// use every row of the client.
+    pub fn without_status_line(cols: u16, rows: u16) -> (Session, Vec<Effect>) {
+        session::new_session(cols, rows, false)
     }
 
     /// The client (GUI window) was resized.
@@ -380,7 +408,7 @@ impl Session {
     pub fn view(&self, clock: &str) -> View {
         let (status, prompt_cursor) = self.status_line(clock);
         if self.dead {
-            return View { panes: Vec::new(), borders: Vec::new(), status, prompt_cursor };
+            return View { panes: Vec::new(), borders: Vec::new(), status, prompt_cursor, overlay: self.overlay() };
         }
         let w = self.cur();
         let panes = w
@@ -389,7 +417,20 @@ impl Session {
             .filter(|p| w.visible(p.id))
             .map(|p| PaneView { pane: p.id, rect: rect_of(p), active: p.id == w.active })
             .collect();
-        View { panes, borders: self.borders(), status, prompt_cursor }
+        View { panes, borders: self.borders(), status, prompt_cursor, overlay: self.overlay() }
+    }
+
+    fn overlay(&self) -> Option<Overlay> {
+        if let Some((text, _)) = &self.message {
+            return Some(Overlay::Message(text.clone()));
+        }
+        let p = self.prompt.as_ref()?;
+        let prompt = format::drawn_text(&self.prompt_text(p));
+        Some(match p.kind {
+            prompt::PromptKind::ConfirmKillPane { .. } => Overlay::Confirm { prompt, target: ConfirmTarget::Pane },
+            prompt::PromptKind::ConfirmKillWindow { .. } => Overlay::Confirm { prompt, target: ConfirmTarget::Window },
+            _ => Overlay::Input { prompt, text: p.buffer.iter().collect(), cursor: p.index },
+        })
     }
 
     /// Runs a command on the current window and pane. Errors are returned
