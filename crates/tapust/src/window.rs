@@ -11,6 +11,7 @@ use glutin::surface::{Surface, SwapInterval, WindowSurface};
 use glutin_winit::{DisplayBuilder, GlWindow as _};
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event_loop::ActiveEventLoop;
+use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::raw_window_handle::HasWindowHandle;
 use winit::window::Window;
 
@@ -36,6 +37,7 @@ impl GlWindow {
     pub fn new(event_loop: &ActiveEventLoop, family: &str, points: f32) -> Result<GlWindow, Box<dyn Error>> {
         let attributes = Window::default_attributes()
             .with_title("tapust")
+            .with_name("tapust", "tapust")
             .with_inner_size(LogicalSize::new(800.0, 500.0));
         let template = ConfigTemplateBuilder::new().with_depth_size(0).with_stencil_size(0);
         let (window, config) = DisplayBuilder::new()
