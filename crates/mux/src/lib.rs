@@ -264,6 +264,8 @@ pub struct PaneInfo {
 pub struct WindowInfo {
     pub index: u32,
     pub name: String,
+    /// The name was set with rename-window, which turns automatic-rename off.
+    pub renamed: bool,
     /// The session's current window (`*`).
     pub active: bool,
     /// The previously current window (`-`).
@@ -449,6 +451,7 @@ impl Session {
             .map(|(&index, w)| WindowInfo {
                 index,
                 name: w.name().to_owned(),
+                renamed: w.fixed_name.is_some(),
                 active: index == self.curw && !self.dead,
                 last: Some(index) == last,
                 zoomed: w.zoomed,
