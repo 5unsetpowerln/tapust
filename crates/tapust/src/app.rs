@@ -17,7 +17,8 @@ use winit::keyboard::ModifiersState;
 use winit::window::WindowId;
 
 use crate::compose;
-use crate::frame::{Dim, Frame, FrameCell, Panel, PanelText};
+use crate::font::{UI, UI_BOLD};
+use crate::frame::{Dim, Frame, FrameCell, Shape};
 use crate::input;
 use crate::pty::{PaneIo, Pty};
 use crate::theme;
@@ -35,7 +36,7 @@ pub enum UserEvent {
 
 struct Pane {
     io: PaneIo<term::Terminal>,
-    /// The title last reported to the session (OSC 0/2, or the host name).
+    /// The terminal title (OSC 0/2) last seen; empty until the program sets one.
     title: String,
 }
 
@@ -54,24 +55,18 @@ pub struct App {
     modifiers: ModifiersState,
     focused: bool,
     cwd: PathBuf,
-    host: String,
     input: Vec<u8>,
     next_names: Instant,
     /// Program for the first pane (`-e`); later panes run the login shell.
     command: Option<Vec<String>>,
     debug: bool,
+    /// The window size in pixels and whether the tab bar is shown.
+    size: winit::dpi::PhysicalSize<u32>,
+    tab_bar: bool,
+    title: String,
     /// Whether the focused cursor is in the visible half of its blink.
     blink_on: bool,
     next_blink: Instant,
-}
-
-fn host_name() -> String {
-    let mut buf = [0u8; 256];
-    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
-        return String::new();
-    }
-    let len = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
-    String::from_utf8_lossy(&buf[..len]).into_owned()
 }
 
 impl App {
@@ -91,11 +86,13 @@ impl App {
             modifiers: ModifiersState::empty(),
             focused: true,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-            host: host_name(),
             input: Vec::new(),
             next_names: Instant::now(),
             command,
             debug: std::env::var_os("TAPUST_DEBUG").is_some(),
+            size: winit::dpi::PhysicalSize::new(1, 1),
+            tab_bar: false,
+            title: String::new(),
             blink_on: true,
             next_blink: Instant::now() + theme::BLINK,
         }
@@ -161,12 +158,24 @@ impl App {
             let _ = proxy.send_event(UserEvent::Pane(id));
         })?;
         let session = self.session.as_mut().expect("session");
-        session.set_pane_title(id, &self.host);
         if let Some(name) = io.pty.foreground_name() {
             session.set_auto_name(id, &name);
         }
-        self.panes.insert(id, Pane { io, title: self.host.clone() });
+        self.panes.insert(id, Pane { io, title: String::new() });
         Ok(())
+    }
+
+    /// Sizes the grid for the window, leaving room for the tab bar while the
+    /// session has two or more windows (ghostty's `window-show-tab-bar = auto`).
+    fn relayout(&mut self) -> bool {
+        let Some(window) = self.window.as_mut() else { return true };
+        let tabs = self.session.as_ref().is_some_and(|s| s.windows().len() > 1);
+        let top = if tabs { window.tab_bar_height() } else { 0 };
+        let (cols, rows) = window.resize(self.size, top);
+        window.window.request_redraw();
+        let changed = tabs != self.tab_bar || (cols, rows) != (self.frame.cols(), self.frame.rows());
+        self.tab_bar = tabs;
+        !changed || self.resize(cols, rows)
     }
 
     fn resize(&mut self, cols: u16, rows: u16) -> bool {
@@ -203,25 +212,86 @@ impl App {
         self.view = Some(view);
     }
 
-    /// A centered panel for a prompt or message (the status line's job in tmux).
-    fn overlay_panel(&self, overlay: &Overlay) -> Panel {
-        let (cw, ch) = self.window.as_ref().expect("window").renderer.cell_size();
-        let (cw, ch) = (cw as i32, ch as i32);
+    /// A tab's title as ghostty shows it: the active pane's terminal title,
+    /// else the application name, with a magnifier while zoomed.
+    fn tab_title(&self, window: &mux::WindowInfo) -> String {
+        let title = window
+            .panes
+            .iter()
+            .find(|p| p.active)
+            .and_then(|p| self.panes.get(&p.pane))
+            .map(|p| p.title.as_str())
+            .filter(|t| !t.is_empty())
+            .unwrap_or("tapust");
+        if window.zoomed { format!("\u{1f50d} {title}") } else { title.to_owned() }
+    }
+
+    /// libadwaita's tab bar: equal-width tabs, the selected one raised.
+    fn tab_bar_shapes(&mut self, out: &mut Vec<Shape>) {
+        let Some(session) = &self.session else { return };
+        let windows = session.windows();
+        let titles: Vec<String> = windows.iter().map(|w| self.tab_title(w)).collect();
+        let window = self.window.as_mut().expect("window");
+        let scale = window.window.scale_factor();
+        let px = |v: f64| (v * scale).round() as i32;
+        let (w, h) = (self.size.width as i32, window.tab_bar_height() as i32);
+        out.push(Shape::Rect { x: 0, y: 0, w, h, color: theme::adw::HEADERBAR_BG, radius: 0, ring: false });
+        out.push(Shape::Rect { x: 0, y: h - 1, w, h: 1, color: theme::adw::HEADERBAR_SHADE, radius: 0, ring: false });
+        let (margin, gap) = (px(theme::TAB_MARGIN), px(theme::TAB_MARGIN));
+        let n = windows.len() as i32;
+        let tab_w = (w - 2 * margin - (n - 1) * gap) / n;
+        let (tab_y, tab_h) = (margin, h - 2 * margin);
+        let radius = px(theme::TAB_RADIUS) as u16;
+        let line_h = window.renderer.fonts.ui_line_height;
+        for (i, (win, title)) in windows.iter().zip(&titles).enumerate() {
+            let x = margin + i as i32 * (tab_w + gap);
+            if win.active {
+                out.push(Shape::Rect { x, y: tab_y, w: tab_w, h: tab_h, color: theme::adw::SELECTED, radius, ring: false });
+                out.push(Shape::Rect { x, y: tab_y, w: tab_w, h: tab_h, color: theme::adw::BORDER, radius, ring: true });
+            } else if i > 0 && !windows[i - 1].active {
+                let sx = x - gap / 2 - 1;
+                out.push(Shape::Rect { x: sx, y: tab_y + px(3.0), w: 1, h: tab_h - px(6.0), color: theme::adw::BORDER, radius: 0, ring: false });
+            }
+            // Ellipsize titles that do not fit, leaving room for the close button.
+            let room = tab_w - px(48.0);
+            let mut text = title.clone();
+            while window.renderer.text_width(&text, UI) > room && text.chars().count() > 1 {
+                text = text.chars().take(text.chars().count() - 2).collect::<String>() + "\u{2026}";
+            }
+            let text_w = window.renderer.text_width(&text, UI);
+            let ty = tab_y + (tab_h - line_h) / 2;
+            out.push(Shape::Text { x: x + (tab_w - text_w) / 2, y: ty, text, color: theme::adw::FG, face: UI });
+            if win.active {
+                let close_w = window.renderer.text_width("\u{00d7}", UI_BOLD);
+                let cx = x + tab_w - px(4.0) - px(24.0) + (px(24.0) - close_w) / 2;
+                out.push(Shape::Text { x: cx, y: ty, text: "\u{00d7}".to_owned(), color: theme::adw::FG, face: UI_BOLD });
+            }
+        }
+    }
+
+    /// A centered dialog-like box for a prompt or message.
+    fn overlay_shapes(&mut self, overlay: &Overlay, out: &mut Vec<Shape>) {
         let (line, caret) = match overlay {
             Overlay::Confirm { prompt, .. } => (prompt.trim_end().to_owned(), None),
-            Overlay::Input { prompt, text, cursor } => (format!("{prompt}{text}"), Some(prompt.chars().count() + cursor)),
+            Overlay::Input { prompt, text, cursor } => {
+                (format!("{prompt}{text}"), Some(prompt.chars().chain(text.chars()).take(prompt.chars().count() + cursor).collect::<String>()))
+            }
             Overlay::Message(text) => (text.clone(), None),
         };
-        let w = (line.chars().count() as i32 + 2) * cw + 16;
-        let h = ch + 16;
-        let x = (self.frame.cols() as i32 * cw - w) / 2;
-        let y = (self.frame.rows() as i32 * ch - h) / 2;
-        let fg = compose::resolve(term::Color::Default, &self.palette, self.palette.foreground);
-        let mut texts = vec![PanelText { x: 8 + cw, y: 8, text: line, color: fg, bold: false }];
-        if let Some(caret) = caret {
-            texts.push(PanelText { x: 8 + cw + caret as i32 * cw, y: 8, text: "\u{258f}".to_owned(), color: fg, bold: false });
+        let window = self.window.as_mut().expect("window");
+        let scale = window.window.scale_factor();
+        let px = |v: f64| (v * scale).round() as i32;
+        let text_w = window.renderer.text_width(&line, UI);
+        let line_h = window.renderer.fonts.ui_line_height;
+        let (w, h) = (text_w + px(48.0), line_h + px(32.0));
+        let (x, y) = ((self.size.width as i32 - w) / 2, (self.size.height as i32 - h) / 2);
+        out.push(Shape::Rect { x, y, w, h, color: theme::adw::DIALOG_BG, radius: px(12.0) as u16, ring: false });
+        out.push(Shape::Rect { x, y, w, h, color: theme::adw::BORDER, radius: px(12.0) as u16, ring: true });
+        out.push(Shape::Text { x: x + px(24.0), y: y + px(16.0), text: line, color: theme::adw::FG, face: UI });
+        if let Some(before) = caret {
+            let cx = x + px(24.0) + window.renderer.text_width(&before, UI);
+            out.push(Shape::Rect { x: cx, y: y + px(16.0), w: 1.max(px(1.0)), h: line_h, color: theme::adw::FG, radius: 0, ring: false });
         }
-        Panel { x, y, w, h, fill: [0x36, 0x36, 0x3a, 0xff], outline: Some([0x55, 0x55, 0x55, 0xff]), texts }
     }
 
     fn redraw(&mut self) {
@@ -254,15 +324,26 @@ impl App {
             if split && !pv.active {
                 self.frame.dims.push(Dim { x: r.x, y: r.y, w: r.w, h: r.h, color: theme::UNFOCUSED_DIM });
             }
-            if !term.title().is_empty() && term.title() != pane.title {
+            if term.title() != pane.title {
                 pane.title = term.title().to_owned();
-                self.session.as_mut().expect("session").set_pane_title(pv.pane, &pane.title);
             }
         }
-        self.frame.panels.clear();
+        let mut shapes = std::mem::take(&mut self.frame.shapes);
+        shapes.clear();
+        if self.tab_bar {
+            self.tab_bar_shapes(&mut shapes);
+        }
         if let Some(overlay) = &view.overlay {
-            let panel = self.overlay_panel(overlay);
-            self.frame.panels.push(panel);
+            self.overlay_shapes(overlay, &mut shapes);
+        }
+        self.frame.shapes = shapes;
+        // The window title follows the active tab, as in ghostty.
+        if let Some(active) = self.session.as_ref().and_then(|s| s.windows().into_iter().find(|w| w.active)) {
+            let title = self.tab_title(&active);
+            if title != self.title {
+                self.window.as_ref().expect("window").window.set_title(&title);
+                self.title = title;
+            }
         }
         self.full = false;
         self.view = Some(view);
@@ -299,7 +380,7 @@ impl App {
                 pane.io.shared.write(&self.input);
             }
             KeyResult::Handled(effects) => {
-                if !self.apply(effects) {
+                if !self.apply(effects) || !self.relayout() {
                     event_loop.exit();
                     return;
                 }
@@ -373,7 +454,8 @@ impl ApplicationHandler<UserEvent> for App {
         if self.debug {
             eprintln!("renderer: {}", window.renderer.info());
         }
-        let (cols, rows) = window.resize(window.window.inner_size());
+        self.size = window.window.inner_size();
+        let (cols, rows) = window.resize(self.size, 0);
         self.window = Some(window);
         self.frame = Frame::new(cols, rows, self.frame.default_bg);
         let (session, effects) = Session::without_status_line(cols, rows);
@@ -390,7 +472,7 @@ impl ApplicationHandler<UserEvent> for App {
         if self.panes.get(&id).is_some_and(|p| p.io.shared.exited.load(Ordering::Acquire)) {
             self.panes.remove(&id);
             let effects = self.session.as_mut().expect("session").pane_exited(id);
-            if !self.apply(effects) {
+            if !self.apply(effects) || !self.relayout() {
                 event_loop.exit();
                 return;
             }
@@ -402,10 +484,8 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                let Some(window) = self.window.as_mut() else { return };
-                let (cols, rows) = window.resize(size);
-                window.window.request_redraw();
-                if (cols, rows) != (self.frame.cols(), self.frame.rows()) && !self.resize(cols, rows) {
+                self.size = size;
+                if !self.relayout() {
                     event_loop.exit();
                 }
             }

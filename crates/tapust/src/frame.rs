@@ -59,26 +59,13 @@ pub struct Dim {
     pub color: [u8; 4],
 }
 
-/// Text drawn on a panel, in pixels from the panel's top-left corner.
+/// Drawn above the grid (tab bar, dialogs, overlays), in window pixels.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PanelText {
-    pub x: i32,
-    pub y: i32,
-    pub text: String,
-    pub color: [u8; 4],
-    pub bold: bool,
-}
-
-/// A box drawn above everything else (dialogs, messages), in pixels from the grid origin.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Panel {
-    pub x: i32,
-    pub y: i32,
-    pub w: i32,
-    pub h: i32,
-    pub fill: [u8; 4],
-    pub outline: Option<[u8; 4]>,
-    pub texts: Vec<PanelText>,
+pub enum Shape {
+    /// A rectangle; `radius` rounds its corners and `ring` keeps only a 1px outline.
+    Rect { x: i32, y: i32, w: i32, h: i32, color: [u8; 4], radius: u16, ring: bool },
+    /// One line of text whose line box starts at (`x`, `y`).
+    Text { x: i32, y: i32, text: String, color: [u8; 4], face: crate::font::Face },
 }
 
 pub struct Frame {
@@ -88,7 +75,7 @@ pub struct Frame {
     dirty: Vec<bool>,
     pub cursors: Vec<FrameCursor>,
     pub dims: Vec<Dim>,
-    pub panels: Vec<Panel>,
+    pub shapes: Vec<Shape>,
     pub default_bg: [u8; 4],
 }
 
@@ -101,7 +88,7 @@ impl Frame {
             dirty: vec![true; rows as usize],
             cursors: Vec::new(),
             dims: Vec::new(),
-            panels: Vec::new(),
+            shapes: Vec::new(),
             default_bg,
         }
     }

@@ -47,8 +47,12 @@ pub fn register_embedded_fonts() -> io::Result<()> {
     Ok(())
 }
 
-/// Index of one of the four faces: regular, bold, italic, bold italic.
+/// Index of a face: 0-3 are the terminal font (regular, bold, italic, bold
+/// italic); [`UI`] and [`UI_BOLD`] are the interface font of tabs and dialogs.
 pub type Face = usize;
+
+pub const UI: Face = 4;
+pub const UI_BOLD: Face = 5;
 
 pub fn face_for(bold: bool, italic: bool) -> Face {
     (bold as usize) | ((italic as usize) << 1)
@@ -62,6 +66,8 @@ pub struct Bitmap {
     pub left: i32,
     /// Pixels from the baseline up to the bitmap's top edge.
     pub top: i32,
+    /// Horizontal advance in pixels.
+    pub advance: i32,
     /// Color glyphs (emoji) carry premultiplied RGBA; others carry coverage in alpha.
     pub colored: bool,
     pub rgba: Vec<u8>,
@@ -69,8 +75,12 @@ pub struct Bitmap {
 
 pub struct Fonts {
     rasterizer: Rasterizer,
-    faces: [FontKey; 4],
+    faces: [FontKey; 6],
     size: Size,
+    ui_size: Size,
+    /// Line height and baseline (from the line top) of the interface font.
+    pub ui_line_height: i32,
+    pub ui_baseline: i32,
     pub cell_width: u32,
     pub cell_height: u32,
     /// Distance from the cell top to the baseline.
@@ -82,7 +92,7 @@ pub struct Fonts {
 }
 
 impl Fonts {
-    pub fn new(family: &str, points: f32, scale: f64) -> Result<Fonts, crossfont::Error> {
+    pub fn new(family: &str, points: f32, ui_family: &str, ui_points: f32, scale: f64) -> Result<Fonts, crossfont::Error> {
         let mut rasterizer = Rasterizer::new()?;
         let size = Size::new(points * scale as f32);
         let desc = |slant, weight| FontDesc::new(family, Style::Description { slant, weight });
@@ -102,10 +112,20 @@ impl Fonts {
         let underline_thickness = metrics.underline_thickness.round().max(1.0) as i32;
         let underline_y = baseline - metrics.underline_position.round() as i32 - underline_thickness / 2;
         let strike_y = baseline - metrics.strikeout_position.round() as i32;
+        let ui_size = Size::new(ui_points * scale as f32);
+        let ui_desc = |weight| FontDesc::new(ui_family, Style::Description { slant: Slant::Normal, weight });
+        let ui = rasterizer.load_font(&ui_desc(Weight::Normal), ui_size)?;
+        let ui_bold = rasterizer.load_font(&ui_desc(Weight::Bold), ui_size).unwrap_or(ui);
+        rasterizer.get_glyph(GlyphKey { font_key: ui, character: 'm', size: ui_size })?;
+        let ui_metrics = rasterizer.metrics(ui, ui_size)?;
+        let ui_line_height = ui_metrics.line_height.ceil() as i32;
         Ok(Fonts {
             rasterizer,
-            faces: [regular, bold, italic, bold_italic],
+            faces: [regular, bold, italic, bold_italic, ui, ui_bold],
             size,
+            ui_size,
+            ui_line_height,
+            ui_baseline: (ui_line_height as f32 + ui_metrics.descent).round() as i32,
             cell_width,
             cell_height,
             baseline,
@@ -118,7 +138,8 @@ impl Fonts {
     /// Rasterizes `ch` in `face`; a character missing from every font yields
     /// the replacement glyph.
     pub fn rasterize(&mut self, ch: char, face: Face) -> Option<Bitmap> {
-        let key = GlyphKey { font_key: self.faces[face], character: ch, size: self.size };
+        let size = if face >= UI { self.ui_size } else { self.size };
+        let key = GlyphKey { font_key: self.faces[face], character: ch, size };
         let glyph = match self.rasterizer.get_glyph(key) {
             Ok(glyph) | Err(crossfont::Error::MissingGlyph(glyph)) => glyph,
             Err(_) => return None,
@@ -139,5 +160,5 @@ fn to_bitmap(glyph: RasterizedGlyph) -> Bitmap {
         ),
         BitmapBuffer::Rgba(rgba) => (true, rgba),
     };
-    Bitmap { width, height, left: glyph.left, top: glyph.top, colored, rgba }
+    Bitmap { width, height, left: glyph.left, top: glyph.top, advance: glyph.advance.0, colored, rgba }
 }

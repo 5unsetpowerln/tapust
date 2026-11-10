@@ -29,6 +29,9 @@ pub fn palette() -> Palette {
 
 pub const FONT_FAMILY: &str = "JetBrains Mono";
 pub const FONT_POINTS: f32 = 12.0;
+/// GTK's interface font, used by ghostty's tab bar and dialogs.
+pub const UI_FONT_FAMILY: &str = "sans-serif";
+pub const UI_FONT_POINTS: f32 = 11.0;
 /// `window-padding-x` / `window-padding-y` (top-left and bottom-right), in points.
 pub const PADDING_POINTS: f64 = 2.0;
 
@@ -38,3 +41,20 @@ pub const DIVIDER: [u8; 4] = [0x43, 0x43, 0x47, 0xff];
 pub const UNFOCUSED_DIM: [u8; 4] = [0x28, 0x2C, 0x34, 77];
 /// `cursor-style-blink` interval.
 pub const BLINK: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// libadwaita's dark colors, which ghostty's tab bar and dialogs use.
+pub mod adw {
+    pub const HEADERBAR_BG: [u8; 4] = [0x2e, 0x2e, 0x32, 0xff];
+    /// `headerbar_shade_color`, the line under the tab bar.
+    pub const HEADERBAR_SHADE: [u8; 4] = [0, 0, 6, 92];
+    pub const FG: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
+    /// `currentColor` at 10% (selected tab) and at `--border-opacity` 15% (outlines, separators).
+    pub const SELECTED: [u8; 4] = [0xff, 0xff, 0xff, 26];
+    pub const BORDER: [u8; 4] = [0xff, 0xff, 0xff, 38];
+    pub const DIALOG_BG: [u8; 4] = [0x36, 0x36, 0x3a, 0xff];
+}
+
+/// Tab bar geometry in pixels at scale 1: tabbox padding 6 + tab (26 + 2 * 4) + 6.
+pub const TAB_BAR_HEIGHT: f64 = 46.0;
+pub const TAB_MARGIN: f64 = 6.0;
+pub const TAB_RADIUS: f64 = 9.0;

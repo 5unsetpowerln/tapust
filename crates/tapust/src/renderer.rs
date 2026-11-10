@@ -13,11 +13,15 @@ use std::collections::HashMap;
 use glow::HasContext;
 
 use crate::font::{Face, Fonts, face_for};
-use crate::frame::{BOLD, CursorStyle, Frame, FrameCell, ITALIC, Panel, STRIKE, UNDERLINE, WIDE};
+use crate::frame::{BOLD, CursorStyle, Frame, FrameCell, ITALIC, STRIKE, Shape, UNDERLINE, WIDE};
 
 const ATLAS_SIZE: i32 = 2048;
 const FLAG_COLORED: u32 = 1;
 const FLAG_RECT: u32 = 2;
+/// Rounded rectangle; the radius is in `uv[0]`.
+const FLAG_ROUND: u32 = 4;
+/// Only the 1px outline of a rounded rectangle.
+const FLAG_RING: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
@@ -35,6 +39,7 @@ struct Glyph {
     uv: [u16; 2],
     size: [u16; 2],
     offset: [i16; 2],
+    advance: i16,
     colored: bool,
 }
 
@@ -88,7 +93,7 @@ pub struct Renderer {
     fg_buffer: glow::Buffer,
     fg_capacity: usize,
     atlas: Atlas,
-    ascii: Box<[[Option<Glyph>; 128]; 4]>,
+    ascii: Box<[[Option<Glyph>; 128]; 6]>,
     glyphs: HashMap<(u32, Face), Option<Glyph>>,
     rows: Vec<Vec<Instance>>,
     upload: Vec<Instance>,
@@ -133,10 +138,16 @@ uniform vec2 u_cell;
 uniform vec2 u_pad;
 uniform vec2 u_viewport;
 out vec2 v_uv;
+out vec2 v_local;
+flat out vec2 v_size;
+flat out float v_radius;
 flat out vec4 v_color;
 flat out uint v_flags;
 void main() {
     vec2 corner = vec2(gl_VertexID & 1, (gl_VertexID >> 1) & 1);
+    v_local = corner * vec2(a_size);
+    v_size = vec2(a_size);
+    v_radius = float(a_uv.x);
     vec2 px = u_pad + vec2(a_cell) * u_cell + vec2(a_offset) + corner * vec2(a_size);
     vec2 ndc = px / u_viewport * 2.0 - 1.0;
     gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
@@ -149,12 +160,28 @@ void main() {
 const FG_FS: &str = r#"#version 330 core
 uniform sampler2D u_atlas;
 in vec2 v_uv;
+in vec2 v_local;
+flat in vec2 v_size;
+flat in float v_radius;
 flat in vec4 v_color;
 flat in uint v_flags;
 out vec4 frag;
 void main() {
     if ((v_flags & 2u) != 0u) {
-        frag = vec4(v_color.rgb * v_color.a, v_color.a);
+        float a = v_color.a;
+        if ((v_flags & 4u) != 0u) {
+            // Signed distance to a rounded box, antialiased over one pixel.
+            vec2 half_size = v_size * 0.5;
+            float r = min(v_radius, min(half_size.x, half_size.y));
+            vec2 q = abs(v_local - half_size) - half_size + r;
+            float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+            float cover = clamp(0.5 - d, 0.0, 1.0);
+            if ((v_flags & 8u) != 0u) {
+                cover *= clamp(d + 1.5, 0.0, 1.0);
+            }
+            a *= cover;
+        }
+        frag = vec4(v_color.rgb * a, a);
     } else if ((v_flags & 1u) != 0u) {
         frag = texture(u_atlas, v_uv);
     } else {
@@ -304,7 +331,7 @@ impl Renderer {
                 fg_buffer,
                 fg_capacity: 0,
                 atlas: Atlas { texture: atlas_texture, x: 0, y: 0, shelf_height: 0 },
-                ascii: Box::new([[None; 128]; 4]),
+                ascii: Box::new([[None; 128]; 6]),
                 glyphs: HashMap::new(),
                 rows: Vec::new(),
                 upload: Vec::new(),
@@ -328,10 +355,10 @@ impl Renderer {
         (self.fonts.cell_width, self.fonts.cell_height)
     }
 
-    /// Sets the drawable size in pixels and the padding before the grid's top-left corner.
-    pub fn resize(&mut self, width: u32, height: u32, pad: u32) {
+    /// Sets the drawable size in pixels and where the grid's top-left corner is.
+    pub fn resize(&mut self, width: u32, height: u32, pad_x: u32, pad_y: u32) {
         self.viewport = (width.max(1), height.max(1));
-        self.padding = (pad as f32, pad as f32);
+        self.padding = (pad_x as f32, pad_y as f32);
         unsafe { self.gl.viewport(0, 0, width as i32, height as i32) };
     }
 
@@ -355,7 +382,8 @@ impl Renderer {
     fn load_glyph(&mut self, ch: u32, face: Face) -> Option<Glyph> {
         let bitmap = self.fonts.rasterize(char::from_u32(ch)?, face)?;
         if bitmap.width == 0 || bitmap.height == 0 {
-            return None;
+            // Blank glyphs (spaces) still carry an advance for proportional text.
+            return Some(Glyph { uv: [0, 0], size: [0, 0], offset: [0, 0], advance: bitmap.advance as i16, colored: false });
         }
         let (x, y) = self.atlas.reserve(bitmap.width as i32, bitmap.height as i32)?;
         unsafe {
@@ -373,10 +401,12 @@ impl Renderer {
                 glow::PixelUnpackData::Slice(Some(&bitmap.rgba)),
             );
         }
+        let baseline = if face >= crate::font::UI { self.fonts.ui_baseline } else { self.fonts.baseline };
         Some(Glyph {
             uv: [x as u16, y as u16],
             size: [bitmap.width as u16, bitmap.height as u16],
-            offset: [bitmap.left as i16, (self.fonts.baseline - bitmap.top) as i16],
+            offset: [bitmap.left as i16, (baseline - bitmap.top) as i16],
+            advance: bitmap.advance as i16,
             colored: bitmap.colored,
         })
     }
@@ -411,7 +441,7 @@ impl Renderer {
             }
         } else if cell.ch > b' ' as u32 {
             let face = face_for(cell.flags & BOLD != 0, cell.flags & ITALIC != 0);
-            if let Some(g) = self.glyph(cell.ch, face) {
+            if let Some(g) = self.glyph(cell.ch, face).filter(|g| g.size[0] > 0) {
                 out.push(Instance {
                     cell: pos,
                     offset: g.offset,
@@ -431,30 +461,47 @@ impl Renderer {
         }
     }
 
-    /// A panel in pixels relative to the grid origin: fill, 1px outline, then text.
-    fn push_panel(&mut self, out: &mut Vec<Instance>, panel: &Panel) {
-        let origin = [0, 0];
-        let (x, y, w, h) = (panel.x, panel.y, panel.w, panel.h);
-        out.push(Self::rect(origin, x, y, w, h, panel.fill));
-        if let Some(c) = panel.outline {
-            out.push(Self::rect(origin, x, y, w, 1, c));
-            out.push(Self::rect(origin, x, y + h - 1, w, 1, c));
-            out.push(Self::rect(origin, x, y, 1, h, c));
-            out.push(Self::rect(origin, x + w - 1, y, 1, h, c));
-        }
-        let cw = self.fonts.cell_width as i32;
-        for text in &panel.texts {
-            let face = face_for(text.bold, false);
-            for (i, ch) in text.text.chars().enumerate() {
-                if let Some(g) = self.glyph(ch as u32, face).filter(|_| ch != ' ') {
-                    out.push(Instance {
-                        cell: origin,
-                        offset: [(x + text.x + i as i32 * cw + g.offset[0] as i32) as i16, (y + text.y + g.offset[1] as i32) as i16],
-                        size: g.size,
-                        uv: g.uv,
-                        color: text.color,
-                        flags: if g.colored { FLAG_COLORED } else { 0 },
-                    });
+    /// Width in pixels of `text` in `face`, using glyph advances.
+    pub fn text_width(&mut self, text: &str, face: Face) -> i32 {
+        text.chars().map(|c| self.glyph(c as u32, face).map_or(0, |g| g.advance as i32)).sum()
+    }
+
+    /// A shape in window pixels; instances are relative to the grid origin.
+    fn push_shape(&mut self, out: &mut Vec<Instance>, shape: &Shape) {
+        let (px, py) = (self.padding.0 as i32, self.padding.1 as i32);
+        match shape {
+            Shape::Rect { x, y, w, h, color, radius, ring } => {
+                let mut flags = FLAG_RECT;
+                if *radius > 0 {
+                    flags |= FLAG_ROUND;
+                }
+                if *ring {
+                    flags |= FLAG_ROUND | FLAG_RING;
+                }
+                out.push(Instance {
+                    cell: [0, 0],
+                    offset: [(x - px) as i16, (y - py) as i16],
+                    size: [(*w).max(0) as u16, (*h).max(0) as u16],
+                    uv: [*radius, 0],
+                    color: *color,
+                    flags,
+                });
+            }
+            Shape::Text { x, y, text, color, face } => {
+                let mut pen = x - px;
+                for ch in text.chars() {
+                    let Some(g) = self.glyph(ch as u32, *face) else { continue };
+                    if g.size[0] > 0 {
+                        out.push(Instance {
+                            cell: [0, 0],
+                            offset: [(pen + g.offset[0] as i32) as i16, (y - py + g.offset[1] as i32) as i16],
+                            size: g.size,
+                            uv: g.uv,
+                            color: *color,
+                            flags: if g.colored { FLAG_COLORED } else { 0 },
+                        });
+                    }
+                    pen += g.advance as i32;
                 }
             }
         }
@@ -548,8 +595,8 @@ impl Renderer {
         for dim in &frame.dims {
             upload.push(Self::rect([dim.x, dim.y], 0, 0, dim.w as i32 * cw, dim.h as i32 * ch, dim.color));
         }
-        for panel in &frame.panels {
-            self.push_panel(&mut upload, panel);
+        for shape in &frame.shapes {
+            self.push_shape(&mut upload, shape);
         }
 
         let gl = &self.gl;

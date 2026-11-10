@@ -57,21 +57,33 @@ impl GlWindow {
         // Frames are paced by Wayland frame callbacks, not by blocking in swap_buffers.
         let _ = surface.set_swap_interval(&context, SwapInterval::DontWait);
         let gl = unsafe { glow::Context::from_loader_function_cstr(|name| display.get_proc_address(name)) };
-        let fonts = Fonts::new(theme::FONT_FAMILY, theme::FONT_POINTS, window.scale_factor())?;
+        let fonts = Fonts::new(
+            theme::FONT_FAMILY,
+            theme::FONT_POINTS,
+            theme::UI_FONT_FAMILY,
+            theme::UI_FONT_POINTS,
+            window.scale_factor(),
+        )?;
         Ok(GlWindow { window, surface, context, renderer: Renderer::new(gl, fonts) })
     }
 
-    /// Resizes the surface and returns the grid size in cells.
-    pub fn resize(&mut self, size: PhysicalSize<u32>) -> (u16, u16) {
+    /// Resizes the surface and returns the grid size in cells; `top` pixels
+    /// above the grid are reserved (the tab bar).
+    pub fn resize(&mut self, size: PhysicalSize<u32>, top: u32) -> (u16, u16) {
         let (w, h) = (size.width.max(1), size.height.max(1));
         self.surface.resize(&self.context, NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap());
         let (cw, ch) = self.renderer.cell_size();
         // ghostty converts the padding from points at 96 dpi and floors it.
         let pad = (theme::PADDING_POINTS * 96.0 / 72.0 * self.window.scale_factor()).floor() as u32;
         let cols = (w.saturating_sub(2 * pad) / cw).clamp(2, u16::MAX as u32) as u16;
-        let rows = (h.saturating_sub(2 * pad) / ch).clamp(2, u16::MAX as u32) as u16;
-        self.renderer.resize(w, h, pad);
+        let rows = (h.saturating_sub(2 * pad + top) / ch).clamp(2, u16::MAX as u32) as u16;
+        self.renderer.resize(w, h, pad, pad + top);
         (cols, rows)
+    }
+
+    /// The tab bar height in pixels for this window's scale.
+    pub fn tab_bar_height(&self) -> u32 {
+        (theme::TAB_BAR_HEIGHT * self.window.scale_factor()).round() as u32
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
