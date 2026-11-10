@@ -1,21 +1,20 @@
-//! A tmux-compatible model of one session: windows, panes, layouts, the key
-//! tables and the status line, reproducing tmux 3.6 defaults with the
-//! tmux-pain-control bindings on top.
+//! A tmux-compatible model of one session: windows, panes and the key
+//! tables, reproducing tmux 3.6 defaults with the tmux-pain-control bindings
+//! on top. Panes are split as ghostty splits them: a tree of ratios laid out
+//! in pixels with a thin divider, instead of tmux's cell grid with borders.
 //!
 //! The model does no I/O. It tells the GUI what to do through [`Effect`]s
 //! (spawn a shell, resize or destroy a pane, write bytes, exit), and the GUI
-//! reads the visible layout, borders and status line from [`Session::view`].
+//! reads the visible panes and dividers from [`Session::view`].
 
 use std::collections::BTreeMap;
 use std::time::Instant;
 
 mod format;
 mod keys;
-mod layout;
 mod prompt;
-mod redraw;
 mod session;
-mod status;
+mod split;
 mod window;
 
 #[cfg(test)]
@@ -28,13 +27,43 @@ use window::Window;
 /// Pane identifier (tmux `%N`), never reused within a session.
 pub type PaneId = u32;
 
-/// A rectangle in cells, relative to the top-left of the window area.
+/// A rectangle in pixels, relative to the top-left of the area the panes share.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Rect {
-    pub x: u16,
-    pub y: u16,
-    pub w: u16,
-    pub h: u16,
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// The client's pixel geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Metrics {
+    /// The area the panes of a window share.
+    pub width: u32,
+    pub height: u32,
+    pub cell_width: u32,
+    pub cell_height: u32,
+    /// Space on each side of a pane's grid (ghostty's `window-padding-x`/`-y`).
+    pub padding_x: u32,
+    pub padding_y: u32,
+    /// Width of the divider between split panes.
+    pub divider: u32,
+}
+
+impl Metrics {
+    pub fn area(&self) -> Rect {
+        Rect { x: 0, y: 0, w: self.width, h: self.height }
+    }
+
+    /// The terminal grid that fits in a pane of `rect`, at least one cell.
+    pub fn grid(&self, rect: Rect) -> (u16, u16) {
+        let fit = |size: u32, padding: u32, cell: u32| {
+            let n = size.saturating_sub(2 * padding) / cell.max(1);
+            u16::try_from(n.max(1)).unwrap_or(u16::MAX)
+        };
+        (fit(rect.w, self.padding_x, self.cell_width), fit(rect.h, self.padding_y, self.cell_height))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -118,53 +147,16 @@ pub struct PaneView {
     pub active: bool,
 }
 
-/// One border cell between panes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BorderCell {
-    pub x: u16,
-    pub y: u16,
-    /// The line-drawing character tmux draws here (U+2502 vertical, U+2500
-    /// horizontal, U+253C cross, U+251C/U+2524/U+252C/U+2534 tees, ...).
-    pub glyph: char,
-    /// Drawn with `pane-active-border-style` (green) instead of `pane-border-style`.
-    pub active: bool,
-}
-
-/// Colors of the status line and prompts.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum ChromeColor {
-    #[default]
-    Default,
-    /// tmux color names as palette indices: black 0, red 1, green 2, yellow 3, ...
-    Indexed(u8),
-}
-
-/// One cell of the status line.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StatusCell {
-    pub ch: char,
-    pub fg: ChromeColor,
-    pub bg: ChromeColor,
-    pub bold: bool,
-    pub underline: bool,
-    pub reverse: bool,
-}
-
-/// The current window's panes and borders, and the status line.
+/// The current window's panes and the dividers between them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct View {
     pub panes: Vec<PaneView>,
-    pub borders: Vec<BorderCell>,
-    /// Exactly `cols` cells for the bottom row of the client.
-    pub status: Vec<StatusCell>,
-    /// Cursor column while a prompt is being edited on the status line.
-    pub prompt_cursor: Option<u16>,
-    /// The prompt or message on the status line, for clients that show it
-    /// elsewhere (always set while one is active, with or without the status line).
+    pub dividers: Vec<Rect>,
+    /// The prompt or message tmux would show on the status line.
     pub overlay: Option<Overlay>,
 }
 
-/// A prompt or message the status line would show.
+/// A prompt or message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Overlay {
     /// `confirm-before`: answered with `y`; any other key cancels.
@@ -186,13 +178,12 @@ pub enum ConfirmTarget {
 /// as a key binding does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
-    /// `split-window [-h] [-b] [-f] [-l size]`, with
-    /// `-c "#{pane_current_path}"` when `cwd_of_active`.
+    /// `split-window [-h] [-b] [-f]`, with `-c "#{pane_current_path}"` when
+    /// `cwd_of_active`. The new pane gets half of the space, as in ghostty.
     SplitWindow {
         horizontal: bool,
         before: bool,
         full: bool,
-        size: Option<u32>,
         cwd_of_active: bool,
     },
     /// `new-window`, with `-c "#{pane_current_path}"` when `cwd_of_active`.
@@ -203,7 +194,8 @@ pub enum Command {
     LastPane,
     /// `select-pane -t :.+`.
     NextPane,
-    /// `resize-pane -L/-R/-U/-D adjustment`.
+    /// `resize-pane -L/-R/-U/-D adjustment`: moves the nearest divider of that
+    /// orientation by `adjustment` cells, as ghostty's resize_split moves it.
     ResizePane(Direction, u32),
     /// `resize-pane -Z`.
     ZoomPane,
@@ -227,8 +219,8 @@ pub enum Command {
     LastWindow,
     /// `swap-window -d -t -N` (negative) or `-t +N` (positive).
     SwapWindow(i32),
-    /// `select-layout -E` (spread the active pane's cells out evenly).
-    SpreadLayout,
+    /// `select-layout -E`, carried out as ghostty's equalize_splits.
+    Equalize,
     /// `rename-window name` (the name is format-expanded as tmux does).
     RenameWindow(String),
     /// `rename-session name`.
@@ -241,10 +233,7 @@ pub enum Command {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandOutput {
     pub effects: Vec<Effect>,
-    /// tmux's error message (as `%error` in control mode), if the command
-    /// failed. The model also refuses the two layouts tmux 3.6 cannot handle
-    /// (an overflowing `split-window -f`, a hanging `select-layout -E`) with
-    /// an error saying so, leaving the session unchanged.
+    /// tmux's error message, if the command failed.
     pub error: Option<String>,
 }
 
@@ -271,18 +260,13 @@ pub struct WindowInfo {
     /// The previously current window (`-`).
     pub last: bool,
     pub zoomed: bool,
-    pub width: u16,
-    pub height: u16,
     pub panes: Vec<PaneInfo>,
 }
 
 /// One tmux session shown in one GUI window.
 pub struct Session {
     name: String,
-    cols: u16,
-    rows: u16,
-    /// tmux's `status` option.
-    status: bool,
+    metrics: Metrics,
     /// Winlinks by index; a winlink is identified by its index.
     winlinks: BTreeMap<u32, Window>,
     curw: u32,
@@ -309,29 +293,16 @@ pub struct Session {
 }
 
 impl Session {
-    /// A session with one window and one pane for a client of `cols x rows`
-    /// cells (the status line takes the last row). Returns the first pane's
-    /// `Spawn` effect.
-    pub fn new(cols: u16, rows: u16) -> (Session, Vec<Effect>) {
-        session::new_session(cols, rows, true)
+    /// A session with one window and one pane for a client of `metrics`.
+    /// Returns the first pane's `Spawn` effect.
+    pub fn new(metrics: Metrics) -> (Session, Vec<Effect>) {
+        session::new_session(metrics)
     }
 
-    /// Like [`Session::new`] with tmux's `status` option off: the windows
-    /// use every row of the client.
-    pub fn without_status_line(cols: u16, rows: u16) -> (Session, Vec<Effect>) {
-        session::new_session(cols, rows, false)
-    }
-
-    /// The client (GUI window) was resized.
-    pub fn resize_client(&mut self, cols: u16, rows: u16) -> Vec<Effect> {
-        self.op(|s| {
-            s.cols = cols;
-            s.rows = rows;
-            // Every window at once, as refresh-client -C does
-            // (recalculate_sizes_now(1)); a tty client's resize in tmux
-            // leaves other windows until they become current.
-            s.recalculate_sizes(true);
-        })
+    /// The client (GUI window) was resized, or its cell size changed. The
+    /// splits keep their ratios.
+    pub fn resize(&mut self, metrics: Metrics) -> Vec<Effect> {
+        self.op(|s| s.set_metrics(metrics))
     }
 
     /// Offers a key to the key tables (prefix, repeat, prompts).
@@ -392,34 +363,24 @@ impl Session {
         if self.dead { self.last_active } else { self.cur().active }
     }
 
-    /// Every pane of every window with its current size (cols, rows).
-    pub fn pane_sizes(&self) -> Vec<(PaneId, u16, u16)> {
-        self.winlinks
-            .values()
-            .flat_map(|w| w.panes.iter())
-            .map(|p| (p.id, clamp16(p.sx), clamp16(p.sy)))
-            .collect()
-    }
-
     /// Changes whenever anything returned by [`Session::view`] may have changed.
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
-    /// The visible state; `clock` is the formatted `%H:%M %d-%b-%y` text.
-    pub fn view(&self, clock: &str) -> View {
-        let (status, prompt_cursor) = self.status_line(clock);
+    /// The visible state of the current window.
+    pub fn view(&self) -> View {
         if self.dead {
-            return View { panes: Vec::new(), borders: Vec::new(), status, prompt_cursor, overlay: self.overlay() };
+            return View { panes: Vec::new(), dividers: Vec::new(), overlay: self.overlay() };
         }
         let w = self.cur();
         let panes = w
             .panes
             .iter()
             .filter(|p| w.visible(p.id))
-            .map(|p| PaneView { pane: p.id, rect: rect_of(p), active: p.id == w.active })
+            .map(|p| PaneView { pane: p.id, rect: p.rect, active: p.id == w.active })
             .collect();
-        View { panes, borders: self.borders(), status, prompt_cursor, overlay: self.overlay() }
+        View { panes, dividers: w.dividers.clone(), overlay: self.overlay() }
     }
 
     fn overlay(&self) -> Option<Overlay> {
@@ -455,14 +416,12 @@ impl Session {
                 active: index == self.curw && !self.dead,
                 last: Some(index) == last,
                 zoomed: w.zoomed,
-                width: clamp16(w.sx),
-                height: clamp16(w.sy),
                 panes: w
                     .panes
                     .iter()
                     .map(|p| PaneInfo {
                         pane: p.id,
-                        rect: rect_of(p),
+                        rect: p.rect,
                         active: p.id == w.active,
                         title: p.title.clone(),
                     })
@@ -470,12 +429,4 @@ impl Session {
             })
             .collect()
     }
-}
-
-fn clamp16(v: u32) -> u16 {
-    u16::try_from(v).unwrap_or(u16::MAX)
-}
-
-fn rect_of(p: &window::Pane) -> Rect {
-    Rect { x: clamp16(p.xoff), y: clamp16(p.yoff), w: clamp16(p.sx), h: clamp16(p.sy) }
 }

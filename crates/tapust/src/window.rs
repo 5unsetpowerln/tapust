@@ -17,6 +17,7 @@ use winit::window::Window;
 
 use crate::font::Fonts;
 use crate::frame::Frame;
+use mux::Metrics;
 use crate::renderer::Renderer;
 use crate::theme;
 
@@ -67,18 +68,26 @@ impl GlWindow {
         Ok(GlWindow { window, surface, context, renderer: Renderer::new(gl, fonts) })
     }
 
-    /// Resizes the surface and returns the grid size in cells; `top` pixels
-    /// above the grid are reserved (the tab bar).
-    pub fn resize(&mut self, size: PhysicalSize<u32>, top: u32) -> (u16, u16) {
+    /// Resizes the surface and returns the geometry of the pane area below
+    /// the `top` pixels reserved for the tab bar.
+    pub fn resize(&mut self, size: PhysicalSize<u32>, top: u32) -> Metrics {
         let (w, h) = (size.width.max(1), size.height.max(1));
         self.surface.resize(&self.context, NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap());
-        let (cw, ch) = self.renderer.cell_size();
+        self.renderer.resize(w, h);
+        let (cell_width, cell_height) = self.renderer.cell_size();
+        let scale = self.window.scale_factor();
         // ghostty converts the padding from points at 96 dpi and floors it.
-        let pad = (theme::PADDING_POINTS * 96.0 / 72.0 * self.window.scale_factor()).floor() as u32;
-        let cols = (w.saturating_sub(2 * pad) / cw).clamp(2, u16::MAX as u32) as u16;
-        let rows = (h.saturating_sub(2 * pad + top) / ch).clamp(2, u16::MAX as u32) as u16;
-        self.renderer.resize(w, h, pad, pad + top);
-        (cols, rows)
+        let padding = (theme::PADDING_POINTS * 96.0 / 72.0 * scale).floor() as u32;
+        Metrics {
+            width: w,
+            height: h.saturating_sub(top),
+            cell_width,
+            cell_height,
+            padding_x: padding,
+            padding_y: padding,
+            // libadwaita's one logical pixel separator.
+            divider: (scale.round() as u32).max(1),
+        }
     }
 
     /// The tab bar height in pixels for this window's scale.

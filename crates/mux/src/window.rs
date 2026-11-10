@@ -1,17 +1,18 @@
-//! Windows and panes, ported from tmux 3.6 `window.c`.
+//! Windows and panes: tmux 3.6's `window.c` bookkeeping (pane order, the
+//! last-pane stack, zoom, directional selection) over ghostty's split tree.
 
-use crate::layout::{Cell, CellId};
-use crate::PaneId;
+use crate::split::{Node, Side};
+use crate::{Metrics, PaneId, Rect};
 
 #[derive(Clone, Debug)]
 pub(crate) struct Pane {
     pub id: PaneId,
-    pub xoff: u32,
-    pub yoff: u32,
-    pub sx: u32,
-    pub sy: u32,
-    pub cell: Option<CellId>,
-    pub saved_cell: Option<CellId>,
+    /// The last laid-out position in pixels, relative to the window area;
+    /// hidden panes of a zoomed window keep the one they had before the zoom.
+    pub rect: Rect,
+    /// The terminal grid inside the padding.
+    pub cols: u16,
+    pub rows: u16,
     pub active_point: u32,
     pub title: String,
     /// The foreground process name reported by the GUI (automatic-rename).
@@ -19,15 +20,12 @@ pub(crate) struct Pane {
 }
 
 impl Pane {
-    pub(crate) fn new(id: PaneId, sx: u32, sy: u32) -> Pane {
+    pub(crate) fn new(id: PaneId) -> Pane {
         Pane {
             id,
-            xoff: 0,
-            yoff: 0,
-            sx,
-            sy,
-            cell: None,
-            saved_cell: None,
+            rect: Rect::default(),
+            cols: 0,
+            rows: 0,
             active_point: 0,
             title: String::new(),
             auto_name: String::new(),
@@ -39,45 +37,38 @@ impl Pane {
 pub(crate) struct Window {
     /// tmux `@N`, never reused within a session.
     pub id: u32,
-    pub sx: u32,
-    pub sy: u32,
-    /// `w->panes` in order; a pane's index is its position.
+    pub metrics: Metrics,
+    /// `w->panes`, kept in the tree's order; a pane's index is its position.
     pub panes: Vec<Pane>,
     /// `w->last_panes`, most recent first.
     pub last_panes: Vec<PaneId>,
     pub active: PaneId,
-    pub cells: Vec<Option<Cell>>,
-    pub root: Option<CellId>,
-    pub saved_root: Option<CellId>,
+    pub tree: Node,
+    /// The dividers of the last layout.
+    pub dividers: Vec<Rect>,
     pub zoomed: bool,
     pub was_zoomed: bool,
     /// Set by rename-window, which turns automatic-rename off.
     pub fixed_name: Option<String>,
-    /// `WINDOW_RESIZE` with `new_sx`/`new_sy`: applied when the window is current.
-    pub pending_resize: Option<(u32, u32)>,
-    /// Set when layout_resize_adjust could not shrink as asked, where tmux
-    /// would loop forever.
-    pub stuck: bool,
 }
 
 impl Window {
-    pub(crate) fn new(id: u32, sx: u32, sy: u32, active: PaneId) -> Window {
-        Window {
+    pub(crate) fn new(id: u32, metrics: Metrics, pane: Pane) -> Window {
+        let active = pane.id;
+        let mut w = Window {
             id,
-            sx,
-            sy,
-            panes: Vec::new(),
+            metrics,
+            panes: vec![pane],
             last_panes: Vec::new(),
             active,
-            cells: Vec::new(),
-            root: None,
-            saved_root: None,
+            tree: Node::Leaf(active),
+            dividers: Vec::new(),
             zoomed: false,
             was_zoomed: false,
             fixed_name: None,
-            pending_resize: None,
-            stuck: false,
-        }
+        };
+        w.relayout();
+        w
     }
 
     pub(crate) fn pos(&self, wp: PaneId) -> Option<usize> {
@@ -119,6 +110,69 @@ impl Window {
         pos.checked_sub(1).map(|i| self.panes[i].id)
     }
 
+    /// Lays the panes out for the window's metrics: the whole area for the
+    /// zoomed pane, else the split tree.
+    pub(crate) fn relayout(&mut self) {
+        let m = self.metrics;
+        let area = m.area();
+        let mut placed = Vec::new();
+        self.dividers.clear();
+        if self.zoomed {
+            placed.push((self.active, area));
+        } else {
+            self.tree.layout(area, &m, &mut placed, &mut self.dividers);
+        }
+        for (wp, rect) in placed {
+            let (cols, rows) = m.grid(rect);
+            let p = self.pane_mut(wp);
+            p.rect = rect;
+            p.cols = cols;
+            p.rows = rows;
+        }
+    }
+
+    /// Puts `panes` back in the tree's order after the tree changed.
+    fn reorder(&mut self) {
+        let mut order = Vec::with_capacity(self.panes.len());
+        self.tree.leaves(&mut order);
+        self.panes.sort_by_key(|p| order.iter().position(|&wp| wp == p.id));
+    }
+
+    /// Whether pane `wp` (or the whole window when `full`) has room for a new
+    /// pane on `side` next to it.
+    pub(crate) fn can_split(&self, wp: PaneId, side: Side, full: bool) -> bool {
+        let m = &self.metrics;
+        let (have, need) = if full {
+            (m.area(), self.tree.min_size(side.horizontal, m))
+        } else {
+            (self.pane(wp).rect, Node::Leaf(wp).min_size(side.horizontal, m))
+        };
+        let have = if side.horizontal { have.w } else { have.h };
+        have >= need + m.divider + Node::Leaf(wp).min_size(side.horizontal, m)
+    }
+
+    /// window_add_pane and layout_split_pane: `pane` splits `at` (or the
+    /// whole window when `full`) on `side`.
+    pub(crate) fn add_pane(&mut self, pane: Pane, at: PaneId, side: Side, full: bool) {
+        let new = pane.id;
+        self.panes.push(pane);
+        let node = if full { &mut self.tree } else { self.tree.find_mut(at).expect("pane in tree") };
+        node.split(new, side);
+        self.reorder();
+    }
+
+    /// Exchanges the places of two panes, in the tree and in the order.
+    pub(crate) fn swap_panes(&mut self, a: PaneId, b: PaneId) {
+        self.tree.swap(a, b);
+        self.reorder();
+    }
+
+    /// Gives the tree's places to the panes in their current order (rotate-window).
+    pub(crate) fn place_in_order(&mut self) {
+        let order: Vec<PaneId> = self.panes.iter().map(|p| p.id).collect();
+        self.tree.assign(&mut order.into_iter());
+    }
+
     /// window_pane_stack_remove
     pub(crate) fn stack_remove(&mut self, wp: PaneId) {
         self.last_panes.retain(|&p| p != wp);
@@ -147,7 +201,7 @@ impl Window {
     }
 
     /// window_lost_pane; `prev`/`next` are the pane's neighbours in the list.
-    pub(crate) fn lost_pane(&mut self, wp: PaneId, prev: Option<PaneId>, next: Option<PaneId>) {
+    fn lost_pane(&mut self, wp: PaneId, prev: Option<PaneId>, next: Option<PaneId>) {
         self.stack_remove(wp);
         if wp == self.active
             && let Some(new) = self.last_panes.first().copied().or(prev).or(next)
@@ -157,28 +211,13 @@ impl Window {
         }
     }
 
-    /// window_remove_pane (the layout cell must already be closed).
+    /// window_remove_pane: its sibling in the tree takes its place.
     pub(crate) fn remove_pane(&mut self, wp: PaneId) -> Pane {
         let (prev, next) = (self.prev_of(wp), self.next_of(wp));
         self.lost_pane(wp, prev, next);
+        self.tree.remove(wp);
         let pos = self.pos(wp).expect("pane in window");
         self.panes.remove(pos)
-    }
-
-    /// window_add_pane: insert a new pane next to `other`.
-    pub(crate) fn add_pane(&mut self, pane: Pane, other: PaneId, before: bool, full: bool) {
-        if self.panes.is_empty() {
-            self.panes.push(pane);
-            return;
-        }
-        let pos = self.pos(other).expect("pane in window");
-        let at = match (before, full) {
-            (true, true) => 0,
-            (true, false) => pos,
-            (false, true) => self.panes.len(),
-            (false, false) => pos + 1,
-        };
-        self.panes.insert(at, pane);
     }
 
     /// window_zoom
@@ -189,12 +228,8 @@ impl Window {
         if self.active != wp {
             self.set_active(wp, next_point);
         }
-        for p in &mut self.panes {
-            p.saved_cell = p.cell.take();
-        }
-        self.saved_root = self.root.take();
-        self.layout_init(wp);
         self.zoomed = true;
+        self.relayout();
         true
     }
 
@@ -204,12 +239,7 @@ impl Window {
             return false;
         }
         self.zoomed = false;
-        self.layout_free();
-        self.root = self.saved_root.take();
-        for p in &mut self.panes {
-            p.cell = p.saved_cell.take();
-        }
-        self.fix_panes(None);
+        self.relayout();
         true
     }
 
@@ -259,79 +289,39 @@ impl Window {
         (start < low && end > high) || (start >= low && start <= high) || (end >= low && end <= high)
     }
 
-    /// window_pane_find_up
-    pub(crate) fn find_up(&self, wp: PaneId) -> Option<PaneId> {
-        let p = self.pane(wp);
-        let mut edge = p.yoff;
-        if edge == 0 {
-            edge = self.sy + 1;
-        }
-        let (left, right) = (p.xoff, p.xoff + p.sx);
-        let list: Vec<usize> = (0..self.panes.len())
-            .filter(|&i| {
-                let n = &self.panes[i];
-                n.id != wp
-                    && n.yoff + n.sy + 1 == edge
-                    && Self::overlaps(n.xoff, n.xoff + n.sx - 1, left, right)
-            })
-            .collect();
+    /// The panes passing `filter`, as tmux's window_pane_find_* collect them.
+    fn candidates(&self, wp: PaneId, filter: impl Fn(&Rect) -> bool) -> Option<PaneId> {
+        let list: Vec<usize> =
+            (0..self.panes.len()).filter(|&i| self.panes[i].id != wp && filter(&self.panes[i].rect)).collect();
         self.choose_best(&list)
     }
 
-    /// window_pane_find_down
-    pub(crate) fn find_down(&self, wp: PaneId) -> Option<PaneId> {
-        let p = self.pane(wp);
-        let mut edge = p.yoff + p.sy + 1;
-        if edge >= self.sy {
-            edge = 0;
+    /// window_pane_find_*: the panes across the divider on that side that
+    /// overlap the pane, wrapping around at the window's edge. tmux's
+    /// one-cell border is the divider's width here.
+    pub(crate) fn find(&self, wp: PaneId, dir: crate::Direction) -> Option<PaneId> {
+        use crate::Direction::{Down, Left, Right, Up};
+        let p = self.pane(wp).rect;
+        let (d, area) = (self.metrics.divider, self.metrics.area());
+        let across = |n: &Rect| Self::overlaps(n.y, n.y + n.h.saturating_sub(1), p.y, p.y + p.h);
+        let along = |n: &Rect| Self::overlaps(n.x, n.x + n.w.saturating_sub(1), p.x, p.x + p.w);
+        match dir {
+            Left => {
+                let edge = if p.x == 0 { area.w + d } else { p.x };
+                self.candidates(wp, |n| n.x + n.w + d == edge && across(n))
+            }
+            Right => {
+                let edge = if p.x + p.w + d >= area.w { 0 } else { p.x + p.w + d };
+                self.candidates(wp, |n| n.x == edge && across(n))
+            }
+            Up => {
+                let edge = if p.y == 0 { area.h + d } else { p.y };
+                self.candidates(wp, |n| n.y + n.h + d == edge && along(n))
+            }
+            Down => {
+                let edge = if p.y + p.h + d >= area.h { 0 } else { p.y + p.h + d };
+                self.candidates(wp, |n| n.y == edge && along(n))
+            }
         }
-        let (left, right) = (p.xoff, p.xoff + p.sx);
-        let list: Vec<usize> = (0..self.panes.len())
-            .filter(|&i| {
-                let n = &self.panes[i];
-                n.id != wp
-                    && n.yoff == edge
-                    && Self::overlaps(n.xoff, n.xoff + n.sx - 1, left, right)
-            })
-            .collect();
-        self.choose_best(&list)
-    }
-
-    /// window_pane_find_left
-    pub(crate) fn find_left(&self, wp: PaneId) -> Option<PaneId> {
-        let p = self.pane(wp);
-        let mut edge = p.xoff;
-        if edge == 0 {
-            edge = self.sx + 1;
-        }
-        let (top, bottom) = (p.yoff, p.yoff + p.sy);
-        let list: Vec<usize> = (0..self.panes.len())
-            .filter(|&i| {
-                let n = &self.panes[i];
-                n.id != wp
-                    && n.xoff + n.sx + 1 == edge
-                    && Self::overlaps(n.yoff, n.yoff + n.sy - 1, top, bottom)
-            })
-            .collect();
-        self.choose_best(&list)
-    }
-
-    /// window_pane_find_right
-    pub(crate) fn find_right(&self, wp: PaneId) -> Option<PaneId> {
-        let p = self.pane(wp);
-        let mut edge = p.xoff + p.sx + 1;
-        if edge >= self.sx {
-            edge = 0;
-        }
-        let (top, bottom) = (p.yoff, p.yoff + p.sy);
-        let list: Vec<usize> = (0..self.panes.len())
-            .filter(|&i| {
-                let n = &self.panes[i];
-                n.id != wp
-                    && n.xoff == edge
-                    && Self::overlaps(n.yoff, n.yoff + n.sy - 1, top, bottom)
-            })
-            .collect();
-        self.choose_best(&list)
     }
 }

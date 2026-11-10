@@ -1,12 +1,16 @@
-//! Unit tests: the tmux 3.6 observations of R-0001 (80x24 window area), the
-//! key state machine, prompts, the status line and borders.
+//! Unit tests: tmux's pane and window bookkeeping and key tables over
+//! ghostty's split layout, in a 1276x796 area of 10x20 cells with 2px padding
+//! and a 1px divider (one pane holds 127x39 cells).
 
 use std::time::{Duration, Instant};
 
 use crate::*;
 
-fn new80() -> Session {
-    Session::new(80, 25).0
+const M: Metrics =
+    Metrics { width: 1276, height: 796, cell_width: 10, cell_height: 20, padding_x: 2, padding_y: 2, divider: 1 };
+
+fn new_session() -> Session {
+    Session::new(M).0
 }
 
 fn run(s: &mut Session, cmd: Command) -> CommandOutput {
@@ -20,15 +24,15 @@ fn ok(s: &mut Session, cmd: Command) -> Vec<Effect> {
 }
 
 fn split(horizontal: bool) -> Command {
-    Command::SplitWindow { horizontal, before: false, full: false, size: None, cwd_of_active: false }
+    Command::SplitWindow { horizontal, before: false, full: false, cwd_of_active: false }
 }
 
 fn full_split(horizontal: bool) -> Command {
-    Command::SplitWindow { horizontal, before: false, full: true, size: None, cwd_of_active: false }
+    Command::SplitWindow { horizontal, before: false, full: true, cwd_of_active: false }
 }
 
 /// (x, y, w, h) of the current window's panes in index order.
-fn rects(s: &Session) -> Vec<(u16, u16, u16, u16)> {
+fn rects(s: &Session) -> Vec<(u32, u32, u32, u32)> {
     let w = s.windows().into_iter().find(|w| w.active).unwrap();
     w.panes.iter().map(|p| (p.rect.x, p.rect.y, p.rect.w, p.rect.h)).collect()
 }
@@ -68,58 +72,104 @@ fn meta(code: KeyCode) -> Key {
     Key { code, mods: Mods { meta: true, ..Mods::default() } }
 }
 
-fn status_text(s: &Session) -> String {
-    s.view("12:34 11-Nov-26").status.iter().map(|c| c.ch).filter(|&c| c != '\0').collect()
+/// The text of the current prompt or message, empty without one.
+fn overlay_text(s: &Session) -> String {
+    match s.view().overlay {
+        Some(Overlay::Confirm { prompt, .. }) => prompt,
+        Some(Overlay::Input { prompt, text, .. }) => prompt + &text,
+        Some(Overlay::Message(text)) => text,
+        None => String::new(),
+    }
 }
 
-// --- R-0001 observations -------------------------------------------------
+// --- Layout ------------------------------------------------------------------
 
 #[test]
 fn split_horizontal_halves() {
-    let mut s = new80();
+    let mut s = new_session();
     ok(&mut s, split(true));
-    assert_eq!(rects(&s), [(0, 0, 40, 24), (41, 0, 39, 24)]);
+    // GtkPaned: round((1276 - 1) * 0.5) = 638 for the first pane.
+    assert_eq!(rects(&s), [(0, 0, 638, 796), (639, 0, 637, 796)]);
+    assert_eq!(s.view().dividers, [Rect { x: 638, y: 0, w: 1, h: 796 }]);
 }
 
 #[test]
 fn split_vertical_halves() {
-    let mut s = new80();
+    let mut s = new_session();
     ok(&mut s, split(false));
-    assert_eq!(rects(&s), [(0, 0, 80, 12), (0, 13, 80, 11)]);
+    assert_eq!(rects(&s), [(0, 0, 1276, 398), (0, 399, 1276, 397)]);
 }
 
 #[test]
-fn resize_right_by_five() {
-    let mut s = new80();
+fn split_before_puts_the_new_pane_first() {
+    let mut s = new_session();
+    ok(&mut s, Command::SplitWindow { horizontal: true, before: true, full: false, cwd_of_active: false });
+    let ids: Vec<PaneId> = s.windows()[0].panes.iter().map(|p| p.pane).collect();
+    assert_eq!(ids, [1, 0]);
+    assert_eq!(rects(&s), [(0, 0, 638, 796), (639, 0, 637, 796)]);
+    assert_eq!(s.active_pane(), 1);
+}
+
+#[test]
+fn resize_right_by_five_cells() {
+    let mut s = new_session();
     ok(&mut s, split(true));
     select_index(&mut s, 0);
     ok(&mut s, Command::ResizePane(Direction::Right, 5));
-    assert_eq!(rects(&s), [(0, 0, 45, 24), (46, 0, 34, 24)]);
+    // The divider moves 50 of the 1276 pixels: round(1275 * (0.5 + 50 / 1276)).
+    assert_eq!(rects(&s), [(0, 0, 687, 796), (688, 0, 588, 796)]);
 }
 
 #[test]
-fn kill_middle_of_three() {
-    let mut s = new80();
+fn resize_moves_the_divider_of_the_panes_own_split() {
+    // Splitting the first of two panes gives [[0 | 2] | 1]. resize-pane -R on
+    // pane 2 moves the divider of its own split, on its left (ghostty);
+    // tmux's flat [0 | 2 | 1] would move the one on its right.
+    let mut s = new_session();
+    ok(&mut s, split(true));
+    select_index(&mut s, 0);
+    ok(&mut s, split(true));
+    assert_eq!(rects(&s), [(0, 0, 319, 796), (320, 0, 318, 796), (639, 0, 637, 796)]);
+    ok(&mut s, Command::ResizePane(Direction::Right, 5));
+    assert_eq!(rects(&s), [(0, 0, 368, 796), (369, 0, 269, 796), (639, 0, 637, 796)]);
+}
+
+#[test]
+fn window_resize_keeps_the_ratios() {
+    let mut s = new_session();
+    ok(&mut s, split(true));
+    select_index(&mut s, 0);
+    ok(&mut s, Command::ResizePane(Direction::Right, 5));
+    let before = rects(&s);
+    s.resize(Metrics { width: 638, height: 398, ..M });
+    assert_eq!(rects(&s), [(0, 0, 343, 398), (344, 0, 294, 398)]);
+    s.resize(M);
+    assert_eq!(rects(&s), before);
+}
+
+#[test]
+fn kill_gives_the_space_to_the_sibling() {
+    let mut s = new_session();
     ok(&mut s, split(true));
     ok(&mut s, split(true));
-    assert_eq!(rects(&s), [(0, 0, 40, 24), (41, 0, 19, 24), (61, 0, 19, 24)]);
+    assert_eq!(rects(&s), [(0, 0, 638, 796), (639, 0, 318, 796), (958, 0, 318, 796)]);
     select_index(&mut s, 1);
     ok(&mut s, Command::KillPane);
-    assert_eq!(rects(&s), [(0, 0, 60, 24), (61, 0, 19, 24)]);
+    assert_eq!(rects(&s), [(0, 0, 638, 796), (639, 0, 637, 796)]);
 }
 
 #[test]
 fn kill_first_of_two() {
-    let mut s = new80();
+    let mut s = new_session();
     ok(&mut s, split(true));
     select_index(&mut s, 0);
     ok(&mut s, Command::KillPane);
-    assert_eq!(rects(&s), [(0, 0, 80, 24)]);
+    assert_eq!(rects(&s), [(0, 0, 1276, 796)]);
 }
 
 #[test]
 fn select_left_wraps() {
-    let mut s = new80();
+    let mut s = new_session();
     ok(&mut s, split(true));
     select_index(&mut s, 0);
     ok(&mut s, Command::SelectPane(Direction::Left));
@@ -128,7 +178,7 @@ fn select_left_wraps() {
 
 #[test]
 fn select_uses_recency() {
-    let mut s = new80();
+    let mut s = new_session();
     ok(&mut s, split(true));
     ok(&mut s, split(false));
     assert_eq!(active_index(&s), 2);
@@ -146,7 +196,7 @@ fn select_uses_recency() {
 
 #[test]
 fn swap_window_wraps_and_follows() {
-    let mut s = new80();
+    let mut s = new_session();
     for name in ["b", "c"] {
         ok(&mut s, Command::NewWindow { cwd_of_active: false });
         ok(&mut s, Command::RenameWindow(name.to_owned()));
@@ -162,7 +212,7 @@ fn swap_window_wraps_and_follows() {
 
 #[test]
 fn new_window_fills_gap() {
-    let mut s = new80();
+    let mut s = new_session();
     ok(&mut s, Command::NewWindow { cwd_of_active: false });
     ok(&mut s, Command::NewWindow { cwd_of_active: false });
     ok(&mut s, Command::SelectWindow(1));
@@ -175,64 +225,113 @@ fn new_window_fills_gap() {
 
 #[test]
 fn zoom_single_pane_does_nothing() {
-    let mut s = new80();
+    let mut s = new_session();
     assert_eq!(ok(&mut s, Command::ZoomPane), []);
     assert!(!s.windows()[0].zoomed);
 }
 
 #[test]
+fn zoom_shows_the_active_pane_alone() {
+    let mut s = new_session();
+    ok(&mut s, split(true));
+    let effects = ok(&mut s, Command::ZoomPane);
+    assert_eq!(effects, [Effect::Resize { pane: 1, cols: 127, rows: 39 }]);
+    let v = s.view();
+    assert!(v.dividers.is_empty());
+    assert_eq!(v.panes, [PaneView { pane: 1, rect: M.area(), active: true }]);
+    // Splitting unzooms.
+    ok(&mut s, split(false));
+    assert!(!s.windows()[0].zoomed);
+    assert_eq!(rects(&s), [(0, 0, 638, 796), (639, 0, 637, 398), (639, 399, 637, 397)]);
+}
+
+#[test]
 fn full_vertical_split_after_horizontal() {
-    let mut s = new80();
+    let mut s = new_session();
     ok(&mut s, split(true));
     ok(&mut s, full_split(false));
-    assert_eq!(rects(&s), [(0, 0, 40, 12), (41, 0, 39, 12), (0, 13, 80, 11)]);
+    assert_eq!(rects(&s), [(0, 0, 638, 398), (639, 0, 637, 398), (0, 399, 1276, 397)]);
+    assert_eq!(
+        s.view().dividers,
+        [Rect { x: 638, y: 0, w: 1, h: 398 }, Rect { x: 0, y: 398, w: 1276, h: 1 }]
+    );
+}
+
+#[test]
+fn equalize_evens_out() {
+    let mut s = new_session();
+    ok(&mut s, split(true));
+    ok(&mut s, split(true));
+    ok(&mut s, Command::Equalize);
+    assert_eq!(rects(&s), [(0, 0, 425, 796), (426, 0, 425, 796), (852, 0, 424, 796)]);
+}
+
+#[test]
+fn split_without_room_is_refused() {
+    // A pane needs one cell inside its padding: 14 pixels across.
+    let mut s = Session::new(Metrics { width: 30, ..M }).0;
+    ok(&mut s, split(true));
+    assert_eq!(rects(&s), [(0, 0, 15, 796), (16, 0, 14, 796)]);
+    let out = run(&mut s, split(true));
+    assert_eq!(out.error.as_deref(), Some("no space for new pane"));
+    assert_eq!(out.effects, []);
+    assert_eq!(run(&mut s, full_split(true)).error.as_deref(), Some("no space for new pane"));
+}
+
+#[test]
+fn small_window_keeps_the_minimum_sizes_in_order() {
+    let mut s = Session::new(Metrics { height: 100, ..M }).0;
+    ok(&mut s, split(false));
+    ok(&mut s, split(false));
+    assert_eq!(rects(&s), [(0, 0, 1276, 50), (0, 51, 1276, 24), (0, 76, 1276, 24)]);
+    s.resize(Metrics { height: 60, ..M });
+    // The first panes keep their minimum; the last one gets what is left.
+    assert_eq!(rects(&s), [(0, 0, 1276, 24), (0, 25, 1276, 24), (0, 50, 1276, 10)]);
+    assert!(s.windows()[0].panes.iter().all(|p| M.grid(p.rect).1 == 1));
 }
 
 // --- Effects ---------------------------------------------------------------
 
 #[test]
 fn new_session_spawns_first_pane() {
-    let (s, effects) = Session::new(100, 30);
-    assert_eq!(effects, [Effect::Spawn { pane: 0, cols: 100, rows: 29, cwd_of: None }]);
+    let (s, effects) = Session::new(M);
+    assert_eq!(effects, [Effect::Spawn { pane: 0, cols: 127, rows: 39, cwd_of: None }]);
     assert_eq!(s.active_pane(), 0);
-    assert_eq!(s.pane_sizes(), [(0, 100, 29)]);
 }
 
 #[test]
 fn split_effects() {
-    let mut s = new80();
-    let effects = ok(
-        &mut s,
-        Command::SplitWindow { horizontal: true, before: false, full: false, size: None, cwd_of_active: true },
-    );
+    let mut s = new_session();
+    let effects =
+        ok(&mut s, Command::SplitWindow { horizontal: true, before: false, full: false, cwd_of_active: true });
     assert_eq!(
         effects,
         [
-            Effect::Resize { pane: 0, cols: 40, rows: 24 },
-            Effect::Spawn { pane: 1, cols: 39, rows: 24, cwd_of: Some(0) },
+            Effect::Resize { pane: 0, cols: 63, rows: 39 },
+            Effect::Spawn { pane: 1, cols: 63, rows: 39, cwd_of: Some(0) },
         ]
     );
 }
 
 #[test]
-fn resize_client_resizes_every_window() {
-    let mut s = new80();
+fn resize_resizes_every_window() {
+    let mut s = new_session();
     ok(&mut s, split(true));
     ok(&mut s, Command::NewWindow { cwd_of_active: false });
-    let effects = s.resize_client(100, 31);
+    let effects = s.resize(Metrics { width: 1576, height: 896, ..M });
     assert_eq!(
         effects,
         [
-            Effect::Resize { pane: 0, cols: 50, rows: 30 },
-            Effect::Resize { pane: 1, cols: 49, rows: 30 },
-            Effect::Resize { pane: 2, cols: 100, rows: 30 },
+            Effect::Resize { pane: 0, cols: 78, rows: 44 },
+            Effect::Resize { pane: 1, cols: 78, rows: 44 },
+            Effect::Resize { pane: 2, cols: 157, rows: 44 },
         ]
     );
 }
 
 #[test]
 fn last_pane_exit_exits() {
-    let mut s = new80();
+    let mut s = new_session();
     ok(&mut s, Command::NewWindow { cwd_of_active: false });
     assert_eq!(s.pane_exited(1), [Effect::Destroy { pane: 1 }]);
     assert_eq!(s.active_pane(), 0);
@@ -242,85 +341,15 @@ fn last_pane_exit_exits() {
 
 #[test]
 fn break_pane_does_not_spawn() {
-    let mut s = new80();
+    let mut s = new_session();
     ok(&mut s, split(true));
     let effects = ok(&mut s, Command::BreakPane);
     assert_eq!(
         effects,
-        [Effect::Resize { pane: 0, cols: 80, rows: 24 }, Effect::Resize { pane: 1, cols: 80, rows: 24 }]
+        [Effect::Resize { pane: 0, cols: 127, rows: 39 }, Effect::Resize { pane: 1, cols: 127, rows: 39 }]
     );
     assert_eq!(s.windows().len(), 2);
     assert!(s.windows()[1].active);
-}
-
-#[test]
-fn full_split_overflow_is_refused() {
-    // A left-right root [C, d] where C is a top-bottom cell holding a row of
-    // four panes squeezed to its minimum width and d is one column wide.
-    // For split-window -fv, tmux 3.6 layout_new_pane_size clamps C below its
-    // minimum and layout_resize_child_cells then wraps the pane widths.
-    let mut s = Session::new(11, 11).0;
-    ok(&mut s, split(true));
-    select_index(&mut s, 0);
-    ok(&mut s, Command::ResizePane(Direction::Right, 10));
-    ok(&mut s, split(false));
-    select_index(&mut s, 0);
-    ok(&mut s, split(true));
-    ok(&mut s, split(true));
-    select_index(&mut s, 0);
-    ok(&mut s, split(true));
-    let before = rects(&s);
-    assert_eq!(
-        before,
-        [(0, 0, 2, 5), (3, 0, 1, 5), (5, 0, 2, 5), (8, 0, 1, 5), (0, 6, 9, 4), (10, 0, 1, 10)]
-    );
-    let out = run(&mut s, full_split(false));
-    assert_eq!(out.error.as_deref(), Some(session::SPLIT_OVERFLOW));
-    assert_eq!(out.effects, []);
-    assert_eq!(rects(&s), before);
-}
-
-#[test]
-fn spread_layout_hang_is_refused() {
-    // Seed 496 of the differential test: tmux 3.6 stopped answering at the
-    // final select-layout -E. layout_spread_cell gives every child of the
-    // spread cell the same share without checking the child's minimum.
-    let mut s = Session::new(21, 7).0;
-    let steps = [
-        Command::SplitWindow { horizontal: false, before: false, full: false, size: Some(2), cwd_of_active: false },
-        Command::SplitWindow { horizontal: true, before: true, full: true, size: Some(0), cwd_of_active: false },
-        Command::NextPane,
-        Command::SplitWindow { horizontal: false, before: true, full: false, size: None, cwd_of_active: false },
-    ];
-    for step in steps {
-        run(&mut s, step);
-    }
-    s.resize_client(22, 6);
-    for step in [
-        Command::ResizePane(Direction::Left, 4),
-        split(false),
-        Command::KillPane,
-        Command::ResizePane(Direction::Down, 7),
-        full_split(false),
-        split(true),
-        split(false),
-    ] {
-        run(&mut s, step);
-    }
-    let before = rects(&s);
-    let out = run(&mut s, Command::SpreadLayout);
-    assert_eq!(out.error.as_deref(), Some(session::SPREAD_OVERFLOW));
-    assert_eq!(out.effects, []);
-    assert_eq!(rects(&s), before);
-}
-
-#[test]
-fn spread_layout_evens_out() {
-    let mut s = new80();
-    ok(&mut s, split(true));
-    ok(&mut s, split(true));
-    ok(&mut s, Command::SpreadLayout);
-    assert_eq!(rects(&s), [(0, 0, 26, 24), (27, 0, 26, 24), (54, 0, 26, 24)]);
 }
 
 // --- Keys ------------------------------------------------------------------
@@ -328,7 +357,7 @@ fn spread_layout_evens_out() {
 #[test]
 fn prefix_then_split() {
     let t = Instant::now();
-    let mut s = new80();
+    let mut s = new_session();
     assert_eq!(s.key(ctrl('b'), t), KeyResult::Handled(vec![]));
     let KeyResult::Handled(effects) = s.key(ch('%'), t) else { panic!() };
     assert_eq!(effects.len(), 2);
@@ -339,7 +368,7 @@ fn prefix_then_split() {
 #[test]
 fn unbound_key_after_prefix_is_swallowed() {
     let t = Instant::now();
-    let mut s = new80();
+    let mut s = new_session();
     s.key(ctrl('b'), t);
     assert_eq!(s.key(ch('Y'), t), KeyResult::Handled(vec![]));
     assert_eq!(s.key(ch('Y'), t), KeyResult::Forward(0));
@@ -348,7 +377,7 @@ fn unbound_key_after_prefix_is_swallowed() {
 #[test]
 fn unimplemented_default_binding_is_consumed() {
     let t = Instant::now();
-    let mut s = new80();
+    let mut s = new_session();
     for k in [ch('d'), ch('['), ch('?'), ch(' '), meta(KeyCode::Char('1')), key(KeyCode::PageUp)] {
         s.key(ctrl('b'), t);
         assert_eq!(s.key(k, t), KeyResult::Handled(vec![]), "{k:?}");
@@ -358,7 +387,7 @@ fn unimplemented_default_binding_is_consumed() {
 #[test]
 fn repeat_within_repeat_time() {
     let t = Instant::now();
-    let mut s = new80();
+    let mut s = new_session();
     ok(&mut s, split(true));
     select_index(&mut s, 0);
     s.key(ctrl('b'), t);
@@ -367,16 +396,16 @@ fn repeat_within_repeat_time() {
     let t2 = t + Duration::from_millis(400);
     s.key(ch('L'), t2);
     assert_eq!(s.deadline(), Some(t2 + Duration::from_millis(500)));
-    assert_eq!(rects(&s)[0].2, 50);
+    assert_eq!(rects(&s)[0].2, 737);
     // Still repeating at t2 + 499 ms.
     s.key(ch('L'), t2 + Duration::from_millis(499));
-    assert_eq!(rects(&s)[0].2, 55);
+    assert_eq!(rects(&s)[0].2, 787);
 }
 
 #[test]
 fn key_after_repeat_time_goes_to_pane() {
     let t = Instant::now();
-    let mut s = new80();
+    let mut s = new_session();
     ok(&mut s, split(true));
     s.key(ctrl('b'), t);
     s.key(key(KeyCode::Left), t);
@@ -389,7 +418,7 @@ fn key_after_repeat_time_goes_to_pane() {
 #[test]
 fn tick_ends_repeat() {
     let t = Instant::now();
-    let mut s = new80();
+    let mut s = new_session();
     ok(&mut s, split(true));
     s.key(ctrl('b'), t);
     s.key(key(KeyCode::Left), t);
@@ -401,7 +430,7 @@ fn tick_ends_repeat() {
 #[test]
 fn non_repeat_key_during_repeat_is_forwarded() {
     let t = Instant::now();
-    let mut s = new80();
+    let mut s = new_session();
     ok(&mut s, split(true));
     s.key(ctrl('b'), t);
     s.key(key(KeyCode::Left), t);
@@ -416,7 +445,7 @@ fn non_repeat_key_during_repeat_is_forwarded() {
 #[test]
 fn prefix_during_repeat_enters_prefix() {
     let t = Instant::now();
-    let mut s = new80();
+    let mut s = new_session();
     ok(&mut s, split(true));
     s.key(ctrl('b'), t);
     s.key(key(KeyCode::Left), t);
@@ -429,7 +458,7 @@ fn prefix_during_repeat_enters_prefix() {
 #[test]
 fn prefix_prefix_writes_ctrl_b() {
     let t = Instant::now();
-    let mut s = new80();
+    let mut s = new_session();
     s.key(ctrl('b'), t);
     assert_eq!(
         s.key(ctrl('b'), t),
@@ -441,35 +470,41 @@ fn prefix_prefix_writes_ctrl_b() {
 #[test]
 fn confirm_kill_pane() {
     let t = Instant::now();
-    let mut s = new80();
+    let mut s = new_session();
     ok(&mut s, split(true));
     s.key(ctrl('b'), t);
     s.key(ch('x'), t);
-    assert!(status_text(&s).starts_with("kill-pane 1? (y/n) "));
-    assert_eq!(s.view("").prompt_cursor, Some(19));
+    assert_eq!(
+        s.view().overlay,
+        // confirm-before appends a space to the prompt (cmd-confirm-before.c).
+        Some(Overlay::Confirm { prompt: "kill-pane 1? (y/n) ".to_owned(), target: ConfirmTarget::Pane })
+    );
     // A special key is ignored by a single-key prompt.
     s.key(key(KeyCode::Left), t);
-    assert!(status_text(&s).starts_with("kill-pane 1?"));
+    assert!(overlay_text(&s).starts_with("kill-pane 1?"));
     assert_eq!(s.key(ch('n'), t), KeyResult::Handled(vec![]));
     assert_eq!(rects(&s).len(), 2);
     s.key(ctrl('b'), t);
     s.key(ch('x'), t);
     assert_eq!(s.key(ch('y'), t), KeyResult::Handled(vec![
         Effect::Destroy { pane: 1 },
-        Effect::Resize { pane: 0, cols: 80, rows: 24 },
+        Effect::Resize { pane: 0, cols: 127, rows: 39 },
     ]));
-    assert_eq!(s.view("").prompt_cursor, None);
+    assert_eq!(s.view().overlay, None);
 }
 
 #[test]
 fn confirm_kill_window() {
     let t = Instant::now();
-    let mut s = new80();
+    let mut s = new_session();
     ok(&mut s, Command::NewWindow { cwd_of_active: false });
     s.set_auto_name(1, "vim");
     s.key(ctrl('b'), t);
     s.key(ch('&'), t);
-    assert!(status_text(&s).starts_with("kill-window vim? (y/n) "));
+    assert_eq!(
+        s.view().overlay,
+        Some(Overlay::Confirm { prompt: "kill-window vim? (y/n) ".to_owned(), target: ConfirmTarget::Window })
+    );
     s.key(ch('y'), t);
     assert_eq!(s.windows().len(), 1);
 }
@@ -477,12 +512,12 @@ fn confirm_kill_window() {
 #[test]
 fn rename_window_editing() {
     let t = Instant::now();
-    let mut s = new80();
+    let mut s = new_session();
     s.set_auto_name(0, "bash");
     s.key(ctrl('b'), t);
     s.key(ch(','), t);
-    assert!(status_text(&s).starts_with("(rename-window) bash "));
-    assert_eq!(s.view("").prompt_cursor, Some(20));
+    let input = |text: &str, cursor| Some(Overlay::Input { prompt: "(rename-window) ".to_owned(), text: text.to_owned(), cursor });
+    assert_eq!(s.view().overlay, input("bash", 4));
     s.key(key(KeyCode::Backspace), t);
     s.key(key(KeyCode::Home), t);
     s.key(ch('x'), t);
@@ -491,8 +526,7 @@ fn rename_window_editing() {
     s.key(key(KeyCode::Left), t);
     s.key(key(KeyCode::Left), t);
     s.key(ch('-'), t);
-    assert!(status_text(&s).starts_with("(rename-window) xba-sy "));
-    assert_eq!(s.view("").prompt_cursor, Some(20));
+    assert_eq!(s.view().overlay, input("xba-sy", 4));
     s.key(ctrl('a'), t);
     s.key(key(KeyCode::Right), t);
     s.key(key(KeyCode::End), t);
@@ -506,7 +540,7 @@ fn rename_window_editing() {
 #[test]
 fn rename_prompt_cancel_and_clear() {
     let t = Instant::now();
-    let mut s = new80();
+    let mut s = new_session();
     s.set_auto_name(0, "bash");
     s.key(ctrl('b'), t);
     s.key(ch(','), t);
@@ -518,19 +552,19 @@ fn rename_prompt_cancel_and_clear() {
     s.key(ch(','), t);
     s.key(ctrl('c'), t);
     assert_eq!(s.windows()[0].name, "bash");
-    assert!(status_text(&s).starts_with("[0] 0:bash*"));
+    assert_eq!(s.view().overlay, None);
 }
 
 #[test]
 fn rename_session_prompt() {
     let t = Instant::now();
-    let mut s = new80();
+    let mut s = new_session();
     s.key(ctrl('b'), t);
     s.key(ch('$'), t);
-    assert!(status_text(&s).starts_with("(rename-session) 0 "));
+    assert_eq!(overlay_text(&s), "(rename-session) 0");
     s.key(key(KeyCode::Backspace), t);
     s.key(key(KeyCode::Enter), t);
-    assert!(status_text(&s).starts_with("Invalid session: "));
+    assert!(overlay_text(&s).starts_with("Invalid session: "));
     for c in "a.b".chars() {
         s.key(ctrl('b'), t);
         s.key(ch('$'), t);
@@ -545,52 +579,51 @@ fn rename_session_prompt() {
         s.key(ch(c), t);
     }
     s.key(key(KeyCode::Enter), t);
-    assert!(status_text(&s).starts_with("[a_b] "));
+    ok(&mut s, Command::RenameWindow("#S".to_owned()));
+    assert_eq!(s.windows()[0].name, "a_b");
 }
 
 #[test]
 fn error_message_and_expiry() {
     let t = Instant::now();
-    let mut s = new80();
+    let mut s = new_session();
     s.key(ctrl('b'), t);
     s.key(ch('5'), t);
-    assert!(status_text(&s).starts_with("Can't find window: 5 "));
-    let view = s.view("");
-    assert_eq!(view.status[0].bg, ChromeColor::Indexed(3));
+    assert_eq!(s.view().overlay, Some(Overlay::Message("Can't find window: 5".to_owned())));
     assert_eq!(s.deadline(), Some(t + Duration::from_millis(750)));
     let g = s.generation();
     s.tick(t + Duration::from_millis(750));
     assert_ne!(s.generation(), g);
-    assert!(status_text(&s).starts_with("[0] 0:*"));
+    assert_eq!(s.view().overlay, None);
     // A key press clears a message and is then processed normally.
     s.key(ctrl('b'), t);
     s.key(ch('n'), t);
-    assert!(status_text(&s).starts_with("No next window"));
+    assert_eq!(overlay_text(&s), "No next window");
     assert_eq!(s.key(ch('q'), t), KeyResult::Forward(0));
-    assert!(status_text(&s).starts_with("[0] "));
+    assert_eq!(s.view().overlay, None);
 }
 
 #[test]
 fn arrow_resize_bindings() {
     let t = Instant::now();
-    let mut s = new80();
+    let mut s = new_session();
     ok(&mut s, split(true));
     select_index(&mut s, 0);
     s.key(ctrl('b'), t);
     s.key(meta(KeyCode::Right), t);
-    assert_eq!(rects(&s)[0].2, 45);
+    assert_eq!(rects(&s)[0].2, 687);
     s.key(meta(KeyCode::Right), t + Duration::from_millis(100));
-    assert_eq!(rects(&s)[0].2, 50);
+    assert_eq!(rects(&s)[0].2, 737);
     let later = t + Duration::from_secs(1);
     s.key(ctrl('b'), later);
     s.key(Key { code: KeyCode::Left, mods: Mods { ctrl: true, ..Mods::default() } }, later);
-    assert_eq!(rects(&s)[0].2, 49);
+    assert_eq!(rects(&s)[0].2, 727);
 }
 
 #[test]
 fn swap_window_bindings_repeat() {
     let t = Instant::now();
-    let mut s = new80();
+    let mut s = new_session();
     ok(&mut s, Command::NewWindow { cwd_of_active: false });
     ok(&mut s, Command::NewWindow { cwd_of_active: false });
     let panes = |s: &Session| -> Vec<PaneId> { s.windows().iter().map(|w| w.panes[0].pane).collect() };
@@ -607,7 +640,7 @@ fn swap_window_bindings_repeat() {
 #[test]
 fn swap_and_rotate_bindings() {
     let t = Instant::now();
-    let mut s = new80();
+    let mut s = new_session();
     ok(&mut s, split(true));
     ok(&mut s, split(false));
     let ids = |s: &Session| -> Vec<PaneId> { s.windows()[0].panes.iter().map(|p| p.pane).collect() };
@@ -618,34 +651,15 @@ fn swap_and_rotate_bindings() {
     s.key(ctrl('b'), t);
     s.key(ctrl('o'), t);
     assert_eq!(ids(&s), [2, 1, 0]);
-    assert_eq!(rects(&s), [(0, 0, 40, 24), (41, 0, 39, 12), (41, 13, 39, 11)]);
-}
-
-#[test]
-fn window_bigger_than_client() {
-    // Three stacked panes need 5 rows; a client with a 3-row window area
-    // leaves the window taller than the client (resize_window keeps the
-    // layout size), which status-right shows as "[x,y] ".
-    let mut s = Session::new(60, 13).0;
-    ok(&mut s, split(false));
-    ok(&mut s, split(false));
-    s.resize_client(60, 4);
-    let w = &s.windows()[0];
-    assert_eq!((w.width, w.height), (60, 5));
-    assert!(status_text(&s).ends_with(" [0,0] \"\" 12:34 11-Nov-26"), "{}", status_text(&s));
-    // The rows of the 3-row window area: pane, border, pane.
-    assert_eq!(s.view("").borders.len(), 60);
-    // On a 5-column client the list goes first, then the right part from its left.
-    s.resize_client(5, 4);
-    assert_eq!(status_text(&s), "[0] 6");
+    assert_eq!(rects(&s), [(0, 0, 638, 796), (639, 0, 637, 398), (639, 399, 637, 397)]);
 }
 
 #[test]
 fn exit_of_pane_in_other_window() {
-    let mut s = new80();
+    let mut s = new_session();
     ok(&mut s, split(true));
     ok(&mut s, Command::NewWindow { cwd_of_active: false });
-    assert_eq!(s.pane_exited(1), [Effect::Destroy { pane: 1 }, Effect::Resize { pane: 0, cols: 80, rows: 24 }]);
+    assert_eq!(s.pane_exited(1), [Effect::Destroy { pane: 1 }, Effect::Resize { pane: 0, cols: 127, rows: 39 }]);
     assert_eq!(s.active_pane(), 2);
     assert_eq!(s.pane_exited(2), [Effect::Destroy { pane: 2 }]);
     assert_eq!(s.active_pane(), 0);
@@ -653,118 +667,12 @@ fn exit_of_pane_in_other_window() {
 
 #[test]
 fn dead_session_view() {
-    let mut s = new80();
+    let mut s = new_session();
     assert_eq!(ok(&mut s, Command::KillWindow), [Effect::Destroy { pane: 0 }, Effect::Exit]);
-    let v = s.view("x");
-    assert!(v.panes.is_empty() && v.borders.is_empty());
-    assert_eq!(v.status.len(), 80);
+    let v = s.view();
+    assert!(v.panes.is_empty() && v.dividers.is_empty());
     assert_eq!(s.active_pane(), 0);
     assert_eq!(s.key(ctrl('b'), Instant::now()), KeyResult::Handled(vec![]));
-}
-
-// --- Status line ------------------------------------------------------------
-
-#[test]
-fn default_status_line() {
-    let mut s = new80();
-    s.set_auto_name(0, "bash");
-    ok(&mut s, Command::NewWindow { cwd_of_active: false });
-    s.set_auto_name(1, "vim");
-    s.set_pane_title(1, "host");
-    let view = s.view("12:34 11-Nov-26");
-    assert_eq!(view.status.len(), 80);
-    let text = status_text(&s);
-    let right = "\"host\" 12:34 11-Nov-26";
-    assert_eq!(text, format!("[0] 0:bash- 1:vim*{}{right}", " ".repeat(80 - 18 - right.len())));
-    assert!(view.status.iter().all(|c| c.fg == ChromeColor::Indexed(0)
-        && c.bg == ChromeColor::Indexed(2)
-        && !c.bold
-        && !c.reverse));
-    assert_eq!(view.prompt_cursor, None);
-}
-
-#[test]
-fn status_flags_and_space() {
-    let mut s = new80();
-    ok(&mut s, split(true));
-    ok(&mut s, Command::ZoomPane);
-    ok(&mut s, Command::NewWindow { cwd_of_active: false });
-    ok(&mut s, Command::NewWindow { cwd_of_active: false });
-    assert!(status_text(&s).starts_with("[0] 0:Z 1:- 2:* "));
-}
-
-#[test]
-fn status_list_is_trimmed_around_focus() {
-    let mut s = Session::new(40, 10).0;
-    for _ in 0..9 {
-        ok(&mut s, Command::NewWindow { cwd_of_active: false });
-    }
-    let text = status_text(&s);
-    assert_eq!(text.chars().count(), 40);
-    assert!(text.starts_with("[0] <"), "{text}");
-    assert!(text.contains("9:*"), "{text}");
-}
-
-#[test]
-fn long_title_is_trimmed() {
-    let mut s = new80();
-    s.set_pane_title(0, "abcdefghijklmnopqrstuvwxyz");
-    assert!(status_text(&s).ends_with("\"abcdefghijklmnopqrstu\" 12:34 11-Nov-26"));
-}
-
-// --- Borders ------------------------------------------------------------------
-
-fn border_at(v: &View, x: u16, y: u16) -> Option<(char, bool)> {
-    v.borders.iter().find(|b| b.x == x && b.y == y).map(|b| (b.glyph, b.active))
-}
-
-#[test]
-fn two_pane_half_border() {
-    let mut s = new80();
-    ok(&mut s, split(true));
-    let v = s.view("");
-    assert_eq!(v.borders.len(), 24);
-    // The left pane owns rows 0..=12 (py <= sy / 2), the right one the rest.
-    for y in 0..24 {
-        assert_eq!(border_at(&v, 40, y), Some(('\u{2502}', y > 12)), "y {y}");
-    }
-    select_index(&mut s, 0);
-    let v = s.view("");
-    for y in 0..24 {
-        assert_eq!(border_at(&v, 40, y), Some(('\u{2502}', y <= 12)), "y {y}");
-    }
-}
-
-#[test]
-fn three_pane_joins() {
-    let mut s = new80();
-    ok(&mut s, split(true));
-    ok(&mut s, split(false));
-    let v = s.view("");
-    assert_eq!(border_at(&v, 40, 12), Some(('\u{251c}', true)));
-    assert_eq!(border_at(&v, 41, 12), Some(('\u{2500}', true)));
-    assert_eq!(border_at(&v, 79, 12), Some(('\u{2500}', true)));
-    assert_eq!(border_at(&v, 40, 0), Some(('\u{2502}', false)));
-    assert_eq!(border_at(&v, 40, 13), Some(('\u{2502}', true)));
-    assert_eq!(border_at(&v, 40, 23), Some(('\u{2502}', true)));
-    // split-window -fv: the old root keeps 12 rows (panes 0, 1 and 2) and
-    // the new full-width pane 3 is active below row 12.
-    ok(&mut s, full_split(false));
-    assert_eq!(rects(&s), [(0, 0, 40, 12), (41, 0, 39, 6), (41, 7, 39, 5), (0, 13, 80, 11)]);
-    let v = s.view("");
-    assert_eq!(border_at(&v, 40, 12), Some(('\u{2534}', true)));
-    assert_eq!(border_at(&v, 40, 6), Some(('\u{251c}', false)));
-    assert_eq!(border_at(&v, 0, 12), Some(('\u{2500}', true)));
-}
-
-#[test]
-fn zoomed_window_has_no_borders() {
-    let mut s = new80();
-    ok(&mut s, split(true));
-    ok(&mut s, Command::ZoomPane);
-    let v = s.view("");
-    assert!(v.borders.is_empty());
-    assert_eq!(v.panes, [PaneView { pane: 1, rect: Rect { x: 0, y: 0, w: 80, h: 24 }, active: true }]);
 }
 
 // --- Formats -------------------------------------------------------------------
@@ -776,36 +684,7 @@ fn vis_encoding() {
 
 #[test]
 fn rename_expands_formats() {
-    let mut s = new80();
+    let mut s = new_session();
     ok(&mut s, Command::RenameWindow("#S-#I-##-#{pane_index}-#Q".to_owned()));
     assert_eq!(s.windows()[0].name, "0-0-#-0-#Q");
-}
-
-#[test]
-fn status_line_off_uses_every_row_and_still_reports_prompts() {
-    use crate::{ConfirmTarget, Effect, Key, KeyCode, KeyResult, Mods, Overlay, Session};
-    let now = std::time::Instant::now();
-    let (mut s, effects) = Session::without_status_line(80, 24);
-    assert_eq!(effects, vec![Effect::Spawn { pane: 0, cols: 80, rows: 24, cwd_of: None }]);
-    assert_eq!(s.view("").overlay, None);
-    let prefix = Key { code: KeyCode::Char('b'), mods: Mods { ctrl: true, ..Mods::default() } };
-    let plain = |c| Key { code: KeyCode::Char(c), mods: Mods::default() };
-    assert_eq!(s.key(prefix, now), KeyResult::Handled(vec![]));
-    s.key(plain('x'), now);
-    assert_eq!(
-        s.view("").overlay,
-        // confirm-before appends a space to the prompt (cmd-confirm-before.c).
-        Some(Overlay::Confirm { prompt: "kill-pane 0? (y/n) ".to_owned(), target: ConfirmTarget::Pane })
-    );
-    s.key(plain('n'), now);
-    assert_eq!(s.view("").overlay, None);
-    s.key(prefix, now);
-    s.key(plain(','), now);
-    match s.view("").overlay {
-        Some(Overlay::Input { prompt, text, cursor }) => {
-            assert_eq!(prompt, "(rename-window) ");
-            assert_eq!(cursor, text.chars().count());
-        }
-        other => panic!("expected a rename prompt, got {other:?}"),
-    }
 }

@@ -1,19 +1,20 @@
 //! OpenGL 3.3 renderer.
 //!
-//! Two draw calls per frame:
-//! 1. Backgrounds: one full-window triangle whose fragment shader looks up
-//!    the cell under each pixel in a `cols x rows` RGBA texture.
-//! 2. Foreground: instanced quads for glyphs (from one RGBA atlas) and solid
-//!    rectangles (cursor, underlines, box-drawing lines).
+//! After clearing to the window background:
+//! 1. Backgrounds: one quad per pane grid whose fragment shader looks up the
+//!    cell under each pixel in the pane's `cols x rows` RGBA texture.
+//! 2. Foreground: one instanced draw of quads in window pixels for glyphs
+//!    (from one RGBA atlas) and rectangles (cursors, underlines, box-drawing
+//!    lines, dividers, the tab bar and dialogs).
 //!
-//! Only dirty frame rows rebuild their background texels and instances.
+//! Only dirty grid rows rebuild their background texels and instances.
 
 use std::collections::HashMap;
 
 use glow::HasContext;
 
 use crate::font::{Face, Fonts, face_for};
-use crate::frame::{BOLD, CursorStyle, Frame, FrameCell, ITALIC, STRIKE, Shape, UNDERLINE, WIDE};
+use crate::frame::{BOLD, CursorStyle, Frame, FrameCell, Grid, ITALIC, STRIKE, Shape, UNDERLINE, WIDE};
 
 const ATLAS_SIZE: i32 = 2048;
 const FLAG_COLORED: u32 = 1;
@@ -23,11 +24,11 @@ const FLAG_ROUND: u32 = 4;
 /// Only the 1px outline of a rounded rectangle.
 const FLAG_RING: u32 = 8;
 
+/// A quad whose top-left corner is at `pos` in window pixels.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 struct Instance {
-    cell: [u16; 2],
-    offset: [i16; 2],
+    pos: [i16; 2],
     size: [u16; 2],
     uv: [u16; 2],
     color: [u8; 4],
@@ -71,9 +72,18 @@ impl Atlas {
     }
 }
 
-struct Uniforms {
+/// What the renderer keeps for one pane grid between frames.
+struct GridCache {
+    texture: glow::Texture,
+    size: (u16, u16),
+    origin: (i32, i32),
+    rows: Vec<Vec<Instance>>,
+}
+
+struct BgUniforms {
+    origin: glow::UniformLocation,
+    size: glow::UniformLocation,
     cell: glow::UniformLocation,
-    pad: glow::UniformLocation,
     viewport: glow::UniformLocation,
 }
 
@@ -81,13 +91,11 @@ pub struct Renderer {
     gl: glow::Context,
     pub fonts: Fonts,
     bg_program: glow::Program,
-    bg_uniforms: Uniforms,
-    bg_default: glow::UniformLocation,
-    bg_texture: glow::Texture,
-    bg_size: (u16, u16),
+    bg_uniforms: BgUniforms,
     bg_row: Vec<[u8; 4]>,
+    grids: HashMap<u32, GridCache>,
     fg_program: glow::Program,
-    fg_uniforms: Uniforms,
+    fg_viewport: glow::UniformLocation,
     empty_vao: glow::VertexArray,
     fg_vao: glow::VertexArray,
     fg_buffer: glow::Buffer,
@@ -95,47 +103,40 @@ pub struct Renderer {
     atlas: Atlas,
     ascii: Box<[[Option<Glyph>; 128]; 6]>,
     glyphs: HashMap<(u32, Face), Option<Glyph>>,
-    rows: Vec<Vec<Instance>>,
     upload: Vec<Instance>,
     viewport: (u32, u32),
-    padding: (f32, f32),
 }
 
 const BG_VS: &str = r#"#version 330 core
+uniform vec2 u_origin;
+uniform vec2 u_size;
+uniform vec2 u_viewport;
 void main() {
-    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
-    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+    vec2 corner = vec2(gl_VertexID & 1, (gl_VertexID >> 1) & 1);
+    vec2 ndc = (u_origin + corner * u_size) / u_viewport * 2.0 - 1.0;
+    gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
 }
 "#;
 
 const BG_FS: &str = r#"#version 330 core
 uniform sampler2D u_bg;
+uniform vec2 u_origin;
 uniform vec2 u_cell;
-uniform vec2 u_pad;
 uniform vec2 u_viewport;
-uniform vec4 u_default_bg;
 out vec4 frag;
 void main() {
     vec2 px = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
-    ivec2 cell = ivec2(floor((px - u_pad) / u_cell));
-    ivec2 size = textureSize(u_bg, 0);
-    if (any(lessThan(cell, ivec2(0))) || any(greaterThanEqual(cell, size))) {
-        frag = u_default_bg;
-    } else {
-        frag = texelFetch(u_bg, cell, 0);
-    }
+    ivec2 cell = ivec2(floor((px - u_origin) / u_cell));
+    frag = texelFetch(u_bg, clamp(cell, ivec2(0), textureSize(u_bg, 0) - 1), 0);
 }
 "#;
 
 const FG_VS: &str = r#"#version 330 core
-layout(location = 0) in uvec2 a_cell;
-layout(location = 1) in ivec2 a_offset;
-layout(location = 2) in uvec2 a_size;
-layout(location = 3) in uvec2 a_uv;
-layout(location = 4) in vec4 a_color;
-layout(location = 5) in uint a_flags;
-uniform vec2 u_cell;
-uniform vec2 u_pad;
+layout(location = 0) in ivec2 a_pos;
+layout(location = 1) in uvec2 a_size;
+layout(location = 2) in uvec2 a_uv;
+layout(location = 3) in vec4 a_color;
+layout(location = 4) in uint a_flags;
 uniform vec2 u_viewport;
 out vec2 v_uv;
 out vec2 v_local;
@@ -148,7 +149,7 @@ void main() {
     v_local = corner * vec2(a_size);
     v_size = vec2(a_size);
     v_radius = float(a_uv.x);
-    vec2 px = u_pad + vec2(a_cell) * u_cell + vec2(a_offset) + corner * vec2(a_size);
+    vec2 px = vec2(a_pos) + corner * vec2(a_size);
     vec2 ndc = px / u_viewport * 2.0 - 1.0;
     gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
     v_uv = (vec2(a_uv) + corner * vec2(a_size)) / 2048.0;
@@ -217,11 +218,8 @@ unsafe fn program(gl: &glow::Context, vs: &str, fs: &str) -> glow::Program {
     }
 }
 
-unsafe fn uniforms(gl: &glow::Context, program: glow::Program) -> Uniforms {
-    unsafe {
-        let get = |name| gl.get_uniform_location(program, name).unwrap_or_else(|| panic!("uniform {name}"));
-        Uniforms { cell: get("u_cell"), pad: get("u_pad"), viewport: get("u_viewport") }
-    }
+unsafe fn uniform(gl: &glow::Context, program: glow::Program, name: &str) -> glow::UniformLocation {
+    unsafe { gl.get_uniform_location(program, name).unwrap_or_else(|| panic!("uniform {name}")) }
 }
 
 unsafe fn new_texture(gl: &glow::Context, w: i32, h: i32) -> glow::Texture {
@@ -279,10 +277,14 @@ impl Renderer {
     pub fn new(gl: glow::Context, fonts: Fonts) -> Renderer {
         unsafe {
             let bg_program = program(&gl, BG_VS, BG_FS);
-            let bg_uniforms = uniforms(&gl, bg_program);
-            let bg_default = gl.get_uniform_location(bg_program, "u_default_bg").expect("u_default_bg");
+            let bg_uniforms = BgUniforms {
+                origin: uniform(&gl, bg_program, "u_origin"),
+                size: uniform(&gl, bg_program, "u_size"),
+                cell: uniform(&gl, bg_program, "u_cell"),
+                viewport: uniform(&gl, bg_program, "u_viewport"),
+            };
             let fg_program = program(&gl, FG_VS, FG_FS);
-            let fg_uniforms = uniforms(&gl, fg_program);
+            let fg_viewport = uniform(&gl, fg_program, "u_viewport");
 
             let empty_vao = gl.create_vertex_array().expect("vao");
             let fg_vao = gl.create_vertex_array().expect("vao");
@@ -291,24 +293,22 @@ impl Renderer {
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(fg_buffer));
             let stride = size_of::<Instance>() as i32;
             for (index, size, ty, offset) in [
-                (0, 2, glow::UNSIGNED_SHORT, 0),
-                (1, 2, glow::SHORT, 4),
+                (0, 2, glow::SHORT, 0),
+                (1, 2, glow::UNSIGNED_SHORT, 4),
                 (2, 2, glow::UNSIGNED_SHORT, 8),
-                (3, 2, glow::UNSIGNED_SHORT, 12),
-                (5, 1, glow::UNSIGNED_INT, 20),
+                (4, 1, glow::UNSIGNED_INT, 16),
             ] {
                 gl.vertex_attrib_pointer_i32(index, size, ty, stride, offset);
                 gl.vertex_attrib_divisor(index, 1);
                 gl.enable_vertex_attrib_array(index);
             }
-            gl.vertex_attrib_pointer_f32(4, 4, glow::UNSIGNED_BYTE, true, stride, 16);
-            gl.vertex_attrib_divisor(4, 1);
-            gl.enable_vertex_attrib_array(4);
+            gl.vertex_attrib_pointer_f32(3, 4, glow::UNSIGNED_BYTE, true, stride, 12);
+            gl.vertex_attrib_divisor(3, 1);
+            gl.enable_vertex_attrib_array(3);
             gl.bind_vertex_array(None);
 
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
             let atlas_texture = new_texture(&gl, ATLAS_SIZE, ATLAS_SIZE);
-            let bg_texture = new_texture(&gl, 1, 1);
             gl.use_program(Some(bg_program));
             gl.uniform_1_i32(gl.get_uniform_location(bg_program, "u_bg").as_ref(), 0);
             gl.use_program(Some(fg_program));
@@ -320,12 +320,10 @@ impl Renderer {
                 fonts,
                 bg_program,
                 bg_uniforms,
-                bg_default,
-                bg_texture,
-                bg_size: (1, 1),
                 bg_row: Vec::new(),
+                grids: HashMap::new(),
                 fg_program,
-                fg_uniforms,
+                fg_viewport,
                 empty_vao,
                 fg_vao,
                 fg_buffer,
@@ -333,10 +331,8 @@ impl Renderer {
                 atlas: Atlas { texture: atlas_texture, x: 0, y: 0, shelf_height: 0 },
                 ascii: Box::new([[None; 128]; 6]),
                 glyphs: HashMap::new(),
-                rows: Vec::new(),
                 upload: Vec::new(),
                 viewport: (1, 1),
-                padding: (0.0, 0.0),
             }
         }
     }
@@ -351,19 +347,13 @@ impl Renderer {
         }
     }
 
-    /// The grid's top-left corner in window pixels.
-    pub fn grid_origin(&self) -> (i32, i32) {
-        (self.padding.0 as i32, self.padding.1 as i32)
-    }
-
     pub fn cell_size(&self) -> (u32, u32) {
         (self.fonts.cell_width, self.fonts.cell_height)
     }
 
-    /// Sets the drawable size in pixels and where the grid's top-left corner is.
-    pub fn resize(&mut self, width: u32, height: u32, pad_x: u32, pad_y: u32) {
+    /// Sets the drawable size in pixels.
+    pub fn resize(&mut self, width: u32, height: u32) {
         self.viewport = (width.max(1), height.max(1));
-        self.padding = (pad_x as f32, pad_y as f32);
         unsafe { self.gl.viewport(0, 0, width as i32, height as i32) };
     }
 
@@ -416,10 +406,9 @@ impl Renderer {
         })
     }
 
-    fn rect(cell: [u16; 2], x: i32, y: i32, w: i32, h: i32, color: [u8; 4]) -> Instance {
+    fn rect(x: i32, y: i32, w: i32, h: i32, color: [u8; 4]) -> Instance {
         Instance {
-            cell,
-            offset: [x as i16, y as i16],
+            pos: [x as i16, y as i16],
             size: [w.max(0) as u16, h.max(0) as u16],
             uv: [0, 0],
             color,
@@ -427,29 +416,29 @@ impl Renderer {
         }
     }
 
-    fn push_cell(&mut self, out: &mut Vec<Instance>, pos: [u16; 2], cell: &FrameCell, fg: [u8; 4]) {
+    /// The instances of `cell` with its top-left corner at (`px`, `py`).
+    fn push_cell(&mut self, out: &mut Vec<Instance>, px: i32, py: i32, cell: &FrameCell, fg: [u8; 4]) {
         let (cw, chh) = (self.fonts.cell_width as i32, self.fonts.cell_height as i32);
         if let Some([left, right, up, down]) = box_arms(cell.ch) {
             let t = (chh / 16).max(1);
             let (mx, my) = ((cw - t) / 2, (chh - t) / 2);
             if left {
-                out.push(Self::rect(pos, 0, my, mx + t, t, fg));
+                out.push(Self::rect(px, py + my, mx + t, t, fg));
             }
             if right {
-                out.push(Self::rect(pos, mx, my, cw - mx, t, fg));
+                out.push(Self::rect(px + mx, py + my, cw - mx, t, fg));
             }
             if up {
-                out.push(Self::rect(pos, mx, 0, t, my + t, fg));
+                out.push(Self::rect(px + mx, py, t, my + t, fg));
             }
             if down {
-                out.push(Self::rect(pos, mx, my, t, chh - my, fg));
+                out.push(Self::rect(px + mx, py + my, t, chh - my, fg));
             }
         } else if cell.ch > b' ' as u32 {
             let face = face_for(cell.flags & BOLD != 0, cell.flags & ITALIC != 0);
             if let Some(g) = self.glyph(cell.ch, face).filter(|g| g.size[0] > 0) {
                 out.push(Instance {
-                    cell: pos,
-                    offset: g.offset,
+                    pos: [(px + g.offset[0] as i32) as i16, (py + g.offset[1] as i32) as i16],
                     size: g.size,
                     uv: g.uv,
                     color: fg,
@@ -459,10 +448,10 @@ impl Renderer {
         }
         let width = if cell.flags & WIDE != 0 { 2 * cw } else { cw };
         if cell.flags & UNDERLINE != 0 {
-            out.push(Self::rect(pos, 0, self.fonts.underline_y, width, self.fonts.underline_thickness, fg));
+            out.push(Self::rect(px, py + self.fonts.underline_y, width, self.fonts.underline_thickness, fg));
         }
         if cell.flags & STRIKE != 0 {
-            out.push(Self::rect(pos, 0, self.fonts.strike_y, width, self.fonts.underline_thickness, fg));
+            out.push(Self::rect(px, py + self.fonts.strike_y, width, self.fonts.underline_thickness, fg));
         }
     }
 
@@ -471,9 +460,7 @@ impl Renderer {
         text.chars().map(|c| self.glyph(c as u32, face).map_or(0, |g| g.advance as i32)).sum()
     }
 
-    /// A shape in window pixels; instances are relative to the grid origin.
     fn push_shape(&mut self, out: &mut Vec<Instance>, shape: &Shape) {
-        let (px, py) = (self.padding.0 as i32, self.padding.1 as i32);
         match shape {
             Shape::Rect { x, y, w, h, color, radius, ring } => {
                 let mut flags = FLAG_RECT;
@@ -484,8 +471,7 @@ impl Renderer {
                     flags |= FLAG_ROUND | FLAG_RING;
                 }
                 out.push(Instance {
-                    cell: [0, 0],
-                    offset: [(x - px) as i16, (y - py) as i16],
+                    pos: [*x as i16, *y as i16],
                     size: [(*w).max(0) as u16, (*h).max(0) as u16],
                     uv: [*radius, 0],
                     color: *color,
@@ -493,13 +479,12 @@ impl Renderer {
                 });
             }
             Shape::Text { x, y, text, color, face } => {
-                let mut pen = x - px;
+                let mut pen = *x;
                 for ch in text.chars() {
                     let Some(g) = self.glyph(ch as u32, *face) else { continue };
                     if g.size[0] > 0 {
                         out.push(Instance {
-                            cell: [0, 0],
-                            offset: [(pen + g.offset[0] as i32) as i16, (y - py + g.offset[1] as i32) as i16],
+                            pos: [(pen + g.offset[0] as i32) as i16, (y + g.offset[1] as i32) as i16],
                             size: g.size,
                             uv: g.uv,
                             color: *color,
@@ -512,25 +497,34 @@ impl Renderer {
         }
     }
 
-    fn rebuild_row(&mut self, frame: &Frame, y: u16) {
-        let mut out = std::mem::take(&mut self.rows[y as usize]);
+    fn rebuild_row(&mut self, cache: &mut GridCache, grid: &Grid, y: u16) {
+        let (cw, ch) = (self.fonts.cell_width as i32, self.fonts.cell_height as i32);
+        let mut out = std::mem::take(&mut cache.rows[y as usize]);
         out.clear();
-        for (x, cell) in frame.row(y).iter().enumerate() {
+        let py = grid.y + y as i32 * ch;
+        for (x, cell) in grid.row(y).iter().enumerate() {
             if cell.ch != 0 || cell.flags & (UNDERLINE | STRIKE) != 0 {
-                self.push_cell(&mut out, [x as u16, y], cell, cell.fg);
+                self.push_cell(&mut out, grid.x + x as i32 * cw, py, cell, cell.fg);
             }
         }
-        self.rows[y as usize] = out;
+        cache.rows[y as usize] = out;
     }
 
-    /// Draws the frame and clears its dirty marks.
-    pub fn draw(&mut self, frame: &mut Frame) {
-        let (cols, rows) = (frame.cols(), frame.rows());
+    /// Uploads the dirty background rows of `grid`, (re)creating its cache.
+    fn upload_background(&mut self, grid: &mut Grid) {
+        let (cols, rows) = (grid.cols(), grid.rows());
+        let gl = &self.gl;
+        let cache = self.grids.entry(grid.id).or_insert_with(|| GridCache {
+            texture: unsafe { new_texture(gl, 1, 1) },
+            size: (0, 0),
+            origin: (grid.x, grid.y),
+            rows: Vec::new(),
+        });
         unsafe {
-            self.gl.active_texture(glow::TEXTURE0);
-            self.gl.bind_texture(glow::TEXTURE_2D, Some(self.bg_texture));
-            if self.bg_size != (cols, rows) {
-                self.gl.tex_image_2d(
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(cache.texture));
+            if cache.size != (cols, rows) {
+                gl.tex_image_2d(
                     glow::TEXTURE_2D,
                     0,
                     glow::RGBA8 as i32,
@@ -541,19 +535,21 @@ impl Renderer {
                     glow::UNSIGNED_BYTE,
                     glow::PixelUnpackData::Slice(None),
                 );
-                self.bg_size = (cols, rows);
-                self.rows = vec![Vec::new(); rows as usize];
-                for y in 0..rows {
-                    frame.row_mut(y);
-                }
+                cache.size = (cols, rows);
+                cache.rows = vec![Vec::new(); rows as usize];
+                grid.mark_dirty();
             }
         }
-        // All background rows first: loading a glyph switches the active texture unit.
-        for y in (0..rows).filter(|&y| frame.is_dirty(y)) {
+        if cache.origin != (grid.x, grid.y) {
+            // Instances are in window pixels: a moved pane rebuilds them all.
+            cache.origin = (grid.x, grid.y);
+            grid.mark_dirty();
+        }
+        for y in (0..rows).filter(|&y| grid.is_dirty(y)) {
             self.bg_row.clear();
-            self.bg_row.extend(frame.row(y).iter().map(|c| c.bg));
+            self.bg_row.extend(grid.row(y).iter().map(|c| c.bg));
             unsafe {
-                self.gl.tex_sub_image_2d(
+                gl.tex_sub_image_2d(
                     glow::TEXTURE_2D,
                     0,
                     0,
@@ -566,39 +562,58 @@ impl Renderer {
                 );
             }
         }
-        for y in (0..rows).filter(|&y| frame.is_dirty(y)) {
-            self.rebuild_row(frame, y);
-        }
-        frame.clear_dirty();
+    }
 
+    /// Draws the frame and clears its grids' dirty marks.
+    pub fn draw(&mut self, frame: &mut Frame) {
+        let gl = &self.gl;
+        self.grids.retain(|id, cache| {
+            let keep = frame.grids.iter().any(|g| g.id == *id);
+            if !keep {
+                unsafe { gl.delete_texture(cache.texture) };
+            }
+            keep
+        });
+        // All background rows first: loading a glyph switches the active texture unit.
+        for grid in &mut frame.grids {
+            self.upload_background(grid);
+        }
         let mut upload = std::mem::take(&mut self.upload);
         upload.clear();
-        for row in &self.rows {
-            upload.extend_from_slice(row);
+        for grid in &mut frame.grids {
+            let mut cache = self.grids.remove(&grid.id).expect("grid cache");
+            for y in (0..grid.rows()).filter(|&y| grid.is_dirty(y)) {
+                self.rebuild_row(&mut cache, grid, y);
+            }
+            grid.clear_dirty();
+            for row in &cache.rows {
+                upload.extend_from_slice(row);
+            }
+            self.grids.insert(grid.id, cache);
         }
         let (cw, ch) = (self.fonts.cell_width as i32, self.fonts.cell_height as i32);
-        for cursor in frame.cursors.iter().filter(|c| c.x < cols && c.y < rows) {
-            let pos = [cursor.x, cursor.y];
+        for cursor in &frame.cursors {
+            let Some(grid) = frame.grids.get(cursor.grid).filter(|g| cursor.x < g.cols() && cursor.y < g.rows()) else {
+                continue;
+            };
+            let (x, y) = (grid.x + cursor.x as i32 * cw, grid.y + cursor.y as i32 * ch);
             let width = if cursor.wide { 2 * cw } else { cw };
             match cursor.style {
                 CursorStyle::Block => {
-                    upload.push(Self::rect(pos, 0, 0, width, ch, cursor.color));
-                    let cell = frame.row(cursor.y)[cursor.x as usize];
-                    self.push_cell(&mut upload, pos, &cell, cursor.text_color);
+                    upload.push(Self::rect(x, y, width, ch, cursor.color));
+                    let cell = grid.row(cursor.y)[cursor.x as usize];
+                    self.push_cell(&mut upload, x, y, &cell, cursor.text_color);
                 }
-                CursorStyle::Underline => upload.push(Self::rect(pos, 0, ch - 2, width, 2, cursor.color)),
-                CursorStyle::Bar => upload.push(Self::rect(pos, 0, 0, 2, ch, cursor.color)),
+                CursorStyle::Underline => upload.push(Self::rect(x, y + ch - 2, width, 2, cursor.color)),
+                CursorStyle::Bar => upload.push(Self::rect(x, y, 2, ch, cursor.color)),
                 CursorStyle::Hollow => {
                     // A 1px outline, like ghostty's block_hollow with cursor_thickness 1.
-                    upload.push(Self::rect(pos, 0, 0, width, 1, cursor.color));
-                    upload.push(Self::rect(pos, 0, ch - 1, width, 1, cursor.color));
-                    upload.push(Self::rect(pos, 0, 0, 1, ch, cursor.color));
-                    upload.push(Self::rect(pos, width - 1, 0, 1, ch, cursor.color));
+                    upload.push(Self::rect(x, y, width, 1, cursor.color));
+                    upload.push(Self::rect(x, y + ch - 1, width, 1, cursor.color));
+                    upload.push(Self::rect(x, y, 1, ch, cursor.color));
+                    upload.push(Self::rect(x + width - 1, y, 1, ch, cursor.color));
                 }
             }
-        }
-        for dim in &frame.dims {
-            upload.push(Self::rect([dim.x, dim.y], 0, 0, dim.w as i32 * cw, dim.h as i32 * ch, dim.color));
         }
         for shape in &frame.shapes {
             self.push_shape(&mut upload, shape);
@@ -606,23 +621,28 @@ impl Renderer {
 
         let gl = &self.gl;
         let (vw, vh) = (self.viewport.0 as f32, self.viewport.1 as f32);
-        let (cw, ch) = (self.fonts.cell_width as f32, self.fonts.cell_height as f32);
         unsafe {
             let bg = frame.default_bg.map(|c| c as f32 / 255.0);
-            gl.use_program(Some(self.bg_program));
-            gl.uniform_2_f32(Some(&self.bg_uniforms.cell), cw, ch);
-            gl.uniform_2_f32(Some(&self.bg_uniforms.pad), self.padding.0, self.padding.1);
-            gl.uniform_2_f32(Some(&self.bg_uniforms.viewport), vw, vh);
-            gl.uniform_4_f32(Some(&self.bg_default), bg[0], bg[1], bg[2], bg[3]);
-            gl.bind_vertex_array(Some(self.empty_vao));
             gl.disable(glow::BLEND);
-            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            gl.clear_color(bg[0], bg[1], bg[2], bg[3]);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            gl.use_program(Some(self.bg_program));
+            gl.uniform_2_f32(Some(&self.bg_uniforms.cell), cw as f32, ch as f32);
+            gl.uniform_2_f32(Some(&self.bg_uniforms.viewport), vw, vh);
+            gl.bind_vertex_array(Some(self.empty_vao));
+            gl.active_texture(glow::TEXTURE0);
+            for grid in &frame.grids {
+                let cache = &self.grids[&grid.id];
+                gl.bind_texture(glow::TEXTURE_2D, Some(cache.texture));
+                gl.uniform_2_f32(Some(&self.bg_uniforms.origin), grid.x as f32, grid.y as f32);
+                let size = (grid.cols() as i32 * cw, grid.rows() as i32 * ch);
+                gl.uniform_2_f32(Some(&self.bg_uniforms.size), size.0 as f32, size.1 as f32);
+                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            }
             if !upload.is_empty() {
                 gl.enable(glow::BLEND);
                 gl.use_program(Some(self.fg_program));
-                gl.uniform_2_f32(Some(&self.fg_uniforms.cell), cw, ch);
-                gl.uniform_2_f32(Some(&self.fg_uniforms.pad), self.padding.0, self.padding.1);
-                gl.uniform_2_f32(Some(&self.fg_uniforms.viewport), vw, vh);
+                gl.uniform_2_f32(Some(&self.fg_viewport), vw, vh);
                 gl.active_texture(glow::TEXTURE1);
                 gl.bind_texture(glow::TEXTURE_2D, Some(self.atlas.texture));
                 gl.bind_vertex_array(Some(self.fg_vao));

@@ -4,28 +4,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::keys::KeyState;
-use crate::layout::{LayoutType, WINDOW_MAXIMUM};
+use crate::split::Side;
 use crate::window::{Pane, Window};
-use crate::{format, Command, Direction, Effect, PaneId, Session};
+use crate::{format, Command, Direction, Effect, Metrics, PaneId, Session};
 
-/// The error of a `split-window -f` that tmux 3.6 would carry out with
-/// wrapped unsigned sizes (layout_resize_child_cells), making the server
-/// allocate a pane of billions of cells. The model refuses it instead.
-pub(crate) const SPLIT_OVERFLOW: &str =
-    "no space for new pane (tmux 3.6 would overflow the layout)";
-
-/// The error of a `select-layout -E` whose layout_spread_cell asks a cell to
-/// shrink below its minimum: tmux 3.6 then loops forever in
-/// layout_resize_adjust or wraps a pane size. The model refuses it.
-pub(crate) const SPREAD_OVERFLOW: &str =
-    "can't spread out the layout (tmux 3.6 would hang or overflow the layout)";
-
-pub(crate) fn new_session(cols: u16, rows: u16, status: bool) -> (Session, Vec<Effect>) {
+pub(crate) fn new_session(metrics: Metrics) -> (Session, Vec<Effect>) {
     let mut s = Session {
         name: "0".to_owned(),
-        cols,
-        rows,
-        status,
+        metrics,
         winlinks: BTreeMap::new(),
         curw: 0,
         lastw: Vec::new(),
@@ -58,21 +44,22 @@ impl Session {
         }
         let before = self.size_map();
         f(self);
-        self.server_loop();
-        debug_assert!(self.winlinks.values().all(Window::layout_valid), "inconsistent layout");
+        for w in self.winlinks.values_mut() {
+            w.relayout();
+        }
         self.generation += 1;
         self.collect_effects(&before)
     }
 
-    fn size_map(&self) -> BTreeMap<PaneId, (u32, u32)> {
+    fn size_map(&self) -> BTreeMap<PaneId, (u16, u16)> {
         self.winlinks
             .values()
             .flat_map(|w| w.panes.iter())
-            .map(|p| (p.id, (p.sx, p.sy)))
+            .map(|p| (p.id, (p.cols, p.rows)))
             .collect()
     }
 
-    fn collect_effects(&mut self, before: &BTreeMap<PaneId, (u32, u32)>) -> Vec<Effect> {
+    fn collect_effects(&mut self, before: &BTreeMap<PaneId, (u16, u16)>) -> Vec<Effect> {
         let after = self.size_map();
         let spawned: Vec<_> = std::mem::take(&mut self.spawned);
         let new: BTreeSet<PaneId> = spawned.iter().map(|s| s.0).collect();
@@ -80,14 +67,14 @@ impl Session {
         for pane in before.keys().filter(|p| !after.contains_key(p)) {
             effects.push(Effect::Destroy { pane: *pane });
         }
-        for (pane, &(sx, sy)) in &after {
-            if !new.contains(pane) && before.get(pane).is_some_and(|&b| b != (sx, sy)) {
-                effects.push(Effect::Resize { pane: *pane, cols: clamp(sx), rows: clamp(sy) });
+        for (pane, &(cols, rows)) in &after {
+            if !new.contains(pane) && before.get(pane).is_some_and(|&b| b != (cols, rows)) {
+                effects.push(Effect::Resize { pane: *pane, cols, rows });
             }
         }
         for (pane, cwd_of) in spawned {
-            if let Some(&(sx, sy)) = after.get(&pane) {
-                effects.push(Effect::Spawn { pane, cols: clamp(sx), rows: clamp(sy), cwd_of });
+            if let Some(&(cols, rows)) = after.get(&pane) {
+                effects.push(Effect::Spawn { pane, cols, rows, cwd_of });
             }
         }
         effects.append(&mut self.writes);
@@ -125,23 +112,10 @@ impl Session {
         self.winlinks.iter().find(|(_, w)| w.id == id).map(|(&i, _)| i)
     }
 
-    /// Whether the client has room for the status line (`CLIENT_STATUSOFF`).
-    pub(crate) fn status_lines(&self) -> u32 {
-        u32::from(self.status && self.rows > 1)
-    }
-
-    /// The window size the client asks for (clients_calculate_size and
-    /// default_window_size for the single client).
-    pub(crate) fn area(&self) -> (u32, u32) {
-        let sx = u32::from(self.cols);
-        let sy = u32::from(self.rows) - self.status_lines().min(u32::from(self.rows));
-        (sx.clamp(1, WINDOW_MAXIMUM), sy.clamp(1, WINDOW_MAXIMUM))
-    }
-
-    fn new_pane(&mut self, sx: u32, sy: u32) -> Pane {
+    fn new_pane(&mut self) -> Pane {
         let id = self.next_pane_id;
         self.next_pane_id += 1;
-        Pane::new(id, sx, sy)
+        Pane::new(id)
     }
 
     /// winlink_add(-1 - base-index): the lowest free index.
@@ -153,13 +127,10 @@ impl Session {
     /// client. Returns the index; the caller selects it.
     fn spawn_window(&mut self, cwd_of: Option<PaneId>) -> u32 {
         let idx = self.free_index();
-        let (sx, sy) = self.area();
-        let pane = self.new_pane(sx, sy);
+        let pane = self.new_pane();
         let id = pane.id;
-        let mut w = Window::new(self.next_window_id, sx, sy, id);
+        let mut w = Window::new(self.next_window_id, self.metrics, pane);
         self.next_window_id += 1;
-        w.panes.push(pane);
-        w.layout_init(id);
         // window_set_active_pane with no previous active pane.
         w.panes[0].active_point = self.next_active_point;
         self.next_active_point = self.next_active_point.wrapping_add(1);
@@ -239,9 +210,7 @@ impl Session {
         }
         if self.session_detach(idx) {
             self.dead = true;
-            return;
         }
-        self.recalculate_sizes(false);
     }
 
     /// server_kill_pane
@@ -249,12 +218,8 @@ impl Session {
         let w = self.winlinks.get_mut(&idx).expect("window");
         if w.panes.len() == 1 {
             self.kill_window(idx);
-            if !self.dead {
-                self.recalculate_sizes(false);
-            }
         } else {
             w.unzoom();
-            w.close_pane(wp);
             w.remove_pane(wp);
         }
     }
@@ -264,48 +229,24 @@ impl Session {
         let Some(idx) = self.window_of(wp) else { return };
         let w = self.winlinks.get_mut(&idx).expect("window");
         w.unzoom();
-        w.close_pane(wp);
         w.remove_pane(wp);
         if w.panes.is_empty() {
             self.kill_window(idx);
         }
     }
 
-    /// recalculate_sizes / recalculate_sizes_now for the single client.
-    pub(crate) fn recalculate_sizes(&mut self, now: bool) {
-        let (sx, sy) = self.area();
+    /// The client's pixel geometry changed: every window takes the new area.
+    pub(crate) fn set_metrics(&mut self, metrics: Metrics) {
+        self.metrics = metrics;
         for w in self.winlinks.values_mut() {
-            let unchanged = match w.pending_resize {
-                Some(pending) => pending == (sx, sy),
-                None => (w.sx, w.sy) == (sx, sy),
-            };
-            if !now && unchanged {
-                continue;
-            }
-            if now {
-                resize_window(w, sx, sy, &mut self.next_active_point);
-            } else {
-                w.pending_resize = Some((sx, sy));
-            }
-        }
-    }
-
-    /// server_client_check_window_resize: only the current window of the
-    /// attached session is resized by the server loop.
-    fn server_loop(&mut self) {
-        if self.dead {
-            return;
-        }
-        let (w, point) = self.cur_point();
-        if let Some((sx, sy)) = w.pending_resize {
-            resize_window(w, sx, sy, point);
+            w.metrics = metrics;
         }
     }
 
     pub(crate) fn exec(&mut self, cmd: &Command) -> Result<(), String> {
         match *cmd {
-            Command::SplitWindow { horizontal, before, full, size, cwd_of_active } => {
-                self.split_window(horizontal, before, full, size, cwd_of_active)
+            Command::SplitWindow { horizontal, before, full, cwd_of_active } => {
+                self.split_window(Side { horizontal, before }, full, cwd_of_active)
             }
             Command::NewWindow { cwd_of_active } => {
                 let cwd_of = cwd_of_active.then(|| self.cur().active);
@@ -370,18 +311,8 @@ impl Session {
                 self.swap_window(offset);
                 Ok(())
             }
-            Command::SpreadLayout => {
-                let w = self.cur_mut();
-                let saved = w.clone();
-                w.unzoom();
-                w.stuck = false;
-                let wp = w.active;
-                w.spread_out(wp);
-                if w.stuck || !w.layout_valid() {
-                    *w = saved;
-                    return Err(SPREAD_OVERFLOW.to_owned());
-                }
-                self.recalculate_sizes(false);
+            Command::Equalize => {
+                self.cur_mut().tree.equalize();
                 Ok(())
             }
             Command::RenameWindow(ref name) => {
@@ -398,37 +329,20 @@ impl Session {
         }
     }
 
-    /// cmd_split_window_exec
-    fn split_window(
-        &mut self,
-        horizontal: bool,
-        before: bool,
-        full: bool,
-        size: Option<u32>,
-        cwd_of_active: bool,
-    ) -> Result<(), String> {
-        let ty = if horizontal { LayoutType::LeftRight } else { LayoutType::TopBottom };
-        let size = size.map_or(-1, |n| i32::try_from(n).unwrap_or(i32::MAX));
+    /// cmd_split_window_exec: the new pane takes half of the active pane (or
+    /// of the window when `full`), as ghostty's new_split does.
+    fn split_window(&mut self, side: Side, full: bool, cwd_of_active: bool) -> Result<(), String> {
         let w = self.cur_mut();
         let wp = w.active;
-        // A refused overflow leaves the window as it was, zoom included.
-        let saved = full.then(|| w.clone());
         w.push_zoom(true, false);
-        let Some(lc) = w.split_pane(wp, ty, size, before, full) else {
+        if !w.can_split(wp, side, full) {
             return Err("no space for new pane".to_owned());
-        };
-        if let Some(saved) = saved
-            && !w.layout_valid()
-        {
-            *w = saved;
-            return Err(SPLIT_OVERFLOW.to_owned());
         }
-        let (sx, sy) = (w.sx, w.sy);
-        let pane = self.new_pane(sx, sy);
+        let pane = self.new_pane();
         let id = pane.id;
         let (w, point) = self.cur_point();
-        w.add_pane(pane, wp, before, full);
-        w.assign_pane(lc, id, false);
+        w.add_pane(pane, wp, side, full);
+        w.relayout();
         w.set_active(id, point);
         w.pop_zoom(point);
         self.spawned.push((id, cwd_of_active.then_some(wp)));
@@ -440,12 +354,7 @@ impl Session {
         let (w, point) = self.cur_point();
         let wp = w.active;
         w.push_zoom(false, true);
-        let found = match dir {
-            Direction::Left => w.find_left(wp),
-            Direction::Right => w.find_right(wp),
-            Direction::Up => w.find_up(wp),
-            Direction::Down => w.find_down(wp),
-        };
+        let found = w.find(wp, dir);
         w.pop_zoom(point);
         let Some(found) = found else { return };
         if found == w.active {
@@ -480,13 +389,15 @@ impl Session {
         let Ok(adjust) = i32::try_from(adjust) else {
             return Err("adjustment too large".to_owned());
         };
+        let m = w.metrics;
+        let (horizontal, cell) = match dir {
+            Direction::Left | Direction::Right => (true, m.cell_width as i32),
+            Direction::Up | Direction::Down => (false, m.cell_height as i32),
+        };
+        let amount = adjust.saturating_mul(cell);
+        let amount = if matches!(dir, Direction::Left | Direction::Up) { -amount } else { amount };
         let wp = w.active;
-        match dir {
-            Direction::Left => w.resize_pane(wp, LayoutType::LeftRight, -adjust, true),
-            Direction::Right => w.resize_pane(wp, LayoutType::LeftRight, adjust, true),
-            Direction::Up => w.resize_pane(wp, LayoutType::TopBottom, -adjust, true),
-            Direction::Down => w.resize_pane(wp, LayoutType::TopBottom, adjust, true),
-        }
+        w.tree.resize(wp, horizontal, amount, m.area(), &m);
         Ok(())
     }
 
@@ -506,13 +417,9 @@ impl Session {
             return;
         }
         let wp = w.active;
-        w.close_pane(wp);
         let pane = w.remove_pane(wp);
-        let (sx, sy) = (w.sx, w.sy);
-        let mut nw = Window::new(self.next_window_id, sx, sy, wp);
+        let nw = Window::new(self.next_window_id, self.metrics, pane);
         self.next_window_id += 1;
-        nw.panes.push(pane);
-        nw.layout_init(wp);
         let new = self.free_index();
         self.winlinks.insert(new, nw);
         self.set_current(new);
@@ -529,19 +436,9 @@ impl Session {
             w.next_of(dst).unwrap_or_else(|| w.panes[0].id)
         };
         if src != dst {
-            let (ps, pd) = (w.pos(src).expect("pane"), w.pos(dst).expect("pane"));
-            w.panes.swap(ps, pd);
-            let (src_lc, dst_lc) = (w.pane(src).cell, w.pane(dst).cell);
-            w.pane_mut(dst).cell = src_lc;
-            w.pane_mut(src).cell = dst_lc;
-            w.retarget_cell(src_lc, dst);
-            w.retarget_cell(dst_lc, src);
-            let s = w.pane(src).clone();
-            let d = w.pane(dst).clone();
-            w.pane_mut(src).set_geometry(d.xoff, d.yoff, d.sx, d.sy);
-            w.pane_mut(dst).set_geometry(s.xoff, s.yoff, s.sx, s.sy);
+            w.swap_panes(src, dst);
+            w.relayout();
             w.set_active(dst, point);
-            w.fix_panes(None);
         }
         w.pop_zoom(point);
     }
@@ -551,27 +448,17 @@ impl Session {
         let (w, point) = self.cur_point();
         w.push_zoom(false, false);
         let n = w.panes.len();
+        // The panes move one place along the order; the places stay.
         let new_active = if down {
-            let last = w.panes.pop().expect("pane");
-            w.panes.insert(0, last);
-            let first = w.panes[0].clone();
-            for i in 0..n - 1 {
-                let next = w.panes[i + 1].clone();
-                w.take_place_of(i, &next);
-            }
-            w.take_place_of(n - 1, &first);
+            w.panes.rotate_right(1);
+            w.place_in_order();
             w.prev_of(w.active).unwrap_or(w.panes[n - 1].id)
         } else {
-            let first = w.panes.remove(0);
-            w.panes.push(first);
-            let last = w.panes[n - 1].clone();
-            for i in (1..n).rev() {
-                let prev = w.panes[i - 1].clone();
-                w.take_place_of(i, &prev);
-            }
-            w.take_place_of(0, &last);
+            w.panes.rotate_left(1);
+            w.place_in_order();
             w.next_of(w.active).unwrap_or(w.panes[0].id)
         };
+        w.relayout();
         w.set_active(new_active, point);
         w.pop_zoom(point);
     }
@@ -593,7 +480,6 @@ impl Session {
             return Err(format!("can't find window: {index}"));
         };
         self.set_current(target);
-        self.recalculate_sizes(false);
         Ok(())
     }
 
@@ -602,7 +488,6 @@ impl Session {
         if step(self) != 0 {
             return Err(error.to_owned());
         }
-        self.recalculate_sizes(false);
         Ok(())
     }
 
@@ -618,7 +503,6 @@ impl Session {
         self.winlinks.insert(src, b);
         self.winlinks.insert(dst, a);
         self.set_current(dst);
-        self.recalculate_sizes(false);
     }
 
     /// cmd_rename_window_exec for the window with id `id`.
@@ -654,57 +538,5 @@ impl Session {
     pub(crate) fn kill_window_target(&mut self, id: u32) {
         let idx = self.window_by_id(id).unwrap_or(self.curw);
         self.kill_window(idx);
-    }
-}
-
-/// resize_window
-fn resize_window(w: &mut Window, sx: u32, sy: u32, point: &mut u32) {
-    let sx = sx.clamp(1, WINDOW_MAXIMUM);
-    let sy = sy.clamp(1, WINDOW_MAXIMUM);
-    let zoomed = w.zoomed;
-    if zoomed {
-        w.unzoom();
-    }
-    w.layout_resize(sx, sy);
-    let (root_sx, root_sy) = {
-        let root = w.cell(w.root.expect("layout root"));
-        (root.sx, root.sy)
-    };
-    w.sx = sx.max(root_sx);
-    w.sy = sy.max(root_sy);
-    if zoomed {
-        let active = w.active;
-        w.zoom(active, point);
-    }
-    w.pending_resize = None;
-}
-
-fn clamp(v: u32) -> u16 {
-    u16::try_from(v).unwrap_or(u16::MAX)
-}
-
-impl Pane {
-    fn set_geometry(&mut self, xoff: u32, yoff: u32, sx: u32, sy: u32) {
-        self.xoff = xoff;
-        self.yoff = yoff;
-        self.sx = sx;
-        self.sy = sy;
-    }
-}
-
-impl Window {
-    /// Points layout cell `lc` (if any) at pane `wp`.
-    fn retarget_cell(&mut self, lc: Option<crate::layout::CellId>, wp: PaneId) {
-        if let Some(lc) = lc {
-            self.set_cell_pane(lc, wp);
-        }
-    }
-
-    /// Gives the pane at `pos` the layout cell and geometry of `other` (rotate-window).
-    fn take_place_of(&mut self, pos: usize, other: &Pane) {
-        let id = self.panes[pos].id;
-        self.panes[pos].cell = other.cell;
-        self.retarget_cell(other.cell, id);
-        self.panes[pos].set_geometry(other.xoff, other.yoff, other.sx, other.sy);
     }
 }

@@ -70,7 +70,7 @@ fn run(cmd: Command) -> Option<Binding> {
 }
 
 fn split(horizontal: bool, full: bool) -> Option<Binding> {
-    run(Command::SplitWindow { horizontal, before: false, full, size: None, cwd_of_active: true })
+    run(Command::SplitWindow { horizontal, before: false, full, cwd_of_active: true })
 }
 
 pub(crate) fn is_prefix(key: Key) -> bool {
@@ -97,7 +97,7 @@ pub(crate) fn prefix_binding(key: Key) -> Option<Binding> {
             ';' => run(Command::LastPane),
             '<' => bind(true, Action::Run(Command::SwapWindow(-1))),
             '>' => bind(true, Action::Run(Command::SwapWindow(1))),
-            'E' => run(Command::SpreadLayout),
+            'E' => run(Command::Equalize),
             'H' => bind(true, Action::Run(Command::ResizePane(Left, 5))),
             'J' => bind(true, Action::Run(Command::ResizePane(Down, 5))),
             'K' => bind(true, Action::Run(Command::ResizePane(Up, 5))),

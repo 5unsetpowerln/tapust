@@ -1,8 +1,8 @@
-//! Copies terminal rows into the frame, resolving styles to colors.
+//! Copies terminal rows into pane grids, resolving styles to colors.
 
 use term::{Attrs, Cell, Color, CursorShape, Palette, Rgb, Style, Terminal, Underline, Width};
 
-use crate::frame::{BOLD, CursorStyle, Frame, FrameCell, FrameCursor, ITALIC, STRIKE, UNDERLINE, WIDE};
+use crate::frame::{BOLD, CursorStyle, FrameCell, FrameCursor, Grid, ITALIC, STRIKE, UNDERLINE, WIDE};
 
 fn rgba(c: Rgb) -> [u8; 4] {
     [c.r, c.g, c.b, 0xff]
@@ -62,23 +62,19 @@ fn frame_cell(cell: Cell, term: &Terminal, palette: &Palette, reverse_video: boo
     FrameCell { ch, fg, bg, flags }
 }
 
-/// Copies the terminal's dirty rows (all rows when `full`) into the frame at
-/// (`x0`, `y0`), clipped to `w x h`, and clears the terminal's dirty marks.
-pub fn copy_pane(frame: &mut Frame, term: &mut Terminal, x0: u16, y0: u16, w: u16, h: u16, full: bool) {
-    copy_rows(frame, term, x0, y0, w, h, full);
-    term.clear_dirty();
-}
-
-fn copy_rows(frame: &mut Frame, term: &Terminal, x0: u16, y0: u16, w: u16, h: u16, full: bool) {
-    let (rows, cols) = (term.rows().min(h), term.cols().min(w) as usize);
+/// Copies the terminal's dirty rows (all rows when `full`) into its pane's
+/// grid and clears the terminal's dirty marks. Rows and columns the terminal
+/// does not have yet (it is resized after the grid) are blank.
+pub fn copy_pane(grid: &mut Grid, term: &mut Terminal, full: bool) {
+    let (rows, cols) = (term.rows().min(grid.rows()), term.cols().min(grid.cols()) as usize);
     let palette = term.palette();
     let reverse_video = term.modes().reverse_video;
     let blank = FrameCell::blank(style_colors(&Style::DEFAULT, palette, reverse_video).1);
-    for y in 0..h.min(frame.rows().saturating_sub(y0)) {
+    for y in 0..grid.rows() {
         if !full && (y >= rows || !term.dirty().is_dirty(y)) {
             continue;
         }
-        let out = &mut frame.row_mut(y0 + y)[x0 as usize..(x0 + w) as usize];
+        let out = grid.row_mut(y);
         if y >= rows {
             out.fill(blank);
             continue;
@@ -88,11 +84,12 @@ fn copy_rows(frame: &mut Frame, term: &Terminal, x0: u16, y0: u16, w: u16, h: u1
         }
         out[cols..].fill(blank);
     }
+    term.clear_dirty();
 }
 
-/// The cursor of a pane drawn at (`x0`, `y0`), if visible. A pane that does
-/// not have the keyboard focus gets ghostty's hollow block.
-pub fn pane_cursor(term: &Terminal, x0: u16, y0: u16, focused: bool) -> Option<FrameCursor> {
+/// The cursor of the pane drawn in `frame.grids[grid]`, if visible. A pane
+/// that does not have the keyboard focus gets ghostty's hollow block.
+pub fn pane_cursor(term: &Terminal, grid: usize, focused: bool) -> Option<FrameCursor> {
     let cursor = term.cursor();
     if !cursor.visible || cursor.x >= term.cols() || cursor.y >= term.rows() {
         return None;
@@ -107,8 +104,9 @@ pub fn pane_cursor(term: &Terminal, x0: u16, y0: u16, focused: bool) -> Option<F
         (true, CursorShape::Bar) => CursorStyle::Bar,
     };
     Some(FrameCursor {
-        x: x0 + cursor.x,
-        y: y0 + cursor.y,
+        grid,
+        x: cursor.x,
+        y: cursor.y,
         style,
         color: palette.cursor.map(rgba).unwrap_or(fg),
         text_color: bg,

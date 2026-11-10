@@ -1,15 +1,15 @@
 //! The application: one window showing one tmux-like session.
 //!
-//! The `mux` crate decides layouts, key bindings and the status line. This
+//! The `mux` crate decides the split layout and the key bindings. This
 //! module carries out its effects (start, resize and stop pane processes),
-//! routes keys, and composes the view into the frame.
+//! routes keys, and composes the panes, dividers and chrome into the frame.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use mux::{ConfirmTarget, Effect, KeyResult, Overlay, PaneId, Session, View};
+use mux::{ConfirmTarget, Effect, KeyResult, Metrics, Overlay, PaneId, Rect, Session, View};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
@@ -18,7 +18,7 @@ use winit::window::WindowId;
 
 use crate::compose;
 use crate::font::{UI, UI_BOLD};
-use crate::frame::{Dim, Frame, FrameCell, Shape};
+use crate::frame::{Frame, Grid, Shape};
 use crate::input;
 use crate::pty::{PaneIo, Pty};
 use crate::theme;
@@ -47,7 +47,7 @@ pub struct App {
     session: Option<Session>,
     panes: HashMap<PaneId, Pane>,
     view: Option<View>,
-    /// Session generation the frame's dividers were built from.
+    /// Session generation the view was taken from.
     drawn: u64,
     /// Copy every visible pane in full on the next frame.
     full: bool,
@@ -60,9 +60,11 @@ pub struct App {
     /// Program for the first pane (`-e`); later panes run the login shell.
     command: Option<Vec<String>>,
     debug: bool,
-    /// The window size in pixels and whether the tab bar is shown.
+    /// The window size in pixels, the geometry of the pane area and the
+    /// height of the tab bar above it (0 while hidden).
     size: winit::dpi::PhysicalSize<u32>,
-    tab_bar: bool,
+    metrics: Option<Metrics>,
+    top: u32,
     title: String,
     /// Panes showing ghostty's `cols x rows` overlay after a resize, until when.
     resize_overlays: HashMap<PaneId, Instant>,
@@ -79,7 +81,7 @@ impl App {
         App {
             proxy,
             window: None,
-            frame: Frame::new(1, 1, default_bg),
+            frame: Frame::new(default_bg),
             session: None,
             panes: HashMap::new(),
             view: None,
@@ -94,7 +96,8 @@ impl App {
             command,
             debug: std::env::var_os("TAPUST_DEBUG").is_some(),
             size: winit::dpi::PhysicalSize::new(1, 1),
-            tab_bar: false,
+            metrics: None,
+            top: 0,
             title: String::new(),
             resize_overlays: HashMap::new(),
             started: Instant::now(),
@@ -173,47 +176,55 @@ impl App {
         Ok(())
     }
 
-    /// Sizes the grid for the window, leaving room for the tab bar while the
-    /// session has two or more windows (ghostty's `window-show-tab-bar = auto`).
+    /// Sizes the pane area for the window, leaving room for the tab bar while
+    /// the session has two or more windows (ghostty's `window-show-tab-bar = auto`).
     fn relayout(&mut self) -> bool {
         let Some(window) = self.window.as_mut() else { return true };
         let tabs = self.session.as_ref().is_some_and(|s| s.windows().len() > 1);
-        let top = if tabs { window.tab_bar_height() } else { 0 };
-        let (cols, rows) = window.resize(self.size, top);
+        self.top = if tabs { window.tab_bar_height() } else { 0 };
+        let metrics = window.resize(self.size, self.top);
         window.window.request_redraw();
-        let changed = tabs != self.tab_bar || (cols, rows) != (self.frame.cols(), self.frame.rows());
-        self.tab_bar = tabs;
-        !changed || self.resize(cols, rows)
-    }
-
-    fn resize(&mut self, cols: u16, rows: u16) -> bool {
-        self.frame = Frame::new(cols, rows, self.frame.default_bg);
+        if self.metrics == Some(metrics) {
+            return true;
+        }
+        self.metrics = Some(metrics);
+        // Same rectangles can hold other grids (a new cell size or padding).
         self.full = true;
         self.drawn = u64::MAX;
         let Some(session) = self.session.as_mut() else { return true };
-        let effects = session.resize_client(cols, rows);
+        let effects = session.resize(metrics);
         self.apply(effects)
     }
 
-    /// Rebuilds the split dividers when the layout changed. ghostty draws a
-    /// thin divider whose color never depends on focus.
-    fn compose_chrome(&mut self) {
-        let Some(session) = &self.session else { return };
+    /// A pane rectangle of the session in window pixels.
+    fn window_rect(&self, r: Rect) -> (i32, i32, i32, i32) {
+        (r.x as i32, (self.top + r.y) as i32, r.w as i32, r.h as i32)
+    }
+
+    /// Takes a new view when the session changed. A changed layout gets new
+    /// grids at the panes' origins (unchanged grids are kept) and a full copy.
+    fn update_view(&mut self) {
+        let (Some(session), Some(m)) = (&self.session, self.metrics) else { return };
         if self.drawn == session.generation() {
             return;
         }
-        let view = session.view("");
+        let view = session.view();
         self.drawn = session.generation();
-        let default_bg = self.frame.default_bg;
-        let layout_changed = self.view.as_ref().is_none_or(|v| v.panes != view.panes || v.borders != view.borders);
+        let layout_changed = self.view.as_ref().is_none_or(|v| v.panes != view.panes);
         if layout_changed || self.full {
-            for y in 0..self.frame.rows() {
-                self.frame.row_mut(y).fill(FrameCell::blank(default_bg));
-            }
-            let (cols, rows) = (self.frame.cols(), self.frame.rows());
-            for border in view.borders.iter().filter(|b| b.y < rows && b.x < cols) {
-                self.frame.row_mut(border.y)[border.x as usize] =
-                    FrameCell { ch: border.glyph as u32, fg: theme::DIVIDER, bg: default_bg, flags: 0 };
+            let mut old: HashMap<u32, Grid> = self.frame.grids.drain(..).map(|g| (g.id, g)).collect();
+            for pv in &view.panes {
+                let (x, y, _, _) = self.window_rect(pv.rect);
+                let (x, y) = (x + m.padding_x as i32, y + m.padding_y as i32);
+                let (cols, rows) = m.grid(pv.rect);
+                let grid = match old.remove(&pv.pane) {
+                    Some(mut g) if (g.cols(), g.rows()) == (cols, rows) => {
+                        (g.x, g.y) = (x, y);
+                        g
+                    }
+                    _ => Grid::new(pv.pane, x, y, cols, rows, self.frame.default_bg),
+                };
+                self.frame.grids.push(grid);
             }
             self.full = true;
         }
@@ -369,17 +380,16 @@ impl App {
     }
 
     /// ghostty's resize overlay: `cols x rows` centered in a pane that just changed size.
-    fn resize_overlay_shapes(&mut self, rect: mux::Rect, cols: u16, rows: u16, out: &mut Vec<Shape>) {
+    fn resize_overlay_shapes(&mut self, rect: Rect, out: &mut Vec<Shape>) {
+        let (cols, rows) = self.metrics.expect("metrics").grid(rect);
+        let (rx, ry, rw, rh) = self.window_rect(rect);
         let window = self.window.as_mut().expect("window");
         let scale = window.window.scale_factor();
         let px = |v: f64| (v * scale).round() as i32;
-        let (cw, ch) = window.renderer.cell_size();
-        let (ox, oy) = window.renderer.grid_origin();
         let text = format!("{cols} x {rows}");
         let line_h = window.renderer.fonts.ui_line_height;
         let (w, h) = (window.renderer.text_width(&text, UI) + px(16.0), line_h + px(8.0));
-        let cx = ox + rect.x as i32 * cw as i32 + (rect.w as i32 * cw as i32 - w) / 2;
-        let cy = oy + rect.y as i32 * ch as i32 + (rect.h as i32 * ch as i32 - h) / 2;
+        let (cx, cy) = (rx + (rw - w) / 2, ry + (rh - h) / 2);
         out.push(Shape::Rect { x: cx, y: cy, w, h, color: theme::adw::WINDOW_BG, radius: px(6.0) as u16, ring: false });
         out.push(Shape::Rect { x: cx, y: cy, w, h, color: theme::RESIZE_OVERLAY_OUTLINE, radius: px(6.0) as u16, ring: true });
         out.push(Shape::Text { x: cx + px(8.0), y: cy + px(4.0), text, color: theme::adw::FG, face: UI });
@@ -389,46 +399,50 @@ impl App {
         if self.window.is_none() {
             return;
         }
-        self.compose_chrome();
+        self.update_view();
         let Some(view) = self.view.take() else { return };
         let split = view.panes.len() > 1;
+        let mut shapes = std::mem::take(&mut self.frame.shapes);
+        shapes.clear();
         self.frame.cursors.clear();
-        self.frame.dims.clear();
-        for pv in &view.panes {
-            let Some(pane) = self.panes.get_mut(&pv.pane) else { continue };
+        for (i, pv) in view.panes.iter().enumerate() {
+            let (Some(pane), Some(grid)) = (self.panes.get_mut(&pv.pane), self.frame.grids.get_mut(i)) else { continue };
             let shared = &pane.io.shared;
             let dirty = shared.dirty.swap(false, Ordering::AcqRel);
             shared.want_lock.store(true, Ordering::Release);
             let mut term = shared.term.lock();
             shared.want_lock.store(false, Ordering::Release);
-            let r = pv.rect;
             if dirty || self.full {
-                compose::copy_pane(&mut self.frame, &mut term, r.x, r.y, r.w, r.h, self.full);
+                compose::copy_pane(grid, &mut term, self.full);
             }
             // The focused pane's cursor blinks; every other pane shows a hollow one.
             let focused = pv.active && self.focused;
             if (!focused || self.blink_on)
-                && let Some(cursor) = compose::pane_cursor(&term, r.x, r.y, focused)
+                && let Some(cursor) = compose::pane_cursor(&term, i, focused)
             {
                 self.frame.cursors.push(cursor);
-            }
-            if split && !pv.active {
-                self.frame.dims.push(Dim { x: r.x, y: r.y, w: r.w, h: r.h, color: theme::UNFOCUSED_DIM });
             }
             if term.title() != pane.title {
                 pane.title = term.title().to_owned();
             }
         }
-        let mut shapes = std::mem::take(&mut self.frame.shapes);
-        shapes.clear();
-        if self.tab_bar {
+        // ghostty's unfocused-split-opacity: a veil over the whole pane, padding included.
+        for pv in view.panes.iter().filter(|pv| split && !pv.active) {
+            let (x, y, w, h) = self.window_rect(pv.rect);
+            shapes.push(Shape::fill(x, y, w, h, theme::UNFOCUSED_DIM));
+        }
+        for &divider in &view.dividers {
+            let (x, y, w, h) = self.window_rect(divider);
+            shapes.push(Shape::fill(x, y, w, h, theme::DIVIDER));
+        }
+        if self.top > 0 {
             self.tab_bar_shapes(&mut shapes);
         }
         let now = Instant::now();
         self.resize_overlays.retain(|_, until| *until > now);
         for pv in &view.panes {
             if self.resize_overlays.contains_key(&pv.pane) {
-                self.resize_overlay_shapes(pv.rect, pv.rect.w, pv.rect.h, &mut shapes);
+                self.resize_overlay_shapes(pv.rect, &mut shapes);
             }
         }
         if let Some(overlay) = &view.overlay {
@@ -445,7 +459,7 @@ impl App {
         }
         self.full = false;
         self.view = Some(view);
-        // A title change bumps the generation; the chrome is rebuilt next frame.
+        // A title change bumps the generation; the view is taken again next frame.
         let stale = self.session.as_ref().is_some_and(|s| s.generation() != self.drawn);
         let window = self.window.as_mut().expect("window");
         window.draw(&mut self.frame);
@@ -556,10 +570,10 @@ impl ApplicationHandler<UserEvent> for App {
             eprintln!("renderer: {}", window.renderer.info());
         }
         self.size = window.window.inner_size();
-        let (cols, rows) = window.resize(self.size, 0);
+        let metrics = window.resize(self.size, 0);
         self.window = Some(window);
-        self.frame = Frame::new(cols, rows, self.frame.default_bg);
-        let (session, effects) = Session::without_status_line(cols, rows);
+        self.metrics = Some(metrics);
+        let (session, effects) = Session::new(metrics);
         self.session = Some(session);
         if !self.apply(effects) || self.panes.is_empty() {
             event_loop.exit();

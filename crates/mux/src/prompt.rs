@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use crate::format::{self, Context};
+use crate::format::Context;
 use crate::{Key, KeyCode, PaneId, Session};
 
 /// The `word-separators` option.
@@ -111,11 +111,6 @@ fn is_space(c: Option<&char>) -> bool {
 
 fn is_separator(c: Option<&char>) -> bool {
     c.is_some_and(|c| WORD_SEPARATORS.contains(*c))
-}
-
-/// Width of a prompt buffer character: control characters show as `^X`.
-pub(crate) fn prompt_char_width(c: char) -> usize {
-    if (c as u32) <= 0x1f || c == '\x7f' { 2 } else { format::char_width(c) }
 }
 
 impl Prompt {

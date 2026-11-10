@@ -1,9 +1,7 @@
-//! The window-sized grid the renderer draws.
-//!
-//! Like tmux, the whole window is one character grid: visible panes are
-//! copied into it at their offsets, followed by the pane borders and the
-//! status line. Colors are already resolved, so the renderer knows nothing
-//! about palettes, styles or panes.
+//! What the renderer draws: one grid of resolved cells per visible pane at
+//! the pane's pixel origin, the cursors, then shapes in window pixels
+//! (dividers, dimming, the tab bar, dialogs). Colors are already resolved, so
+//! the renderer knows nothing about palettes, styles or the multiplexer.
 
 pub const BOLD: u16 = 1 << 0;
 pub const ITALIC: u16 = 1 << 1;
@@ -28,68 +26,28 @@ impl FrameCell {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CursorStyle {
-    Block,
-    Underline,
-    Bar,
-    /// The outline ghostty draws in unfocused panes and windows.
-    Hollow,
-}
-
-/// Where and how to draw a cursor, in frame coordinates.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FrameCursor {
-    pub x: u16,
-    pub y: u16,
-    pub style: CursorStyle,
-    pub color: [u8; 4],
-    /// Color of the glyph under a block cursor.
-    pub text_color: [u8; 4],
-    pub wide: bool,
-}
-
-/// A translucent rectangle over a range of cells (unfocused panes are dimmed with one).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Dim {
-    pub x: u16,
-    pub y: u16,
-    pub w: u16,
-    pub h: u16,
-    pub color: [u8; 4],
-}
-
-/// Drawn above the grid (tab bar, dialogs, overlays), in window pixels.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Shape {
-    /// A rectangle; `radius` rounds its corners and `ring` keeps only a 1px outline.
-    Rect { x: i32, y: i32, w: i32, h: i32, color: [u8; 4], radius: u16, ring: bool },
-    /// One line of text whose line box starts at (`x`, `y`).
-    Text { x: i32, y: i32, text: String, color: [u8; 4], face: crate::font::Face },
-}
-
-pub struct Frame {
+/// A pane's cells, drawn with cell (0, 0) at (`x`, `y`) in window pixels.
+pub struct Grid {
+    /// Identifies the pane across frames, so the renderer can keep its work.
+    pub id: u32,
+    pub x: i32,
+    pub y: i32,
     cols: u16,
     rows: u16,
     cells: Vec<FrameCell>,
     dirty: Vec<bool>,
-    pub cursors: Vec<FrameCursor>,
-    pub dims: Vec<Dim>,
-    pub shapes: Vec<Shape>,
-    pub default_bg: [u8; 4],
 }
 
-impl Frame {
-    pub fn new(cols: u16, rows: u16, default_bg: [u8; 4]) -> Frame {
-        Frame {
+impl Grid {
+    pub fn new(id: u32, x: i32, y: i32, cols: u16, rows: u16, bg: [u8; 4]) -> Grid {
+        Grid {
+            id,
+            x,
+            y,
             cols,
             rows,
-            cells: vec![FrameCell::blank(default_bg); cols as usize * rows as usize],
+            cells: vec![FrameCell::blank(bg); cols as usize * rows as usize],
             dirty: vec![true; rows as usize],
-            cursors: Vec::new(),
-            dims: Vec::new(),
-            shapes: Vec::new(),
-            default_bg,
         }
     }
 
@@ -119,7 +77,62 @@ impl Frame {
         self.dirty[y as usize]
     }
 
+    pub fn mark_dirty(&mut self) {
+        self.dirty.fill(true);
+    }
+
     pub fn clear_dirty(&mut self) {
         self.dirty.fill(false);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorStyle {
+    Block,
+    Underline,
+    Bar,
+    /// The outline ghostty draws in unfocused panes and windows.
+    Hollow,
+}
+
+/// Where and how to draw a cursor: a cell of `frame.grids[grid]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameCursor {
+    pub grid: usize,
+    pub x: u16,
+    pub y: u16,
+    pub style: CursorStyle,
+    pub color: [u8; 4],
+    /// Color of the glyph under a block cursor.
+    pub text_color: [u8; 4],
+    pub wide: bool,
+}
+
+/// Drawn above the grids, in window pixels.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Shape {
+    /// A rectangle; `radius` rounds its corners and `ring` keeps only a 1px outline.
+    Rect { x: i32, y: i32, w: i32, h: i32, color: [u8; 4], radius: u16, ring: bool },
+    /// One line of text whose line box starts at (`x`, `y`).
+    Text { x: i32, y: i32, text: String, color: [u8; 4], face: crate::font::Face },
+}
+
+impl Shape {
+    pub fn fill(x: i32, y: i32, w: i32, h: i32, color: [u8; 4]) -> Shape {
+        Shape::Rect { x, y, w, h, color, radius: 0, ring: false }
+    }
+}
+
+pub struct Frame {
+    pub grids: Vec<Grid>,
+    pub cursors: Vec<FrameCursor>,
+    pub shapes: Vec<Shape>,
+    /// The window background outside the grids (ghostty's padding color).
+    pub default_bg: [u8; 4],
+}
+
+impl Frame {
+    pub fn new(default_bg: [u8; 4]) -> Frame {
+        Frame { grids: Vec::new(), cursors: Vec::new(), shapes: Vec::new(), default_bg }
     }
 }

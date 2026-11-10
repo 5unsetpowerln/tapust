@@ -100,16 +100,13 @@ impl Session {
             "window_active" => flag(ctx.window == self.curw),
             "window_panes" => w.panes.len().to_string(),
             "window_zoomed_flag" => flag(w.zoomed),
-            "window_width" => w.sx.to_string(),
-            "window_height" => w.sy.to_string(),
             "pane_id" => format!("%{}", ctx.pane),
             "pane_index" => pane.map(|i| i.to_string()).unwrap_or_default(),
             "pane_title" => pane.map(|i| w.panes[i].title.clone()).unwrap_or_default(),
             "pane_active" => flag(w.active == ctx.pane),
-            "pane_width" => pane.map(|i| w.panes[i].sx.to_string()).unwrap_or_default(),
-            "pane_height" => pane.map(|i| w.panes[i].sy.to_string()).unwrap_or_default(),
-            "pane_left" => pane.map(|i| w.panes[i].xoff.to_string()).unwrap_or_default(),
-            "pane_top" => pane.map(|i| w.panes[i].yoff.to_string()).unwrap_or_default(),
+            // Pixel splits have no cell positions; the size is the pane's grid.
+            "pane_width" => pane.map(|i| w.panes[i].cols.to_string()).unwrap_or_default(),
+            "pane_height" => pane.map(|i| w.panes[i].rows.to_string()).unwrap_or_default(),
             _ => String::new(),
         }
     }
@@ -201,73 +198,6 @@ pub(crate) fn vis(s: &str) -> String {
     out
 }
 
-/// Display width of a character (an approximation of tmux's wcwidth):
-/// control characters 0, combining marks 0, East Asian wide characters and
-/// emoji 2.
-pub(crate) fn char_width(c: char) -> usize {
-    let cp = c as u32;
-    if cp < 0x20 || (0x7f..0xa0).contains(&cp) {
-        return 0;
-    }
-    const ZERO: &[(u32, u32)] = &[
-        (0x0300, 0x036f),
-        (0x0483, 0x0489),
-        (0x0591, 0x05bd),
-        (0x0610, 0x061a),
-        (0x064b, 0x065f),
-        (0x1ab0, 0x1aff),
-        (0x1dc0, 0x1dff),
-        (0x200b, 0x200f),
-        (0x20d0, 0x20ff),
-        (0xfe00, 0xfe0f),
-        (0xfe20, 0xfe2f),
-    ];
-    const WIDE: &[(u32, u32)] = &[
-        (0x1100, 0x115f),
-        (0x2e80, 0x303e),
-        (0x3041, 0x33ff),
-        (0x3400, 0x4dbf),
-        (0x4e00, 0x9fff),
-        (0xa000, 0xa4cf),
-        (0xac00, 0xd7a3),
-        (0xf900, 0xfaff),
-        (0xfe30, 0xfe4f),
-        (0xff00, 0xff60),
-        (0xffe0, 0xffe6),
-        (0x1f300, 0x1f64f),
-        (0x1f900, 0x1f9ff),
-        (0x20000, 0x2fffd),
-        (0x30000, 0x3fffd),
-    ];
-    let within = |table: &[(u32, u32)]| table.iter().any(|&(a, b)| (a..=b).contains(&cp));
-    if within(ZERO) {
-        0
-    } else if within(WIDE) {
-        2
-    } else {
-        1
-    }
-}
-
-pub(crate) fn str_width(s: &str) -> usize {
-    s.chars().map(char_width).sum()
-}
-
-/// format_trim_left: the leading characters that fit in `limit` columns.
-pub(crate) fn trim_left(s: &str, limit: usize) -> String {
-    let mut width = 0;
-    let mut out = String::new();
-    for c in s.chars() {
-        let w = char_width(c);
-        if width + w > limit {
-            break;
-        }
-        width += w;
-        out.push(c);
-    }
-    out
-}
-
 /// The text format_draw shows for an expanded string: runs of '#' collapse
 /// as in format_draw and `#[...]` style sequences (not modelled) vanish.
 pub(crate) fn drawn_text(s: &str) -> String {
@@ -301,7 +231,7 @@ pub(crate) fn drawn_text(s: &str) -> String {
             }
             continue;
         }
-        if char_width(chars[i]) > 0 || chars[i] as u32 >= 0xa0 {
+        if !chars[i].is_control() {
             out.push(chars[i]);
         }
         i += 1;
