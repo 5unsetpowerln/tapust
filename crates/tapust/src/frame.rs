@@ -90,12 +90,4 @@ impl Frame {
     pub fn clear_dirty(&mut self) {
         self.dirty.fill(false);
     }
-
-    /// Writes `text` at (`x`, `y`), clipped to the row.
-    pub fn put_str(&mut self, x: u16, y: u16, text: &str, fg: [u8; 4], bg: [u8; 4], flags: u16) {
-        let row = self.row_mut(y);
-        for (cell, ch) in row.iter_mut().skip(x as usize).zip(text.chars()) {
-            *cell = FrameCell { ch: ch as u32, fg, bg, flags };
-        }
-    }
 }
