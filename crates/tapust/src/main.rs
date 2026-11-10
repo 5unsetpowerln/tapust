@@ -1,4 +1,6 @@
 mod font;
+mod input;
+mod pty;
 mod frame;
 mod renderer;
 mod window;
