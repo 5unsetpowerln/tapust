@@ -6,7 +6,24 @@
 //! (spawn a shell, resize or destroy a pane, write bytes, exit), and the GUI
 //! reads the visible layout, borders and status line from [`Session::view`].
 
+use std::collections::BTreeMap;
 use std::time::Instant;
+
+mod format;
+mod keys;
+mod layout;
+mod prompt;
+mod redraw;
+mod session;
+mod status;
+mod window;
+
+#[cfg(test)]
+mod tests;
+
+use keys::KeyState;
+use prompt::Prompt;
+use window::Window;
 
 /// Pane identifier (tmux `%N`), never reused within a session.
 pub type PaneId = u32;
@@ -144,9 +161,127 @@ pub struct View {
     pub prompt_cursor: Option<u16>,
 }
 
+/// A command of the model, named after the tmux command and flags it
+/// reproduces. Every command acts on the current window and its active pane,
+/// as a key binding does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Command {
+    /// `split-window [-h] [-b] [-f] [-l size]`, with
+    /// `-c "#{pane_current_path}"` when `cwd_of_active`.
+    SplitWindow {
+        horizontal: bool,
+        before: bool,
+        full: bool,
+        size: Option<u32>,
+        cwd_of_active: bool,
+    },
+    /// `new-window`, with `-c "#{pane_current_path}"` when `cwd_of_active`.
+    NewWindow { cwd_of_active: bool },
+    /// `select-pane -L/-R/-U/-D`.
+    SelectPane(Direction),
+    /// `select-pane -l` (`last-pane`).
+    LastPane,
+    /// `select-pane -t :.+`.
+    NextPane,
+    /// `resize-pane -L/-R/-U/-D adjustment`.
+    ResizePane(Direction, u32),
+    /// `resize-pane -Z`.
+    ZoomPane,
+    /// `kill-pane`.
+    KillPane,
+    /// `kill-window`.
+    KillWindow,
+    /// `break-pane`.
+    BreakPane,
+    /// `swap-pane -U` (`up`) or `swap-pane -D`.
+    SwapPane { up: bool },
+    /// `rotate-window` (`-U`) or `rotate-window -D` (`down`).
+    RotateWindow { down: bool },
+    /// `select-window -t :=index`.
+    SelectWindow(u32),
+    /// `next-window`.
+    NextWindow,
+    /// `previous-window`.
+    PreviousWindow,
+    /// `last-window`.
+    LastWindow,
+    /// `swap-window -d -t -N` (negative) or `-t +N` (positive).
+    SwapWindow(i32),
+    /// `select-layout -E` (spread the active pane's cells out evenly).
+    SpreadLayout,
+    /// `rename-window name` (the name is format-expanded as tmux does).
+    RenameWindow(String),
+    /// `rename-session name`.
+    RenameSession(String),
+    /// `send-prefix`.
+    SendPrefix,
+}
+
+/// Result of [`Session::command`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandOutput {
+    pub effects: Vec<Effect>,
+    /// tmux's error message (as `%error` in control mode), if the command
+    /// failed. The model also refuses the two layouts tmux 3.6 cannot handle
+    /// (an overflowing `split-window -f`, a hanging `select-layout -E`) with
+    /// an error saying so, leaving the session unchanged.
+    pub error: Option<String>,
+}
+
+/// A pane as `list-panes` reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaneInfo {
+    pub pane: PaneId,
+    /// The pane's last laid-out position; hidden panes of a zoomed window
+    /// keep the one they had before the zoom, as in tmux.
+    pub rect: Rect,
+    pub active: bool,
+    pub title: String,
+}
+
+/// A window as `list-windows` reports it, with its panes in index order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowInfo {
+    pub index: u32,
+    pub name: String,
+    /// The session's current window (`*`).
+    pub active: bool,
+    /// The previously current window (`-`).
+    pub last: bool,
+    pub zoomed: bool,
+    pub width: u16,
+    pub height: u16,
+    pub panes: Vec<PaneInfo>,
+}
+
 /// One tmux session shown in one GUI window.
 pub struct Session {
-    // Implementation-defined.
+    name: String,
+    cols: u16,
+    rows: u16,
+    /// Winlinks by index; a winlink is identified by its index.
+    winlinks: BTreeMap<u32, Window>,
+    curw: u32,
+    /// `s->lastw`, most recent first.
+    lastw: Vec<u32>,
+    next_pane_id: PaneId,
+    next_window_id: u32,
+    /// tmux's global `next_active_point`.
+    next_active_point: u32,
+    keys: KeyState,
+    prompt: Option<Prompt>,
+    message: Option<(String, Instant)>,
+    /// tmux's command prompt history.
+    history: Vec<String>,
+    generation: u64,
+    /// No windows are left.
+    dead: bool,
+    /// The active pane when the session died.
+    last_active: PaneId,
+    /// Panes created by the running operation, with `cwd_of`.
+    spawned: Vec<(PaneId, Option<PaneId>)>,
+    /// Write effects of the running operation.
+    writes: Vec<Effect>,
 }
 
 impl Session {
@@ -154,72 +289,149 @@ impl Session {
     /// cells (the status line takes the last row). Returns the first pane's
     /// `Spawn` effect.
     pub fn new(cols: u16, rows: u16) -> (Session, Vec<Effect>) {
-        let _ = (cols, rows);
-        todo!()
+        session::new_session(cols, rows)
     }
 
     /// The client (GUI window) was resized.
     pub fn resize_client(&mut self, cols: u16, rows: u16) -> Vec<Effect> {
-        let _ = (cols, rows);
-        todo!()
+        self.op(|s| {
+            s.cols = cols;
+            s.rows = rows;
+            // Every window at once, as refresh-client -C does
+            // (recalculate_sizes_now(1)); a tty client's resize in tmux
+            // leaves other windows until they become current.
+            s.recalculate_sizes(true);
+        })
     }
 
     /// Offers a key to the key tables (prefix, repeat, prompts).
     pub fn key(&mut self, key: Key, now: Instant) -> KeyResult {
-        let _ = (key, now);
-        todo!()
+        self.handle_key(key, now)
     }
 
     /// When the current timed state (the repeat window of a `-r` binding, or
     /// a message) ends; the GUI calls [`Session::tick`] then.
     pub fn deadline(&self) -> Option<Instant> {
-        todo!()
+        let repeat = self.keys.repeat_deadline();
+        let message = self.message.as_ref().map(|m| m.1);
+        match (repeat, message) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Expires timed state whose deadline passed.
     pub fn tick(&mut self, now: Instant) {
-        let _ = now;
-        todo!()
+        self.keys.expire(now);
+        if self.message.as_ref().is_some_and(|m| m.1 <= now) {
+            self.message = None;
+            self.generation += 1;
+        }
     }
 
     /// The pane's process exited: remove it as tmux does with remain-on-exit off.
     pub fn pane_exited(&mut self, pane: PaneId) -> Vec<Effect> {
-        let _ = pane;
-        todo!()
+        self.op(|s| s.destroy_pane(pane))
     }
 
     /// Sets `#{pane_title}` (OSC 0/2; tmux defaults it to the host name).
     pub fn set_pane_title(&mut self, pane: PaneId, title: &str) {
-        let _ = (pane, title);
-        todo!()
+        if let Some(p) = self.find_pane_mut(pane)
+            && p.title != title
+        {
+            p.title = title.to_owned();
+            self.generation += 1;
+        }
     }
 
     /// Reports the foreground process name of `pane` for automatic-rename;
     /// it names the window while the pane is the window's active pane.
     /// Ignored for windows renamed by the user.
     pub fn set_auto_name(&mut self, pane: PaneId, name: &str) {
-        let _ = (pane, name);
-        todo!()
+        let name = format::vis(name);
+        if let Some(p) = self.find_pane_mut(pane)
+            && p.auto_name != name
+        {
+            p.auto_name = name;
+            self.generation += 1;
+        }
     }
 
     /// The pane that receives forwarded keys.
     pub fn active_pane(&self) -> PaneId {
-        todo!()
+        if self.dead { self.last_active } else { self.cur().active }
     }
 
     /// Every pane of every window with its current size (cols, rows).
     pub fn pane_sizes(&self) -> Vec<(PaneId, u16, u16)> {
-        todo!()
+        self.winlinks
+            .values()
+            .flat_map(|w| w.panes.iter())
+            .map(|p| (p.id, clamp16(p.sx), clamp16(p.sy)))
+            .collect()
     }
 
     /// Changes whenever anything returned by [`Session::view`] may have changed.
     pub fn generation(&self) -> u64 {
-        todo!()
+        self.generation
     }
 
     /// The visible state; `clock` is the formatted `%H:%M %d-%b-%y` text.
     pub fn view(&self, clock: &str) -> View {
-        let _ = clock;
-        todo!()
+        let (status, prompt_cursor) = self.status_line(clock);
+        if self.dead {
+            return View { panes: Vec::new(), borders: Vec::new(), status, prompt_cursor };
+        }
+        let w = self.cur();
+        let panes = w
+            .panes
+            .iter()
+            .filter(|p| w.visible(p.id))
+            .map(|p| PaneView { pane: p.id, rect: rect_of(p), active: p.id == w.active })
+            .collect();
+        View { panes, borders: self.borders(), status, prompt_cursor }
     }
+
+    /// Runs a command on the current window and pane. Errors are returned
+    /// instead of being shown on the status line.
+    pub fn command(&mut self, cmd: &Command) -> CommandOutput {
+        let mut error = None;
+        let effects = self.op(|s| error = s.exec(cmd).err());
+        CommandOutput { effects, error }
+    }
+
+    /// The windows in index order, as `list-windows` and `list-panes` report them.
+    pub fn windows(&self) -> Vec<WindowInfo> {
+        let last = self.lastw.first().copied();
+        self.winlinks
+            .iter()
+            .map(|(&index, w)| WindowInfo {
+                index,
+                name: w.name().to_owned(),
+                active: index == self.curw && !self.dead,
+                last: Some(index) == last,
+                zoomed: w.zoomed,
+                width: clamp16(w.sx),
+                height: clamp16(w.sy),
+                panes: w
+                    .panes
+                    .iter()
+                    .map(|p| PaneInfo {
+                        pane: p.id,
+                        rect: rect_of(p),
+                        active: p.id == w.active,
+                        title: p.title.clone(),
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+}
+
+fn clamp16(v: u32) -> u16 {
+    u16::try_from(v).unwrap_or(u16::MAX)
+}
+
+fn rect_of(p: &window::Pane) -> Rect {
+    Rect { x: clamp16(p.xoff), y: clamp16(p.yoff), w: clamp16(p.sx), h: clamp16(p.sy) }
 }
