@@ -1,0 +1,11 @@
+[package]
+name = "tapust-mux"
+description = "tmux-compatible session, window and pane model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "mux"
+
+[dependencies]

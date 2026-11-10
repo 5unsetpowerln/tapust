@@ -1,0 +1,10 @@
+[package]
+name = "tapust"
+description = "A fast Wayland terminal emulator with a built-in tmux-compatible multiplexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+term = { package = "tapust-term", path = "../term" }
+mux = { package = "tapust-mux", path = "../mux" }

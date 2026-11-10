@@ -1,0 +1,11 @@
+[package]
+name = "tapust-term"
+description = "Terminal state machine: VT parser, grid, scrollback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "term"
+
+[dependencies]
