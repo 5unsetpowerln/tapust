@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use glow::HasContext;
 
 use crate::font::{Face, Fonts, face_for};
-use crate::frame::{BOLD, Frame, FrameCell, ITALIC, STRIKE, UNDERLINE, WIDE};
+use crate::frame::{BOLD, CursorStyle, Frame, FrameCell, ITALIC, Panel, STRIKE, UNDERLINE, WIDE};
 
 const ATLAS_SIZE: i32 = 2048;
 const FLAG_COLORED: u32 = 1;
@@ -431,6 +431,35 @@ impl Renderer {
         }
     }
 
+    /// A panel in pixels relative to the grid origin: fill, 1px outline, then text.
+    fn push_panel(&mut self, out: &mut Vec<Instance>, panel: &Panel) {
+        let origin = [0, 0];
+        let (x, y, w, h) = (panel.x, panel.y, panel.w, panel.h);
+        out.push(Self::rect(origin, x, y, w, h, panel.fill));
+        if let Some(c) = panel.outline {
+            out.push(Self::rect(origin, x, y, w, 1, c));
+            out.push(Self::rect(origin, x, y + h - 1, w, 1, c));
+            out.push(Self::rect(origin, x, y, 1, h, c));
+            out.push(Self::rect(origin, x + w - 1, y, 1, h, c));
+        }
+        let cw = self.fonts.cell_width as i32;
+        for text in &panel.texts {
+            let face = face_for(text.bold, false);
+            for (i, ch) in text.text.chars().enumerate() {
+                if let Some(g) = self.glyph(ch as u32, face).filter(|_| ch != ' ') {
+                    out.push(Instance {
+                        cell: origin,
+                        offset: [(x + text.x + i as i32 * cw + g.offset[0] as i32) as i16, (y + text.y + g.offset[1] as i32) as i16],
+                        size: g.size,
+                        uv: g.uv,
+                        color: text.color,
+                        flags: if g.colored { FLAG_COLORED } else { 0 },
+                    });
+                }
+            }
+        }
+    }
+
     fn rebuild_row(&mut self, frame: &Frame, y: u16) {
         let mut out = std::mem::take(&mut self.rows[y as usize]);
         out.clear();
@@ -495,19 +524,32 @@ impl Renderer {
         for row in &self.rows {
             upload.extend_from_slice(row);
         }
-        if let Some(cursor) = frame.cursor.filter(|c| c.x < cols && c.y < rows) {
-            let (cw, ch) = (self.fonts.cell_width as i32, self.fonts.cell_height as i32);
+        let (cw, ch) = (self.fonts.cell_width as i32, self.fonts.cell_height as i32);
+        for cursor in frame.cursors.iter().filter(|c| c.x < cols && c.y < rows) {
             let pos = [cursor.x, cursor.y];
             let width = if cursor.wide { 2 * cw } else { cw };
-            match cursor.shape {
-                term::CursorShape::Block => {
+            match cursor.style {
+                CursorStyle::Block => {
                     upload.push(Self::rect(pos, 0, 0, width, ch, cursor.color));
                     let cell = frame.row(cursor.y)[cursor.x as usize];
                     self.push_cell(&mut upload, pos, &cell, cursor.text_color);
                 }
-                term::CursorShape::Underline => upload.push(Self::rect(pos, 0, ch - 2, width, 2, cursor.color)),
-                term::CursorShape::Bar => upload.push(Self::rect(pos, 0, 0, 2, ch, cursor.color)),
+                CursorStyle::Underline => upload.push(Self::rect(pos, 0, ch - 2, width, 2, cursor.color)),
+                CursorStyle::Bar => upload.push(Self::rect(pos, 0, 0, 2, ch, cursor.color)),
+                CursorStyle::Hollow => {
+                    // A 1px outline, like ghostty's block_hollow with cursor_thickness 1.
+                    upload.push(Self::rect(pos, 0, 0, width, 1, cursor.color));
+                    upload.push(Self::rect(pos, 0, ch - 1, width, 1, cursor.color));
+                    upload.push(Self::rect(pos, 0, 0, 1, ch, cursor.color));
+                    upload.push(Self::rect(pos, width - 1, 0, 1, ch, cursor.color));
+                }
             }
+        }
+        for dim in &frame.dims {
+            upload.push(Self::rect([dim.x, dim.y], 0, 0, dim.w as i32 * cw, dim.h as i32 * ch, dim.color));
+        }
+        for panel in &frame.panels {
+            self.push_panel(&mut upload, panel);
         }
 
         let gl = &self.gl;

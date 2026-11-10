@@ -31,3 +31,10 @@ pub const FONT_FAMILY: &str = "JetBrains Mono";
 pub const FONT_POINTS: f32 = 12.0;
 /// `window-padding-x` / `window-padding-y` (top-left and bottom-right), in points.
 pub const PADDING_POINTS: f64 = 2.0;
+
+/// The split divider: libadwaita's 1px `paned > separator` over the window background.
+pub const DIVIDER: [u8; 4] = [0x43, 0x43, 0x47, 0xff];
+/// `unfocused-split-fill` (the background) at `1 - unfocused-split-opacity` (0.30).
+pub const UNFOCUSED_DIM: [u8; 4] = [0x28, 0x2C, 0x34, 77];
+/// `cursor-style-blink` interval.
+pub const BLINK: std::time::Duration = std::time::Duration::from_millis(600);

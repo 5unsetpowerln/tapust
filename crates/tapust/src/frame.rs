@@ -28,16 +28,57 @@ impl FrameCell {
     }
 }
 
-/// Where and how to draw the cursor, in frame coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorStyle {
+    Block,
+    Underline,
+    Bar,
+    /// The outline ghostty draws in unfocused panes and windows.
+    Hollow,
+}
+
+/// Where and how to draw a cursor, in frame coordinates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameCursor {
     pub x: u16,
     pub y: u16,
-    pub shape: term::CursorShape,
+    pub style: CursorStyle,
     pub color: [u8; 4],
     /// Color of the glyph under a block cursor.
     pub text_color: [u8; 4],
     pub wide: bool,
+}
+
+/// A translucent rectangle over a range of cells (unfocused panes are dimmed with one).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dim {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+    pub color: [u8; 4],
+}
+
+/// Text drawn on a panel, in pixels from the panel's top-left corner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PanelText {
+    pub x: i32,
+    pub y: i32,
+    pub text: String,
+    pub color: [u8; 4],
+    pub bold: bool,
+}
+
+/// A box drawn above everything else (dialogs, messages), in pixels from the grid origin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Panel {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub fill: [u8; 4],
+    pub outline: Option<[u8; 4]>,
+    pub texts: Vec<PanelText>,
 }
 
 pub struct Frame {
@@ -45,7 +86,9 @@ pub struct Frame {
     rows: u16,
     cells: Vec<FrameCell>,
     dirty: Vec<bool>,
-    pub cursor: Option<FrameCursor>,
+    pub cursors: Vec<FrameCursor>,
+    pub dims: Vec<Dim>,
+    pub panels: Vec<Panel>,
     pub default_bg: [u8; 4],
 }
 
@@ -56,7 +99,9 @@ impl Frame {
             rows,
             cells: vec![FrameCell::blank(default_bg); cols as usize * rows as usize],
             dirty: vec![true; rows as usize],
-            cursor: None,
+            cursors: Vec::new(),
+            dims: Vec::new(),
+            panels: Vec::new(),
             default_bg,
         }
     }

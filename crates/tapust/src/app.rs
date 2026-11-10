@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use mux::{ChromeColor, Effect, KeyResult, PaneId, Session, View};
+use mux::{Effect, KeyResult, Overlay, PaneId, Session, View};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
@@ -17,7 +17,7 @@ use winit::keyboard::ModifiersState;
 use winit::window::WindowId;
 
 use crate::compose;
-use crate::frame::{BOLD, Frame, FrameCell, FrameCursor, UNDERLINE};
+use crate::frame::{Dim, Frame, FrameCell, Panel, PanelText};
 use crate::input;
 use crate::pty::{PaneIo, Pty};
 use crate::theme;
@@ -46,8 +46,8 @@ pub struct App {
     session: Option<Session>,
     panes: HashMap<PaneId, Pane>,
     view: Option<View>,
-    /// Session generation and clock text the frame's chrome was built from.
-    drawn: (u64, String),
+    /// Session generation the frame's dividers were built from.
+    drawn: u64,
     /// Copy every visible pane in full on the next frame.
     full: bool,
     palette: term::Palette,
@@ -60,18 +60,9 @@ pub struct App {
     /// Program for the first pane (`-e`); later panes run the login shell.
     command: Option<Vec<String>>,
     debug: bool,
-}
-
-/// Local time as tmux's default status-right shows it (`%H:%M %d-%b-%y`).
-fn clock() -> String {
-    unsafe {
-        let now = libc::time(std::ptr::null_mut());
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&now, &mut tm);
-        let mut buf = [0u8; 64];
-        let n = libc::strftime(buf.as_mut_ptr().cast(), buf.len(), c"%H:%M %d-%b-%y".as_ptr(), &tm);
-        String::from_utf8_lossy(&buf[..n]).into_owned()
-    }
+    /// Whether the focused cursor is in the visible half of its blink.
+    blink_on: bool,
+    next_blink: Instant,
 }
 
 fn host_name() -> String {
@@ -94,7 +85,7 @@ impl App {
             session: None,
             panes: HashMap::new(),
             view: None,
-            drawn: (u64::MAX, String::new()),
+            drawn: u64::MAX,
             full: true,
             palette,
             modifiers: ModifiersState::empty(),
@@ -105,15 +96,9 @@ impl App {
             next_names: Instant::now(),
             command,
             debug: std::env::var_os("TAPUST_DEBUG").is_some(),
+            blink_on: true,
+            next_blink: Instant::now() + theme::BLINK,
         }
-    }
-
-    fn color(&self, color: ChromeColor) -> [u8; 4] {
-        let color = match color {
-            ChromeColor::Default => term::Color::Default,
-            ChromeColor::Indexed(i) => term::Color::Indexed(i),
-        };
-        compose::resolve(color, &self.palette, self.palette.foreground)
     }
 
     fn request_redraw(&self) {
@@ -187,53 +172,56 @@ impl App {
     fn resize(&mut self, cols: u16, rows: u16) -> bool {
         self.frame = Frame::new(cols, rows, self.frame.default_bg);
         self.full = true;
-        self.drawn.0 = u64::MAX;
+        self.drawn = u64::MAX;
         let Some(session) = self.session.as_mut() else { return true };
         let effects = session.resize_client(cols, rows);
         self.apply(effects)
     }
 
-    /// Rebuilds the borders and the status line when the session or the clock changed.
+    /// Rebuilds the split dividers when the layout changed. ghostty draws a
+    /// thin divider whose color never depends on focus.
     fn compose_chrome(&mut self) {
         let Some(session) = &self.session else { return };
-        let clock = clock();
-        if self.drawn.0 == session.generation() && self.drawn.1 == clock {
+        if self.drawn == session.generation() {
             return;
         }
-        let view = session.view(&clock);
-        self.drawn = (session.generation(), clock);
+        let view = session.view("");
+        self.drawn = session.generation();
         let default_bg = self.frame.default_bg;
         let layout_changed = self.view.as_ref().is_none_or(|v| v.panes != view.panes || v.borders != view.borders);
         if layout_changed || self.full {
-            let (border_fg, active_fg) = (self.color(ChromeColor::Default), self.color(ChromeColor::Indexed(2)));
             for y in 0..self.frame.rows() {
                 self.frame.row_mut(y).fill(FrameCell::blank(default_bg));
             }
             let (cols, rows) = (self.frame.cols(), self.frame.rows());
             for border in view.borders.iter().filter(|b| b.y < rows && b.x < cols) {
-                let fg = if border.active { active_fg } else { border_fg };
                 self.frame.row_mut(border.y)[border.x as usize] =
-                    FrameCell { ch: border.glyph as u32, fg, bg: default_bg, flags: 0 };
+                    FrameCell { ch: border.glyph as u32, fg: theme::DIVIDER, bg: default_bg, flags: 0 };
             }
             self.full = true;
         }
-        let status: Vec<FrameCell> = view
-            .status
-            .iter()
-            .map(|c| {
-                let mut fg = self.color(c.fg);
-                let mut bg = if c.bg == ChromeColor::Default { default_bg } else { self.color(c.bg) };
-                if c.reverse {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-                let flags = if c.bold { BOLD } else { 0 } | if c.underline { UNDERLINE } else { 0 };
-                FrameCell { ch: c.ch as u32, fg, bg, flags }
-            })
-            .collect();
-        let row = self.frame.row_mut(self.frame.rows() - 1);
-        let n = row.len().min(status.len());
-        row[..n].copy_from_slice(&status[..n]);
         self.view = Some(view);
+    }
+
+    /// A centered panel for a prompt or message (the status line's job in tmux).
+    fn overlay_panel(&self, overlay: &Overlay) -> Panel {
+        let (cw, ch) = self.window.as_ref().expect("window").renderer.cell_size();
+        let (cw, ch) = (cw as i32, ch as i32);
+        let (line, caret) = match overlay {
+            Overlay::Confirm { prompt, .. } => (prompt.trim_end().to_owned(), None),
+            Overlay::Input { prompt, text, cursor } => (format!("{prompt}{text}"), Some(prompt.chars().count() + cursor)),
+            Overlay::Message(text) => (text.clone(), None),
+        };
+        let w = (line.chars().count() as i32 + 2) * cw + 16;
+        let h = ch + 16;
+        let x = (self.frame.cols() as i32 * cw - w) / 2;
+        let y = (self.frame.rows() as i32 * ch - h) / 2;
+        let fg = compose::resolve(term::Color::Default, &self.palette, self.palette.foreground);
+        let mut texts = vec![PanelText { x: 8 + cw, y: 8, text: line, color: fg, bold: false }];
+        if let Some(caret) = caret {
+            texts.push(PanelText { x: 8 + cw + caret as i32 * cw, y: 8, text: "\u{258f}".to_owned(), color: fg, bold: false });
+        }
+        Panel { x, y, w, h, fill: [0x36, 0x36, 0x3a, 0xff], outline: Some([0x55, 0x55, 0x55, 0xff]), texts }
     }
 
     fn redraw(&mut self) {
@@ -242,14 +230,13 @@ impl App {
         }
         self.compose_chrome();
         let Some(view) = self.view.take() else { return };
-        let mut cursor = None;
+        let split = view.panes.len() > 1;
+        self.frame.cursors.clear();
+        self.frame.dims.clear();
         for pv in &view.panes {
             let Some(pane) = self.panes.get_mut(&pv.pane) else { continue };
             let shared = &pane.io.shared;
             let dirty = shared.dirty.swap(false, Ordering::AcqRel);
-            if !dirty && !self.full && !pv.active {
-                continue;
-            }
             shared.want_lock.store(true, Ordering::Release);
             let mut term = shared.term.lock();
             shared.want_lock.store(false, Ordering::Release);
@@ -257,29 +244,30 @@ impl App {
             if dirty || self.full {
                 compose::copy_pane(&mut self.frame, &mut term, r.x, r.y, r.w, r.h, self.full);
             }
-            if pv.active && view.prompt_cursor.is_none() {
-                cursor = compose::pane_cursor(&term, r.x, r.y, self.focused);
+            // The focused pane's cursor blinks; every other pane shows a hollow one.
+            let focused = pv.active && self.focused;
+            if (!focused || self.blink_on)
+                && let Some(cursor) = compose::pane_cursor(&term, r.x, r.y, focused)
+            {
+                self.frame.cursors.push(cursor);
+            }
+            if split && !pv.active {
+                self.frame.dims.push(Dim { x: r.x, y: r.y, w: r.w, h: r.h, color: theme::UNFOCUSED_DIM });
             }
             if !term.title().is_empty() && term.title() != pane.title {
                 pane.title = term.title().to_owned();
                 self.session.as_mut().expect("session").set_pane_title(pv.pane, &pane.title);
             }
         }
-        if let Some(x) = view.prompt_cursor {
-            cursor = Some(FrameCursor {
-                x,
-                y: self.frame.rows() - 1,
-                shape: term::CursorShape::Block,
-                color: self.color(ChromeColor::Indexed(0)),
-                text_color: self.color(ChromeColor::Indexed(3)),
-                wide: false,
-            });
+        self.frame.panels.clear();
+        if let Some(overlay) = &view.overlay {
+            let panel = self.overlay_panel(overlay);
+            self.frame.panels.push(panel);
         }
         self.full = false;
-        self.frame.cursor = cursor;
         self.view = Some(view);
-        // A title change bumps the generation; the status line is rebuilt next frame.
-        let stale = self.session.as_ref().is_some_and(|s| s.generation() != self.drawn.0);
+        // A title change bumps the generation; the chrome is rebuilt next frame.
+        let stale = self.session.as_ref().is_some_and(|s| s.generation() != self.drawn);
         let window = self.window.as_mut().expect("window");
         window.draw(&mut self.frame);
         if stale {
@@ -292,6 +280,10 @@ impl App {
             return;
         }
         let Some((key, text)) = input::from_winit(event, self.modifiers) else { return };
+        // Typing shows the cursor and restarts its blink, as in ghostty.
+        self.blink_on = true;
+        self.next_blink = Instant::now() + theme::BLINK;
+        self.request_redraw();
         let Some(session) = self.session.as_mut() else { return };
         let before = session.generation();
         let result = session.key(key, Instant::now());
@@ -347,14 +339,22 @@ impl ApplicationHandler<UserEvent> for App {
             self.next_names = now + NAME_INTERVAL;
             self.update_names();
         }
-        if clock() != self.drawn.1 || self.session.as_ref().map(|s| s.generation()) != before {
+        if now >= self.next_blink {
+            self.blink_on = !self.blink_on;
+            self.next_blink = now + theme::BLINK;
+            self.request_redraw();
+        }
+        if self.session.as_ref().map(|s| s.generation()) != before {
             self.request_redraw();
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let deadline = self.session.as_ref().and_then(|s| s.deadline());
-        let wake = deadline.map_or(self.next_names, |d| d.min(self.next_names));
+        let mut wake = deadline.map_or(self.next_names, |d| d.min(self.next_names));
+        if self.focused {
+            wake = wake.min(self.next_blink);
+        }
         event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
     }
 
@@ -376,7 +376,7 @@ impl ApplicationHandler<UserEvent> for App {
         let (cols, rows) = window.resize(window.window.inner_size());
         self.window = Some(window);
         self.frame = Frame::new(cols, rows, self.frame.default_bg);
-        let (session, effects) = Session::new(cols, rows);
+        let (session, effects) = Session::without_status_line(cols, rows);
         self.session = Some(session);
         if !self.apply(effects) || self.panes.is_empty() {
             event_loop.exit();
