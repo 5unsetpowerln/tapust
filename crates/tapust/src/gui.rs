@@ -721,20 +721,24 @@ impl App {
         match st.session.key(key, Instant::now()) {
             KeyResult::Forward(id) => {
                 let target = if st.panes.contains_key(&id) { id } else { pane };
+                let mut typed = None;
                 if let Some(io) = st.panes.get(&target).and_then(|p| p.io.as_ref()) {
                     let app_cursor = io.shared.term.lock().modes().app_cursor;
                     let mut bytes = Vec::new();
                     input::encode(key, text.as_deref(), app_cursor, &mut bytes);
                     io.shared.write(&bytes);
                     if !bytes.is_empty() {
-                        // ghostty's selection-clear-on-typing and
-                        // scroll-to-bottom = keystroke.
-                        let surface = &st.panes[&target].surface;
-                        surface.clear_selection();
-                        surface.scroll_to_bottom();
+                        typed = Some(st.panes[&target].surface.clone());
                     }
                 }
                 drop(st);
+                // ghostty's selection-clear-on-typing and scroll-to-bottom =
+                // keystroke, once the state is no longer borrowed (clearing
+                // the selection updates the Copy action).
+                if let Some(surface) = typed {
+                    surface.clear_selection();
+                    surface.scroll_to_bottom();
+                }
             }
             KeyResult::Handled(effects) => {
                 drop(st);
