@@ -811,6 +811,7 @@ impl App {
         p.surface.output();
         p.surface.area.queue_render();
         p.surface.sync_scrollbar();
+        p.surface.update_cursor();
         let surface = p.surface.clone();
         let mut changed = pwd != p.pwd;
         p.pwd = pwd;

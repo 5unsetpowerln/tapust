@@ -128,6 +128,10 @@ pub struct Surface {
     autoscroll: RefCell<Option<(glib::SourceId, bool)>>,
     /// The terminal was on the alternate screen at the last frame.
     was_alt: Cell<bool>,
+    /// Modifiers held (from the key controller), for the pointer's shape.
+    mods: Cell<mouse::Mods>,
+    /// The CSS cursor name last given to the GLArea.
+    cursor: Cell<&'static str>,
     last_blink_reset: Cell<Option<Instant>>,
     font_scale: Cell<f64>,
     cell_idle: Cell<bool>,
@@ -282,6 +286,8 @@ impl Surface {
             suppress_left_release: Cell::new(false),
             autoscroll: RefCell::new(None),
             was_alt: Cell::new(false),
+            mods: Cell::new(mouse::Mods::default()),
+            cursor: Cell::new("text"),
             last_blink_reset: Cell::new(None),
             font_scale: Cell::new(0.0),
             cell_idle: Cell::new(false),
@@ -433,6 +439,14 @@ impl Surface {
                 s.set_preedit(None);
             }
             glib::Propagation::Stop
+        });
+        let weak = Rc::downgrade(self);
+        keys.connect_modifiers(move |_, state| {
+            if let Some(s) = weak.upgrade() {
+                s.mods.set(mods_of(state));
+                s.update_cursor();
+            }
+            glib::Propagation::Proceed
         });
         let weak = Rc::downgrade(self);
         keys.connect_key_released(move |keys, _, _, _| {
@@ -955,6 +969,27 @@ impl Surface {
     fn stop_autoscroll(&self) {
         if let Some((id, _)) = self.autoscroll.take() {
             id.remove();
+        }
+    }
+
+    /// ghostty's mouse shape: the terminal's (OSC 22, or an arrow while it
+    /// reports the mouse), overridden by modifiers (keyToMouseShape):
+    /// shift shows text, and the rectangle-select chord a crosshair.
+    pub fn update_cursor(&self) {
+        let Some(shared) = self.draw.borrow().shared.clone() else { return };
+        let (shape, reporting) = {
+            let term = shared.term.lock();
+            (term.mouse_shape(), term.modes().mouse_mode != term::MouseMode::None)
+        };
+        let m = self.mods.get();
+        let rectangle = m.ctrl && m.alt;
+        let name = match (reporting, m.shift, rectangle) {
+            (true, true, true) | (false, _, true) => "crosshair",
+            (_, true, _) => "text",
+            _ => shape,
+        };
+        if self.cursor.replace(name) != name {
+            self.area.set_cursor_from_name(Some(name));
         }
     }
 
