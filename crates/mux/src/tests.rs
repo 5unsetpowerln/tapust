@@ -335,6 +335,56 @@ fn small_window_keeps_the_minimum_sizes_in_order() {
     assert!(s.windows()[0].panes.iter().all(|p| M.grid(p.rect).1 == 1));
 }
 
+// --- Pointer ---------------------------------------------------------------
+
+#[test]
+fn dragging_a_divider_follows_gtk_paned() {
+    let mut s = new_session();
+    ok(&mut s, split(true));
+    // The divider is at 638; GtkPaned takes presses 6 pixels around it.
+    assert_eq!(s.grab_divider(631.0, 100.0), None);
+    assert!(s.grab_divider(632.0, 100.0).is_some());
+    let grab = s.grab_divider(640.0, 100.0).expect("grab");
+    s.drag_divider(grab, 700.0, 300.0);
+    // The pointer keeps its 2 pixel offset into the divider.
+    assert_eq!(rects(&s)[0].2, 698);
+    s.idle();
+    // GtkPaned scales the dragged position to a new size, and ghostty keeps
+    // it within 0.001 of the ratio the drag wrote: 1268 * 698 / 1275 + 0.5.
+    s.resize(Metrics { width: 1269, ..M });
+    assert_eq!(rects(&s)[0].2, 694);
+}
+
+#[test]
+fn hits_follow_gtk_picking() {
+    let mut s = new_session();
+    assert_eq!(s.hit(5.0, 5.0), Some(Hit::Pane(0)));
+    ok(&mut s, split(true));
+    // Split panes carry ghostty's drag handle in their top 16 pixels.
+    assert_eq!(s.hit(5.0, 5.0), Some(Hit::DragHandle(0)));
+    assert_eq!(s.hit(5.0, 16.0), Some(Hit::Pane(0)));
+    // The divider's handle lies above the first pane but below the second.
+    assert_eq!(s.hit(632.0, 100.0), Some(Hit::Divider { horizontal: true }));
+    assert_eq!(s.hit(631.0, 100.0), Some(Hit::Pane(0)));
+    assert_eq!(s.hit(639.0, 100.0), Some(Hit::Pane(1)));
+    ok(&mut s, Command::ZoomPane);
+    assert_eq!(s.hit(5.0, 5.0), Some(Hit::DragHandle(1)));
+}
+
+#[test]
+fn click_focuses_and_drop_moves_a_pane() {
+    let mut s = new_session();
+    ok(&mut s, split(true));
+    assert_eq!(s.active_pane(), 1);
+    s.focus_pane(0);
+    assert_eq!(s.active_pane(), 0);
+    // Dropping pane 1 on the left side of pane 0 swaps their places.
+    s.move_pane(1, 0, Direction::Left);
+    let ids: Vec<PaneId> = s.windows()[0].panes.iter().map(|p| p.pane).collect();
+    assert_eq!(ids, [1, 0]);
+    assert_eq!(rects(&s), [(0, 0, 638, 796), (639, 0, 637, 796)]);
+}
+
 // --- Effects ---------------------------------------------------------------
 
 #[test]

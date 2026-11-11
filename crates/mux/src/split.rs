@@ -37,11 +37,68 @@ struct Paned {
     last_allocation: i32,
     min: i32,
     max: i32,
+    /// The ratio ghostty's split widget aims for (`priv.ratio`): the tree's
+    /// when built, then what it last wrote to the tree, unrounded.
+    ratio: f64,
+    /// The position changed by a drag, for ghostty's idle sync.
+    moved: bool,
+    /// The last allocation: the split's rectangle and its divider's.
+    rect: Rect,
+    handle: Rect,
 }
 
 impl Paned {
-    /// `gtk_paned_init`.
-    const NEW: Paned = Paned { position_set: false, position: 0, last_allocation: -1, min: 0, max: i32::MAX };
+    /// `gtk_paned_init`, for a split widget built from a tree with `ratio`.
+    fn new(ratio: f64) -> Paned {
+        Paned {
+            position_set: false,
+            position: 0,
+            last_allocation: -1,
+            min: 0,
+            max: i32::MAX,
+            ratio,
+            moved: false,
+            rect: Rect::default(),
+            handle: Rect::default(),
+        }
+    }
+}
+
+/// A divider grabbed by the pointer: the split's place among the dividers
+/// (as [`crate::View::dividers`] lists them) and where in it the pointer is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Grab {
+    pub index: usize,
+    /// `drag_pos`: the pointer's distance from the divider's start.
+    offset: i32,
+}
+
+/// What the pointer is over, in the order GTK picks widgets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hit {
+    /// A divider's handle (6 pixels around it on the first pane's side).
+    Divider { horizontal: bool },
+    /// The drag handle on top of a pane of a split window.
+    DragHandle(PaneId),
+    Pane(PaneId),
+}
+
+/// ghostty's drag handle is a band this many logical pixels high (its 16px icon).
+pub const DRAG_HANDLE_HEIGHT: u32 = 16;
+/// GtkPaned's `HANDLE_EXTRA_SIZE`.
+const HANDLE_EXTRA: f64 = 6.0;
+
+/// A pane at `rect` under `point`; with `split`, its top band is the drag handle.
+pub(crate) fn leaf_hit(wp: PaneId, rect: Rect, point: (f64, f64), split: bool) -> Option<Hit> {
+    if !contains(rect, point, 0.0) {
+        return None;
+    }
+    let band = Rect { h: DRAG_HANDLE_HEIGHT.min(rect.h), ..rect };
+    Some(if split && contains(band, point, 0.0) { Hit::DragHandle(wp) } else { Hit::Pane(wp) })
+}
+
+fn contains(r: Rect, (x, y): (f64, f64), pad: f64) -> bool {
+    x >= f64::from(r.x) - pad && x < f64::from(r.x + r.w) + pad && y >= f64::from(r.y) - pad && y < f64::from(r.y + r.h) + pad
 }
 
 /// Where a new pane goes relative to the one it splits.
@@ -86,6 +143,7 @@ impl Split {
     /// the children's rectangles and the divider's.
     fn allocate(&mut self, rect: Rect, m: &Metrics) -> (Rect, Rect, Rect) {
         let h = self.horizontal;
+        self.paned.rect = rect;
         let (start_min, end_min) = (self.first.min_size(h, m) as i32, self.second.min_size(h, m) as i32);
         let (total, handle) = (extent(rect, h) as i32, m.divider as i32);
         self.calc_position((total - handle).max(1), start_min, end_min);
@@ -96,7 +154,7 @@ impl Split {
         let first = pos.max(1) as u32;
         let second = (total - pos - handle).max(1).max(end_min) as u32;
         let (pos, handle) = (pos as u32, m.divider);
-        if h {
+        let children = if h {
             (
                 Rect { w: first, ..rect },
                 Rect { x: rect.x + pos, w: handle, ..rect },
@@ -108,7 +166,9 @@ impl Split {
                 Rect { y: rect.y + pos, h: handle, ..rect },
                 Rect { y: rect.y + pos + handle, h: second, ..rect },
             )
-        }
+        };
+        self.paned.handle = children.1;
+        children
     }
 
     /// `gtk_paned_calc_position` with `shrink-*-child` false and both
@@ -147,26 +207,125 @@ impl Split {
             return None;
         }
         let size = p.max + end_min;
-        if size == 0 || (f64::from(p.position) / f64::from(size) - self.ratio).abs() <= 0.001 {
+        if size == 0 || (f64::from(p.position) / f64::from(size) - p.ratio).abs() <= 0.001 {
             return None;
         }
-        let desired = (f64::from(size) * self.ratio).round() as i32;
+        let desired = (f64::from(size) * p.ratio).round() as i32;
         Some((desired, desired.clamp(p.min, p.min.max(p.max)), size))
+    }
+
+    /// ghostty's setTreeRatio: the tree keeps the ratio as f16, the widget unrounded.
+    fn set_tree_ratio(&mut self, ratio: f64) {
+        self.ratio = f16(ratio);
+        self.paned.ratio = ratio;
     }
 }
 
 impl Node {
     fn split_node(horizontal: bool, first: Node, second: Node) -> Node {
-        Node::Split(Box::new(Split { horizontal, ratio: 0.5, first, second, paned: Paned::NEW }))
+        Node::Split(Box::new(Split { horizontal, ratio: 0.5, first, second, paned: Paned::new(0.5) }))
     }
 
     /// Starts every GtkPaned over, as ghostty's rebuild of the widget tree
     /// after each change of the tree does.
     pub(crate) fn rebuild(&mut self) {
         if let Node::Split(s) = self {
-            s.paned = Paned::NEW;
+            s.paned = Paned::new(s.ratio);
             s.first.rebuild();
             s.second.rebuild();
+        }
+    }
+
+    fn split_count(&self) -> usize {
+        match self {
+            Node::Leaf(_) => 0,
+            Node::Split(s) => 1 + s.first.split_count() + s.second.split_count(),
+        }
+    }
+
+    /// GtkPaned's pointer gesture works in the capture phase, so the
+    /// outermost split whose handle area (6 pixels around the divider)
+    /// holds a press takes it, on either side of the divider.
+    pub(crate) fn grab(&self, point: (f64, f64)) -> Option<Grab> {
+        self.grab_in(point, 0)
+    }
+
+    fn grab_in(&self, point: (f64, f64), before: usize) -> Option<Grab> {
+        let Node::Split(s) = self else { return None };
+        let index = before + s.first.split_count();
+        let (p, h) = (&s.paned, s.paned.handle);
+        if contains(p.rect, point, 0.0) && contains(h, point, HANDLE_EXTRA) {
+            let start = if s.horizontal { point.0 - f64::from(h.x) } else { point.1 - f64::from(h.y) };
+            // drag_pos is an int measured from the widened area's start.
+            let offset = (start + HANDLE_EXTRA) as i32 - HANDLE_EXTRA as i32;
+            return Some(Grab { index, offset });
+        }
+        match s.first.grab_in(point, before) {
+            Some(grab) => Some(grab),
+            None => s.second.grab_in(point, index + 1),
+        }
+    }
+
+    fn split_at(&mut self, index: usize) -> Option<&mut Split> {
+        let Node::Split(s) = self else { return None };
+        let own = s.first.split_count();
+        if index < own {
+            s.first.split_at(index)
+        } else if index == own {
+            Some(s)
+        } else {
+            s.second.split_at(index - own - 1)
+        }
+    }
+
+    /// GtkPaned's update_drag for the pointer at `point`: the divider keeps
+    /// the grab offset and stays between the children's minimums.
+    pub(crate) fn drag(&mut self, grab: Grab, point: (f64, f64)) {
+        let Some(s) = self.split_at(grab.index) else { return };
+        let p = &mut s.paned;
+        // The pointer in the paned's coordinates, converted to int by C.
+        let xpos = if s.horizontal { point.0 - f64::from(p.rect.x) } else { point.1 - f64::from(p.rect.y) };
+        let size = (xpos as i32 - grab.offset).clamp(p.min, p.max);
+        if size != p.position {
+            p.position = size;
+            p.position_set = true;
+            p.moved = true;
+        }
+    }
+
+    /// ghostty's idle widget-to-tree sync after drags: a divider that ended
+    /// more than 0.001 away from its ratio writes its ratio to the tree.
+    pub(crate) fn sync_dragged(&mut self, m: &Metrics) {
+        if let Node::Split(s) = self {
+            if std::mem::take(&mut s.paned.moved)
+                && let Some((_, _, size)) = s.sync(s.second.min_size(s.horizontal, m) as i32)
+            {
+                s.set_tree_ratio(f64::from(s.paned.position) / f64::from(size));
+            }
+            s.first.sync_dragged(m);
+            s.second.sync_dragged(m);
+        }
+    }
+
+    /// The widget GTK picks at `point`: a split's second child lies above its
+    /// divider handle, which lies above its first child; the drag handle of a
+    /// pane in a split window lies above the pane.
+    pub(crate) fn hit(&self, point: (f64, f64), split: bool, rect_of: &impl Fn(PaneId) -> Rect) -> Option<Hit> {
+        match self {
+            Node::Leaf(wp) => leaf_hit(*wp, rect_of(*wp), point, split),
+            Node::Split(s) => {
+                let p = &s.paned;
+                if !contains(p.rect, point, 0.0) {
+                    return None;
+                }
+                if let Some(hit) = s.second.hit(point, split, rect_of) {
+                    return Some(hit);
+                }
+                if contains(p.handle, point, HANDLE_EXTRA) {
+                    return Some(Hit::Divider { horizontal: s.horizontal });
+                }
+                s.first.hit(point, split, rect_of)
+            }
         }
     }
 
@@ -337,7 +496,7 @@ impl Node {
         if let Some((desired, clamped, size)) = s.sync(s.second.min_size(horizontal, m) as i32)
             && clamped != desired
         {
-            s.ratio = f16(f64::from(clamped) / f64::from(size));
+            s.set_tree_ratio(f64::from(clamped) / f64::from(size));
         }
         // The split's width relative to the tree's, as spatial normalizes it.
         let scale = f16(size / root);

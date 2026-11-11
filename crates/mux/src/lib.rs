@@ -20,6 +20,8 @@ mod window;
 #[cfg(test)]
 mod tests;
 
+pub use split::{Grab, Hit, DRAG_HANDLE_HEIGHT};
+
 use keys::KeyState;
 use prompt::Prompt;
 use window::Window;
@@ -187,6 +189,8 @@ pub struct PaneView {
 pub struct View {
     pub panes: Vec<PaneView>,
     pub dividers: Vec<Divider>,
+    /// The window is split, zoomed or not (ghostty's `is-split`).
+    pub split: bool,
     /// The prompt or message tmux would show on the status line.
     pub overlay: Option<Overlay>,
 }
@@ -357,6 +361,42 @@ impl Session {
         self.min_area_of_windows()
     }
 
+    /// What the pointer at (`x`, `y`) is over, in logical pixels of the pane area.
+    pub fn hit(&self, x: f64, y: f64) -> Option<Hit> {
+        if self.dead { None } else { self.cur().hit((x, y)) }
+    }
+
+    /// The divider a pointer press at (`x`, `y`) starts dragging, if any.
+    pub fn grab_divider(&self, x: f64, y: f64) -> Option<Grab> {
+        if self.dead { None } else { self.cur().grab((x, y)) }
+    }
+
+    /// Moves a grabbed divider with the pointer at (`x`, `y`).
+    pub fn drag_divider(&mut self, grab: Grab, x: f64, y: f64) -> Vec<Effect> {
+        self.op(|s| s.cur_mut().tree.drag(grab, (x, y)))
+    }
+
+    /// ghostty's idle callbacks: dragged dividers write their ratio to the
+    /// tree. The GUI calls this when it has handled the pending events.
+    pub fn idle(&mut self) {
+        if !self.dead {
+            let w = self.cur_mut();
+            let m = w.metrics;
+            w.tree.sync_dragged(&m);
+        }
+    }
+
+    /// A click on a pane focuses it.
+    pub fn focus_pane(&mut self, pane: PaneId) -> Vec<Effect> {
+        self.op(|s| s.focus(pane))
+    }
+
+    /// Drops pane `source` on the `dir` side of pane `target` (ghostty's
+    /// drag and drop of a split).
+    pub fn move_pane(&mut self, source: PaneId, target: PaneId, dir: Direction) -> Vec<Effect> {
+        self.op(|s| s.drop_pane(source, target, dir))
+    }
+
     /// Offers a key to the key tables (prefix, repeat, prompts).
     pub fn key(&mut self, key: Key, now: Instant) -> KeyResult {
         self.handle_key(key, now)
@@ -423,7 +463,7 @@ impl Session {
     /// The visible state of the current window.
     pub fn view(&self) -> View {
         if self.dead {
-            return View { panes: Vec::new(), dividers: Vec::new(), overlay: self.overlay() };
+            return View { panes: Vec::new(), dividers: Vec::new(), split: false, overlay: self.overlay() };
         }
         let w = self.cur();
         let panes = w
@@ -432,7 +472,7 @@ impl Session {
             .filter(|p| w.visible(p.id))
             .map(|p| PaneView { pane: p.id, rect: p.rect, active: p.id == w.active })
             .collect();
-        View { panes, dividers: w.dividers.clone(), overlay: self.overlay() }
+        View { panes, dividers: w.dividers.clone(), split: w.panes.len() > 1, overlay: self.overlay() }
     }
 
     fn overlay(&self) -> Option<Overlay> {

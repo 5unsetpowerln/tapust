@@ -84,6 +84,36 @@ struct GridCache {
     rows: Vec<Vec<Instance>>,
 }
 
+/// The drag preview: a copy of a pane's pixels drawn scaled down.
+struct Preview {
+    program: glow::Program,
+    rect: glow::UniformLocation,
+    viewport: glow::UniformLocation,
+    texture: glow::Texture,
+}
+
+const PREVIEW_VS: &str = r#"#version 330 core
+uniform vec4 u_rect;
+uniform vec2 u_viewport;
+out vec2 v_uv;
+void main() {
+    vec2 corner = vec2(gl_VertexID & 1, (gl_VertexID >> 1) & 1);
+    // The copy is bottom-up, as OpenGL reads the framebuffer.
+    v_uv = vec2(corner.x, 1.0 - corner.y);
+    vec2 ndc = (u_rect.xy + corner * u_rect.zw) / u_viewport * 2.0 - 1.0;
+    gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
+}
+"#;
+
+const PREVIEW_FS: &str = r#"#version 330 core
+uniform sampler2D u_tex;
+in vec2 v_uv;
+out vec4 frag;
+void main() {
+    frag = texture(u_tex, v_uv);
+}
+"#;
+
 struct BgUniforms {
     rect: glow::UniformLocation,
     origin: glow::UniformLocation,
@@ -101,6 +131,7 @@ pub struct Renderer {
     grids: HashMap<u32, GridCache>,
     fg_program: glow::Program,
     fg_viewport: glow::UniformLocation,
+    preview: Preview,
     empty_vao: glow::VertexArray,
     fg_vao: glow::VertexArray,
     fg_buffer: glow::Buffer,
@@ -298,6 +329,15 @@ impl Renderer {
             };
             let fg_program = program(&gl, FG_VS, FG_FS);
             let fg_viewport = uniform(&gl, fg_program, "u_viewport");
+            let preview_program = program(&gl, PREVIEW_VS, PREVIEW_FS);
+            let preview = Preview {
+                program: preview_program,
+                rect: uniform(&gl, preview_program, "u_rect"),
+                viewport: uniform(&gl, preview_program, "u_viewport"),
+                texture: new_texture(&gl, 1, 1),
+            };
+            gl.use_program(Some(preview_program));
+            gl.uniform_1_i32(gl.get_uniform_location(preview_program, "u_tex").as_ref(), 2);
 
             let empty_vao = gl.create_vertex_array().expect("vao");
             let fg_vao = gl.create_vertex_array().expect("vao");
@@ -337,6 +377,7 @@ impl Renderer {
                 grids: HashMap::new(),
                 fg_program,
                 fg_viewport,
+                preview,
                 empty_vao,
                 fg_vao,
                 fg_buffer,
@@ -708,6 +749,26 @@ impl Renderer {
                 }
                 gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytes_of(&upload));
                 gl.draw_arrays_instanced(glow::TRIANGLE_STRIP, 0, 4, upload.len() as i32);
+            }
+            if let Some((x, y, w, h)) = frame.capture.take() {
+                // Keep the pane's pixels, with mipmaps to scale them down smoothly.
+                gl.active_texture(glow::TEXTURE2);
+                gl.bind_texture(glow::TEXTURE_2D, Some(self.preview.texture));
+                let bottom = self.viewport.1 as i32 - y - h as i32;
+                gl.copy_tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8, x, bottom, w as i32, h as i32, 0);
+                gl.generate_mipmap(glow::TEXTURE_2D);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR_MIPMAP_LINEAR as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+            }
+            if let Some((x, y, w, h)) = frame.preview {
+                gl.enable(glow::BLEND);
+                gl.use_program(Some(self.preview.program));
+                gl.uniform_4_f32(Some(&self.preview.rect), x as f32, y as f32, w as f32, h as f32);
+                gl.uniform_2_f32(Some(&self.preview.viewport), vw, vh);
+                gl.active_texture(glow::TEXTURE2);
+                gl.bind_texture(glow::TEXTURE_2D, Some(self.preview.texture));
+                gl.bind_vertex_array(Some(self.empty_vao));
+                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
             }
             if cfg!(debug_assertions) {
                 let error = gl.get_error();

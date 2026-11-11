@@ -133,10 +133,15 @@ pub struct Frame {
     pub shapes: Vec<Shape>,
     /// The window background, wherever no pane is.
     pub window_bg: [u8; 4],
+    /// Device pixels (x, y, width, height) to keep as the drag preview once
+    /// the grids are drawn.
+    pub capture: Option<(i32, i32, u32, u32)>,
+    /// Where to draw the kept pixels, scaled, above everything (x, y, width, height).
+    pub preview: Option<(f64, f64, f64, f64)>,
 }
 
 impl Frame {
     pub fn new(window_bg: [u8; 4]) -> Frame {
-        Frame { grids: Vec::new(), cursors: Vec::new(), shapes: Vec::new(), window_bg }
+        Frame { grids: Vec::new(), cursors: Vec::new(), shapes: Vec::new(), window_bg, capture: None, preview: None }
     }
 }

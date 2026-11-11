@@ -9,16 +9,17 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use mux::{ConfirmTarget, Effect, KeyResult, Metrics, Overlay, PaneId, Rect, Session, View};
+use mux::{ConfirmTarget, Direction, Effect, Hit, KeyResult, Metrics, Overlay, PaneId, Rect, Session, View};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, StartCause, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::ModifiersState;
-use winit::window::WindowId;
+use winit::window::{CursorIcon, WindowId};
 
 use crate::compose;
 use crate::font::{UI, UI_BOLD};
 use crate::frame::{Frame, Grid, Shape};
+use crate::handle;
 use crate::input;
 use crate::pty::{PaneIo, Pty};
 use crate::theme;
@@ -74,6 +75,25 @@ pub struct App {
     /// Whether the focused cursor is in the visible half of its blink.
     blink_on: bool,
     next_blink: Instant,
+    /// The pointer in logical window pixels, while it is in the window.
+    pointer: Option<(f64, f64)>,
+    press: Press,
+    cursor: CursorIcon,
+    /// The pane whose drag handle the pointer is on.
+    handle_hover: Option<PaneId>,
+    /// Drag handles fading in or out: (from, to, since).
+    fades: HashMap<PaneId, (f64, f64, Instant)>,
+}
+
+/// What the left mouse button is doing.
+enum Press {
+    None,
+    /// Dragging a divider (GtkPaned's drag gesture).
+    Divider(mux::Grab),
+    /// Pressed on a pane's drag handle; dragging starts past GTK's threshold.
+    Handle { pane: PaneId, start: (f64, f64) },
+    /// Dragging a pane (ghostty's drag source), with where it would drop.
+    Pane { source: PaneId, size: (f64, f64), target: Option<(PaneId, Direction)> },
 }
 
 impl App {
@@ -106,6 +126,11 @@ impl App {
             started: Instant::now(),
             blink_on: true,
             next_blink: Instant::now() + theme::BLINK,
+            pointer: None,
+            press: Press::None,
+            cursor: CursorIcon::Default,
+            handle_hover: None,
+            fades: HashMap::new(),
         }
     }
 
@@ -441,6 +466,7 @@ impl App {
                 pane.title = term.title().to_owned();
             }
         }
+        let now = Instant::now();
         // In GtkPaned's order: a split's first pane, its divider, its second
         // pane. A pane's veil (ghostty's unfocused-split-opacity) covers the
         // widget's own fractional rectangle, padding included.
@@ -460,25 +486,45 @@ impl App {
                 shapes.push(Shape::Area { x0, y0, x1, y1, color: [r, g, b], alpha: 1.0 });
                 shapes.push(Shape::Area { x0, y0, x1, y1, color: theme::DIVIDER_SHADOW, alpha: theme::DIVIDER_SHADOW_ALPHA });
             }
+            // The surface's overlays in ghostty's order: the resize overlay,
+            // the unfocused veil, the drag handle and the drop overlay.
+            if self.resize_overlays.get(&pv.pane).is_some_and(|&until| until > now) {
+                self.resize_overlay_shapes(pv.rect, &mut shapes);
+            }
             if split && !pv.active {
                 let (x0, y0, x1, y1) = self.device_area(pv.rect);
                 shapes.push(Shape::Area { x0, y0, x1, y1, color: theme::UNFOCUSED_FILL, alpha: theme::UNFOCUSED_ALPHA });
             }
+            let opacity = self.handle_opacity(pv.pane, now);
+            if view.split && opacity > 0.0 {
+                handle::drag_handle(pv.rect, m.top, m.scale, opacity, &mut shapes);
+            }
+            if let Press::Pane { target: Some((target, dir)), .. } = self.press
+                && target == pv.pane
+            {
+                handle::drop_overlay(pv.rect, m.top, m.scale, dir, &mut shapes);
+            }
         }
+        self.resize_overlays.retain(|_, until| *until > now);
+        self.fades.retain(|_, &mut (_, to, since)| to > 0.0 || now < since + theme::DRAG_HANDLE_FADE);
         if self.top > 0 {
             self.tab_bar_shapes(&mut shapes);
-        }
-        let now = Instant::now();
-        self.resize_overlays.retain(|_, until| *until > now);
-        for pv in &view.panes {
-            if self.resize_overlays.contains_key(&pv.pane) {
-                self.resize_overlay_shapes(pv.rect, &mut shapes);
-            }
         }
         if let Some(overlay) = &view.overlay {
             self.overlay_shapes(overlay, &mut shapes);
         }
         self.frame.shapes = shapes;
+        // ghostty's drag icon: the dragged surface at 0.2, centered on the pointer.
+        self.frame.preview = match (&self.press, self.pointer) {
+            (Press::Pane { size: (w, h), .. }, Some((x, y))) => {
+                let (w, h) = (w * theme::DRAG_PREVIEW_SCALE, h * theme::DRAG_PREVIEW_SCALE);
+                Some((x * m.scale - w / 2.0, y * m.scale - h / 2.0, w, h))
+            }
+            _ => None,
+        };
+        if self.fading(now) {
+            self.request_redraw();
+        }
         // The window title follows the active tab, as in ghostty.
         if let Some(active) = self.session.as_ref().and_then(|s| s.windows().into_iter().find(|w| w.active)) {
             let title = self.tab_title(&active);
@@ -496,6 +542,141 @@ impl App {
         if stale {
             window.window.request_redraw();
         }
+    }
+
+    /// The drag handle's opacity: CSS `transition: 0.1s opacity` with `ease`.
+    fn handle_opacity(&self, pane: PaneId, now: Instant) -> f64 {
+        let Some(&(from, to, since)) = self.fades.get(&pane) else { return 0.0 };
+        let t = (now - since).as_secs_f64() / theme::DRAG_HANDLE_FADE.as_secs_f64();
+        from + (to - from) * handle::ease(t.min(1.0))
+    }
+
+    fn fading(&self, now: Instant) -> bool {
+        self.fades.values().any(|&(_, _, since)| now < since + theme::DRAG_HANDLE_FADE)
+    }
+
+    /// The pointer moves onto or off a drag handle (GTK's `:hover`).
+    fn set_handle_hover(&mut self, pane: Option<PaneId>) {
+        if pane == self.handle_hover {
+            return;
+        }
+        let now = Instant::now();
+        // A new transition starts from the current opacity.
+        for (p, to) in [(self.handle_hover, 0.0), (pane, 1.0)] {
+            if let Some(p) = p {
+                let from = self.handle_opacity(p, now);
+                self.fades.insert(p, (from, to, now));
+            }
+        }
+        self.handle_hover = pane;
+        self.request_redraw();
+    }
+
+    fn set_cursor(&mut self, cursor: CursorIcon) {
+        if cursor != self.cursor
+            && let Some(window) = &self.window
+        {
+            window.window.set_cursor(cursor);
+            self.cursor = cursor;
+        }
+    }
+
+    /// The pointer in logical pixels of the pane area.
+    fn area_point(&self) -> Option<(f64, f64)> {
+        self.pointer.map(|(x, y)| (x, y - f64::from(self.top)))
+    }
+
+    fn pane_rect(&self, pane: PaneId) -> Option<Rect> {
+        self.view.as_ref()?.panes.iter().find(|p| p.pane == pane).map(|p| p.rect)
+    }
+
+    /// Returns false when the program should exit.
+    fn pointer_moved(&mut self, x: f64, y: f64) -> bool {
+        self.pointer = Some((x, y));
+        let Some((ax, ay)) = self.area_point() else { return true };
+        let Some(session) = self.session.as_mut() else { return true };
+        match self.press {
+            Press::Divider(grab) => {
+                let effects = session.drag_divider(grab, ax, ay);
+                self.request_redraw();
+                return self.apply(effects);
+            }
+            Press::Handle { pane, start } => {
+                if (x - start.0).abs() > theme::DRAG_THRESHOLD || (y - start.1).abs() > theme::DRAG_THRESHOLD {
+                    // The drag icon is a snapshot of the surface when the drag begins.
+                    if let (Some(m), Some(r)) = (self.metrics, self.pane_rect(pane)) {
+                        let d = m.device(r);
+                        self.frame.capture = Some((d.x, d.y, d.w, d.h));
+                        self.press = Press::Pane { source: pane, size: (f64::from(d.w), f64::from(d.h)), target: None };
+                        self.set_handle_hover(None);
+                        self.set_cursor(CursorIcon::Move);
+                    }
+                }
+            }
+            Press::Pane { source, size, .. } => {
+                // Surfaces are the drop targets; a surface rejects itself.
+                let target = match session.hit(ax, ay) {
+                    Some(Hit::Pane(p) | Hit::DragHandle(p)) if p != source => self.pane_rect(p).map(|r| {
+                        let (px, py) = (ax - f64::from(r.x), ay - f64::from(r.y));
+                        (p, handle::drop_direction(px, py, f64::from(r.w), f64::from(r.h)))
+                    }),
+                    _ => None,
+                };
+                self.press = Press::Pane { source, size, target };
+            }
+            Press::None => {
+                let hit = session.hit(ax, ay);
+                self.set_cursor(match hit {
+                    Some(Hit::Divider { horizontal: true }) => CursorIcon::ColResize,
+                    Some(Hit::Divider { horizontal: false }) => CursorIcon::RowResize,
+                    Some(Hit::DragHandle(_)) => CursorIcon::Grab,
+                    Some(Hit::Pane(_)) => CursorIcon::Text,
+                    None => CursorIcon::Default,
+                });
+                self.set_handle_hover(match hit {
+                    Some(Hit::DragHandle(p)) => Some(p),
+                    _ => None,
+                });
+            }
+        }
+        self.request_redraw();
+        true
+    }
+
+    /// Returns false when the program should exit.
+    fn left_button(&mut self, pressed: bool) -> bool {
+        let Some((ax, ay)) = self.area_point() else { return true };
+        let Some(session) = self.session.as_mut() else { return true };
+        if pressed {
+            if let Some(grab) = session.grab_divider(ax, ay) {
+                self.press = Press::Divider(grab);
+                return true;
+            }
+            match session.hit(ax, ay) {
+                Some(Hit::DragHandle(pane)) => {
+                    self.press = Press::Handle { pane, start: self.pointer.expect("pointer") };
+                }
+                Some(Hit::Pane(pane)) => {
+                    let effects = session.focus_pane(pane);
+                    self.request_redraw();
+                    return self.apply(effects);
+                }
+                _ => {}
+            }
+            return true;
+        }
+        let press = std::mem::replace(&mut self.press, Press::None);
+        let mut ok = true;
+        if let Press::Pane { source, target: Some((target, dir)), .. } = press {
+            let effects = session.move_pane(source, target, dir);
+            ok = self.apply(effects);
+        }
+        self.request_redraw();
+        // The pointer may now be over something else.
+        if let Some((x, y)) = self.pointer {
+            ok &= self.pointer_moved(x, y);
+        }
+        ok
     }
 
     fn key(&mut self, event_loop: &ActiveEventLoop, event: &KeyEvent) {
@@ -581,6 +762,10 @@ impl ApplicationHandler<UserEvent> for App {
         if self.focused {
             wake = wake.min(self.next_blink);
         }
+        // ghostty's idle callbacks run once the pending events are handled.
+        if let Some(session) = self.session.as_mut() {
+            session.idle();
+        }
         event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
     }
 
@@ -641,6 +826,21 @@ impl ApplicationHandler<UserEvent> for App {
                 self.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => self.key(event_loop, &event),
+            WindowEvent::CursorMoved { position, .. } => {
+                let scale = self.window.as_ref().map_or(1.0, |w| w.window.scale_factor());
+                if !self.pointer_moved(position.x / scale, position.y / scale) {
+                    event_loop.exit();
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.pointer = None;
+                self.set_handle_hover(None);
+            }
+            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
+                if !self.left_button(state == ElementState::Pressed) {
+                    event_loop.exit();
+                }
+            }
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }

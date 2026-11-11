@@ -44,6 +44,18 @@ pub const DIVIDER_SHADOW_ALPHA: f64 = 0.15;
 /// background) at opacity `1 - unfocused-split-opacity`.
 pub const UNFOCUSED_FILL: [u8; 3] = [0x28, 0x2C, 0x34];
 pub const UNFOCUSED_ALPHA: f64 = 1.0 - 0.7;
+/// ghostty's drag handle: `.drag-handle { background-color: rgba(0, 0, 0, 0.15); }`,
+/// shown on hover with `transition: 0.1s opacity`; its icon has the foreground color.
+pub const DRAG_HANDLE_ALPHA: f64 = 0.15;
+pub const DRAG_HANDLE_FADE: std::time::Duration = std::time::Duration::from_millis(100);
+pub const ICON_COLOR: [u8; 3] = [0xf7, 0xf7, 0xf7];
+/// ghostty's drop overlay: the accent background mixed with 80% transparent.
+pub const DROP_ALPHA: f64 = 0.2;
+/// ghostty's drag icon: the surface scaled by 0.2.
+pub const DRAG_PREVIEW_SCALE: f64 = 0.2;
+/// GTK's `gtk-dnd-drag-threshold`, in logical pixels along either axis.
+pub const DRAG_THRESHOLD: f64 = 8.0;
+
 /// libadwaita's smallest vertical scrollbar (a 40px slider in a trough with
 /// 9px margins), which a pane's GtkScrolledWindow keeps room for.
 pub const SCROLLBAR_MIN_HEIGHT: u32 = 58;
@@ -70,6 +82,8 @@ pub mod adw {
     pub const DESTRUCTIVE: [u8; 4] = [0xc0, 0x1c, 0x28, 0xff];
     pub const SUGGESTED: [u8; 4] = [0x35, 0x84, 0xe4, 0xff];
     pub const TOAST_BG: [u8; 4] = [0x50, 0x50, 0x53, 0xff];
+    /// Yaru's orange accent background on the dark side.
+    pub const ACCENT_BG: [u8; 4] = [0xcb, 0x43, 0x14, 0xff];
     /// Yaru's window background: Ubuntu's libadwaita loads the Yaru stylesheet.
     pub const WINDOW_BG: [u8; 4] = [0x2c, 0x2c, 0x2c, 0xff];
 }

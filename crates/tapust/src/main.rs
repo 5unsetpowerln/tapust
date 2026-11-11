@@ -2,6 +2,7 @@ mod app;
 mod compose;
 mod font;
 mod frame;
+mod handle;
 mod input;
 mod pty;
 mod renderer;

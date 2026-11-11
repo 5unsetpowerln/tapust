@@ -386,6 +386,32 @@ impl Session {
         w.pop_zoom(point);
     }
 
+    /// select-pane -t for a pane of the current window.
+    pub(crate) fn focus(&mut self, wp: PaneId) {
+        let (w, point) = self.cur_point();
+        if !w.has_pane(wp) || wp == w.active {
+            return;
+        }
+        w.push_zoom(false, false);
+        w.set_active(wp, point);
+        w.pop_zoom(point);
+    }
+
+    /// ghostty's moveSplit within the current window.
+    pub(crate) fn drop_pane(&mut self, source: PaneId, target: PaneId, dir: Direction) {
+        let w = self.cur_mut();
+        if source == target || !w.has_pane(source) || !w.has_pane(target) {
+            return;
+        }
+        let side = match dir {
+            Direction::Left => Side { horizontal: true, before: true },
+            Direction::Right => Side { horizontal: true, before: false },
+            Direction::Up => Side { horizontal: false, before: true },
+            Direction::Down => Side { horizontal: false, before: false },
+        };
+        w.move_pane(source, target, side);
+    }
+
     /// cmd_select_pane_exec for last-pane
     fn last_pane(&mut self) -> Result<(), String> {
         let (w, point) = self.cur_point();

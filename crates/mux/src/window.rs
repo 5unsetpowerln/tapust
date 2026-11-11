@@ -1,7 +1,7 @@
 //! Windows and panes: tmux 3.6's `window.c` bookkeeping (pane order, the
 //! last-pane stack, zoom, directional selection) over ghostty's split tree.
 
-use crate::split::{Node, Side};
+use crate::split::{leaf_hit, Grab, Hit, Node, Side};
 use crate::{Divider, Metrics, PaneId, Rect};
 
 #[derive(Clone, Debug)]
@@ -178,6 +178,29 @@ impl Window {
         let (m, area) = (self.metrics, self.area);
         let wp = self.active;
         self.tree.resize(wp, horizontal, amount, area, &m);
+        self.tree_changed();
+    }
+
+    /// What the pointer at `point` (logical, in the pane area) is over. A
+    /// zoomed window still counts as split, as ghostty's `is-split` does.
+    pub(crate) fn hit(&self, point: (f64, f64)) -> Option<Hit> {
+        let split = matches!(self.tree, Node::Split(_));
+        if self.zoomed {
+            return leaf_hit(self.active, self.pane(self.active).rect, point, split);
+        }
+        self.tree.hit(point, split, &|wp| self.pane(wp).rect)
+    }
+
+    /// The divider a press at `point` grabs (no dividers show while zoomed).
+    pub(crate) fn grab(&self, point: (f64, f64)) -> Option<Grab> {
+        if self.zoomed { None } else { self.tree.grab(point) }
+    }
+
+    /// ghostty's moveSplit: `source` leaves its place (its sibling takes it)
+    /// and splits `target` on `side` with the ratio 0.5.
+    pub(crate) fn move_pane(&mut self, source: PaneId, target: PaneId, side: Side) {
+        self.tree.remove(source);
+        self.tree.find_mut(target).expect("pane in tree").split(source, side);
         self.tree_changed();
     }
 
