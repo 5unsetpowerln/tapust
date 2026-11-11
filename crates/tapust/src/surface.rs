@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use adw::prelude::*;
-use gtk::{gdk, glib, graphene};
+use gtk::{gdk, gio, glib, graphene};
 use mux::{Direction, PaneId};
 
 use crate::compose;
@@ -18,6 +18,7 @@ use crate::frame::{Frame, Grid};
 use crate::pty::Shared;
 use crate::renderer::Renderer;
 use crate::scroll::SurfaceBin;
+use crate::links;
 use crate::mouse;
 use crate::selection::{self, DragPoint, Point, Selection};
 use crate::theme;
@@ -69,6 +70,8 @@ struct Gesture {
     first_px: (f64, f64),
     click: Option<DragPoint>,
     left_down: bool,
+    /// The press became a selection drag (ghostty's left_click_dragged).
+    dragged: bool,
 }
 
 /// The drawing state, borrowed only by the GLArea's handlers.
@@ -94,6 +97,8 @@ pub struct Surface {
     drop_overlay: gtk::DrawingArea,
     resize_label: gtk::Label,
     resize_bin: adw::Bin,
+    url_left: gtk::Label,
+    url_right: gtk::Label,
     resize_hide: RefCell<Option<glib::SourceId>>,
     resize_idle: Cell<bool>,
     blink_timer: RefCell<Option<glib::SourceId>>,
@@ -132,6 +137,8 @@ pub struct Surface {
     mods: Cell<mouse::Mods>,
     /// The CSS cursor name last given to the GLArea.
     cursor: Cell<&'static str>,
+    /// The link under the pointer while ctrl is held, and its text.
+    hover: RefCell<Option<(Selection, String)>>,
     last_blink_reset: Cell<Option<Instant>>,
     font_scale: Cell<f64>,
     cell_idle: Cell<bool>,
@@ -143,6 +150,29 @@ pub struct Surface {
     size: Cell<(u16, u16)>,
     /// The GLArea's size in device pixels.
     pixels: Cell<(i32, i32)>,
+}
+
+/// Zig's std.fs.path.resolve for an absolute `dir`: `path` joined to it
+/// with `.` and `..` segments and repeated slashes folded away.
+fn resolve_path(dir: &str, path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in dir.split('/').chain(path.split('/')) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
+/// ghostty's internal_os.open on Linux.
+fn xdg_open(url: &str) {
+    if let Err(err) = std::process::Command::new("xdg-open").arg(url).stdout(std::process::Stdio::null()).spawn() {
+        eprintln!("tapust: cannot run xdg-open: {err}");
+    }
 }
 
 fn mods_of(state: gdk::ModifierType) -> mouse::Mods {
@@ -223,6 +253,19 @@ impl Surface {
             .child(&inner)
             .build();
         overlay.add_overlay(&resize_bin);
+        // ghostty's url_left and url_right: the hovered link's text.
+        let url_label = |align| {
+            gtk::Label::builder().css_classes(["background", "url-overlay"]).visible(false).halign(align).valign(gtk::Align::End).build()
+        };
+        let (url_left, url_right) = (url_label(gtk::Align::Start), url_label(gtk::Align::End));
+        let url_motion = gtk::EventControllerMotion::new();
+        let right = url_right.clone();
+        url_motion.connect_enter(move |_, _, _| right.set_visible(true));
+        let right = url_right.clone();
+        url_motion.connect_leave(move |_| right.set_visible(false));
+        url_left.add_controller(url_motion);
+        overlay.add_overlay(&url_left);
+        overlay.add_overlay(&url_right);
 
         let veil = gtk::Revealer::builder().transition_duration(0).can_focus(false).can_target(false).focusable(false).build();
         veil.set_child(Some(&gtk::DrawingArea::builder().css_classes(["unfocused-split"]).build()));
@@ -266,6 +309,8 @@ impl Surface {
             drop_overlay,
             resize_label,
             resize_bin,
+            url_left,
+            url_right,
             resize_hide: RefCell::new(None),
             resize_idle: Cell::new(false),
             blink_timer: RefCell::new(None),
@@ -288,6 +333,7 @@ impl Surface {
             was_alt: Cell::new(false),
             mods: Cell::new(mouse::Mods::default()),
             cursor: Cell::new("text"),
+            hover: RefCell::new(None),
             last_blink_reset: Cell::new(None),
             font_scale: Cell::new(0.0),
             cell_idle: Cell::new(false),
@@ -444,6 +490,7 @@ impl Surface {
         keys.connect_modifiers(move |_, state| {
             if let Some(s) = weak.upgrade() {
                 s.mods.set(mods_of(state));
+                s.update_hover();
                 s.update_cursor();
             }
             glib::Propagation::Proceed
@@ -851,9 +898,11 @@ impl Surface {
                 g.last_press = Some(Instant::now());
                 g.click = Some(point);
                 g.left_down = true;
+                g.dragged = false;
                 let selection = match g.count {
                     1 => None,
-                    2 => selection::word(&term, point.cell),
+                    // A double click on a link selects all of it.
+                    2 => links::link_at(&term, point.cell).map(|(sel, _)| sel).or_else(|| selection::word(&term, point.cell)),
                     _ => selection::line(&term, point.cell, true),
                 };
                 drop(g);
@@ -869,7 +918,8 @@ impl Surface {
                 let term = shared.term.lock();
                 let Some(point) = self.drag_point(&term, x, y) else { return };
                 let inside = self.selection.borrow().is_some_and(|s| s.contains(point.cell, term.cols()));
-                if !inside && let Some(word) = selection::word(&term, point.cell) {
+                let hovered = self.hover.borrow().as_ref().map(|(sel, _)| *sel);
+                if !inside && let Some(word) = hovered.or_else(|| selection::word(&term, point.cell)) {
                     drop(term);
                     self.set_selection(Some(word));
                     self.copy_primary();
@@ -898,12 +948,21 @@ impl Surface {
         if button == mouse::Button::Left && self.has_selection() {
             self.copy_primary();
         }
+        // ghostty opens the hovered link on a left release that did not drag.
+        if button == mouse::Button::Left && !self.gesture.borrow().dragged {
+            let link = self.hover.borrow().as_ref().map(|(_, text)| text.clone());
+            if let Some(text) = link {
+                self.open_link(&text);
+            }
+        }
     }
 
     /// ghostty's cursorPosCallback: motion reports, or dragging the
     /// selection with the left button.
     fn pointer_moved(self: &Rc<Self>, state: gdk::ModifierType) {
         let mods = mods_of(state);
+        self.mods.set(mods);
+        self.update_hover();
         let held = self.buttons.get();
         if self.reporting() && !(mods.shift && held != 0) {
             let button = [1, 2, 3].into_iter().find(|n| held & 1 << n != 0).and_then(button_of);
@@ -942,6 +1001,9 @@ impl Surface {
         };
         drop(g);
         drop(term);
+        if selection.is_some() {
+            self.gesture.borrow_mut().dragged = true;
+        }
         self.set_selection(selection);
     }
 
@@ -972,6 +1034,68 @@ impl Surface {
         }
     }
 
+    /// ghostty's link hover: with exactly ctrl held (shift too while a
+    /// program reports the mouse), the link under the pointer is underlined
+    /// and its text shown at the bottom left.
+    fn update_hover(&self) {
+        let m = self.mods.get();
+        let reporting = self.reporting();
+        let wanted = m.ctrl && !m.alt && (!m.shift || reporting);
+        let link = wanted
+            .then(|| {
+                let shared = self.draw.borrow().shared.clone()?;
+                let term = shared.term.lock();
+                let (x, y) = self.pointer.get();
+                let point = self.drag_point(&term, x, y)?;
+                links::link_at(&term, point.cell)
+            })
+            .flatten();
+        if *self.hover.borrow() == link {
+            return;
+        }
+        match &link {
+            Some((_, text)) => {
+                self.url_left.set_label(text);
+                self.url_right.set_label(text);
+                self.url_left.set_visible(true);
+            }
+            None => {
+                self.url_left.set_visible(false);
+                self.url_right.set_visible(false);
+            }
+        }
+        *self.hover.borrow_mut() = link;
+        self.draw.borrow_mut().full = true;
+        self.area.queue_render();
+        self.update_cursor();
+    }
+
+    /// ghostty's processLinks and the GTK openUrl: a relative path that
+    /// exists under the terminal's directory opens resolved; paths and
+    /// file:// URLs go to xdg-open, other URIs to the OpenURI portal.
+    fn open_link(&self, text: &str) {
+        let pwd = self.draw.borrow().shared.as_ref().and_then(|s| s.term.lock().reported_cwd().map(str::to_owned));
+        let resolved = (!text.starts_with('/'))
+            .then(|| pwd.map(|dir| resolve_path(&dir, text)))
+            .flatten()
+            .filter(|p| std::path::Path::new(p).exists());
+        let url = resolved.unwrap_or_else(|| text.to_owned());
+        if url.starts_with('/') || url.starts_with("file://") {
+            xdg_open(&url);
+            return;
+        }
+        let fallback = url.clone();
+        gtk::UriLauncher::new(&url).launch(
+            self.area.root().and_downcast_ref::<gtk::Window>(),
+            gio::Cancellable::NONE,
+            move |result| {
+                if result.is_err() {
+                    xdg_open(&fallback);
+                }
+            },
+        );
+    }
+
     /// ghostty's mouse shape: the terminal's (OSC 22, or an arrow while it
     /// reports the mouse), overridden by modifiers (keyToMouseShape):
     /// shift shows text, and the rectangle-select chord a crosshair.
@@ -984,6 +1108,7 @@ impl Surface {
         let m = self.mods.get();
         let rectangle = m.ctrl && m.alt;
         let name = match (reporting, m.shift, rectangle) {
+            _ if self.hover.borrow().is_some() => "pointer",
             (true, true, true) | (false, _, true) => "crosshair",
             (_, true, _) => "text",
             _ => shape,
@@ -1192,6 +1317,9 @@ impl Surface {
                 (self.handler)(Event::SelectionChanged);
             }
             compose::copy_pane(grid, &mut term, d.full, self.selection.borrow().as_ref());
+            if let Some((link, _)) = self.hover.borrow().as_ref() {
+                compose::underline(grid, &term, link);
+            }
             let focused = self.focused.get();
             let preedit = self.preedit.borrow();
             let cursor = if let Some(text) = preedit.as_deref().filter(|t| !t.is_empty()) {
@@ -1216,4 +1344,16 @@ impl Surface {
         self.outer.compute_bounds(ancestor)
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_path;
+
+    #[test]
+    fn paths_resolve_like_zig() {
+        assert_eq!(resolve_path("/a/b", "./c"), "/a/b/c");
+        assert_eq!(resolve_path("/a/b/", "../c//d"), "/a/c/d");
+        assert_eq!(resolve_path("/", "../x"), "/x");
+    }
 }

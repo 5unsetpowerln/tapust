@@ -4,6 +4,7 @@ mod frame;
 mod gl;
 mod gui;
 mod input;
+mod links;
 mod mouse;
 mod pty;
 mod renderer;

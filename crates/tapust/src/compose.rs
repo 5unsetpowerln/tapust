@@ -97,6 +97,18 @@ pub fn copy_pane(grid: &mut Grid, term: &mut Terminal, full: bool, selection: Op
     term.clear_dirty();
 }
 
+/// Underlines the visible cells of a hovered link, as ghostty does.
+pub fn underline(grid: &mut Grid, term: &Terminal, link: &Selection) {
+    let top = term.view_top();
+    for y in 0..grid.rows() {
+        if let Some((left, right)) = link.columns(top + u64::from(y), grid.cols()) {
+            for cell in &mut grid.row_mut(y)[left as usize..=right as usize] {
+                cell.flags |= UNDERLINE;
+            }
+        }
+    }
+}
+
 /// ghostty's preedit cells: the input method's text from the cursor on,
 /// in the default foreground on the default background, underlined, shifted
 /// left (and cut from the start) to stay on the row.

@@ -14,3 +14,4 @@ glow = "0.16"
 crossfont = "0.8"
 libc = "0.2"
 parking_lot = "0.12"
+onig = { version = "6", default-features = false }
