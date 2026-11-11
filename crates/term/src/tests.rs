@@ -1136,7 +1136,7 @@ fn osc_133_marks_prompts_input_and_output() {
     let top = t.view_top();
     assert_eq!(t.line_prompt(top + 1), PromptMark::Prompt);
     assert!(t.cursor_at_prompt());
-    assert_eq!(t.prompt_click(), Some(&PromptClick::Events(true)));
+    assert_eq!(t.prompt_click(), Some(PromptClick::Absolute));
     let row = t.line(top + 1).unwrap();
     assert_eq!((row[0].semantic(), row[2].semantic()), (Semantic::Prompt, Semantic::Input));
     feed(&mut t, "\r\n\x1b]133;C\x07file\r\n\x1b]133;D;0\x07");

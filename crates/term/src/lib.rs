@@ -265,8 +265,13 @@ impl Terminal {
     }
 
     /// How a click at the prompt should move the cursor, if the shell said.
-    pub fn prompt_click(&self) -> Option<&PromptClick> {
-        self.term.prompt_click.as_ref()
+    pub fn prompt_click(&self) -> Option<PromptClick> {
+        self.term.prompt_click
+    }
+
+    /// What the shell is printing now (OSC 133).
+    pub fn cursor_semantic(&self) -> Semantic {
+        self.term.semantic
     }
 
     /// The prompt mark of absolute line `line`.

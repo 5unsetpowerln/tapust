@@ -712,10 +712,16 @@ impl Term {
             b'A' | b'N' => {
                 self.fresh_line();
                 prompt(self);
-                if let Some(v) = option(b"click_events") {
-                    self.prompt_click = Some(PromptClick::Events(v == b"1"));
-                } else if let Some(v) = option(b"cl") {
-                    self.prompt_click = Some(PromptClick::Cl(String::from_utf8_lossy(v).into_owned()));
+                // ghostty reads click_events first (1 absolute, 2 relative),
+                // then cl (line, m, v, w); invalid values are ignored.
+                let events = option(b"click_events").and_then(|v| match v {
+                    b"1" => Some(PromptClick::Absolute),
+                    b"2" => Some(PromptClick::Relative),
+                    _ => None,
+                });
+                let cl = option(b"cl").filter(|v| matches!(*v, b"line" | b"m" | b"v" | b"w")).map(|_| PromptClick::Cl);
+                if let Some(click) = events.or(cl) {
+                    self.prompt_click = Some(click);
                 }
             }
             b'P' => prompt(self),
@@ -1502,12 +1508,14 @@ impl Term {
 }
 
 /// How the shell wants clicks at its prompt (OSC 133;A click_events or cl).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptClick {
-    /// click_events=1: clicks are reported as SGR mouse events.
-    Events(bool),
-    /// cl=line, cl=m, cl=v or cl=w: clicks move the cursor with arrow keys.
-    Cl(String),
+    /// click_events=1: an SGR click with the absolute row.
+    Absolute,
+    /// click_events=2: an SGR click with the row from the prompt's.
+    Relative,
+    /// cl=line, m, v or w: arrow keys (ghostty moves along the line for all).
+    Cl,
 }
 
 /// ghostty's OSC 22 names: CSS cursor names and their X11 aliases, as CSS.
