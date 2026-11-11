@@ -617,7 +617,14 @@ impl App {
 
     pub fn handle(self: &Rc<Self>, event: Event) -> bool {
         match event {
-            Event::Key { pane, keyval, state } => self.key(pane, keyval, state),
+            Event::Key { pane, keyval, state, text } => self.key(pane, keyval, state, text),
+            Event::Text { pane, text } => {
+                for c in text.chars() {
+                    let key = mux::Key { code: mux::KeyCode::Char(c), mods: mux::Mods::default() };
+                    self.send_key(pane, key, Some(c.to_string()));
+                }
+                true
+            }
             Event::Resized { pane, cols, rows, cell } => {
                 self.resized(pane, cols, rows, cell);
                 true
@@ -670,8 +677,27 @@ impl App {
         }
     }
 
-    fn key(self: &Rc<Self>, pane: PaneId, keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> bool {
-        let Some((key, text)) = input::from_gdk(keyval, state) else { return false };
+    /// A key press; `commit` is the input method's text for it, which is
+    /// typed as it is (a dead key or a direct input method).
+    fn key(self: &Rc<Self>, pane: PaneId, keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType, commit: Option<String>) -> bool {
+        let (key, text) = match commit {
+            Some(text) => {
+                for c in text.chars() {
+                    let key = mux::Key { code: mux::KeyCode::Char(c), mods: mux::Mods::default() };
+                    self.send_key(pane, key, Some(c.to_string()));
+                }
+                return true;
+            }
+            None => match input::from_gdk(keyval, state) {
+                Some(key) => key,
+                None => return false,
+            },
+        };
+        self.send_key(pane, key, text);
+        true
+    }
+
+    fn send_key(self: &Rc<Self>, pane: PaneId, key: mux::Key, text: Option<String>) {
         // Any key the terminal uses stops the bell (ghostty's keyEvent).
         let surface = self.state.borrow().panes.get(&pane).map(|p| p.surface.clone());
         if let Some(surface) = surface {
@@ -696,7 +722,6 @@ impl App {
             }
         }
         self.schedule_tick();
-        true
     }
 
     /// GTK gave a pane its size: start its shell, or resize it.

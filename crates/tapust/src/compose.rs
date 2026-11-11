@@ -87,6 +87,45 @@ pub fn copy_pane(grid: &mut Grid, term: &mut Terminal, full: bool) {
     term.clear_dirty();
 }
 
+/// ghostty's preedit cells: the input method's text from the cursor on,
+/// in the default foreground on the default background, underlined, shifted
+/// left (and cut from the start) to stay on the row.
+pub fn preedit(grid: &mut Grid, term: &Terminal, text: &str) {
+    let cursor = term.cursor();
+    let cols = grid.cols();
+    if cursor.y >= grid.rows() || cursor.x >= cols {
+        return;
+    }
+    let palette = term.palette();
+    let (fg, bg) = style_colors(&Style::DEFAULT, palette, term.modes().reverse_video);
+    let chars: Vec<(char, usize)> = text.chars().map(|c| (c, term::char_width(c))).filter(|&(_, w)| w > 0).collect();
+    // renderer.State.Preedit.range: measure from the end; past the row's
+    // width, start at the character that overflows and shift left.
+    let (start, max) = (usize::from(cursor.x), usize::from(cols) - 1);
+    let max_width = max - start + 1;
+    let (mut width, mut offset) = (0, 0);
+    for (i, &(_, w)) in chars.iter().enumerate().rev() {
+        width += w;
+        if width > max_width {
+            offset = i;
+            break;
+        }
+    }
+    let end = if width > 0 { start + width - 1 } else { start };
+    let mut x = start.saturating_sub(end.saturating_sub(max));
+    let row = grid.row_mut(cursor.y);
+    for &(c, w) in &chars[offset..] {
+        if x + w > row.len() {
+            break;
+        }
+        row[x] = FrameCell { ch: c as u32, fg, bg, flags: UNDERLINE | if w == 2 { WIDE } else { 0 } };
+        if w == 2 {
+            row[x + 1] = FrameCell { ch: 0, fg, bg, flags: UNDERLINE };
+        }
+        x += w;
+    }
+}
+
 /// The cursor of the pane drawn in `frame.grids[grid]`, if visible. A pane
 /// that does not have the keyboard focus gets ghostty's hollow block.
 /// ghostty's lock cursor at a password prompt: drawn even when the cursor

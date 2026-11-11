@@ -24,8 +24,12 @@ pub enum Event {
     /// GTK gave the GLArea a new size: the grid it holds.
     Resized { pane: PaneId, cols: u16, rows: u16, cell: (u32, u32) },
     Focused { pane: PaneId },
-    /// A key press; returns whether it was used.
-    Key { pane: PaneId, keyval: gdk::Key, state: gdk::ModifierType },
+    /// A key press; returns whether it was used. `text` is what the input
+    /// method committed for it, if anything.
+    Key { pane: PaneId, keyval: gdk::Key, state: gdk::ModifierType, text: Option<String> },
+    /// Text the input method committed outside a plain key press (a
+    /// finished composition).
+    Text { pane: PaneId, text: String },
     /// A pane's drag handle was dropped on the `dir` side of this pane.
     Dropped { source: PaneId, target: PaneId, dir: Direction },
     /// The GLArea was mapped (ghostty restores focus after this).
@@ -38,6 +42,15 @@ pub enum Event {
 }
 
 pub type Handler = Rc<dyn Fn(Event) -> bool>;
+
+/// ghostty's in_keyevent: whether a key press is being filtered through
+/// the input method, and whether it was composing then.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InKeyEvent {
+    No,
+    Composing,
+    NotComposing,
+}
 
 /// The drawing state, borrowed only by the GLArea's handlers.
 struct Draw {
@@ -70,6 +83,14 @@ pub struct Surface {
     /// ghostty's bell-ringing: set by BEL while unfocused, cleared by focus,
     /// a key or a click.
     bell: Cell<bool>,
+    /// ghostty's IMMulticontext for the surface and its state.
+    im: gtk::IMMulticontext,
+    im_composing: Cell<bool>,
+    in_keyevent: Cell<InKeyEvent>,
+    /// Text committed during the current key press while not composing.
+    im_commit: RefCell<Option<String>>,
+    /// The input method's preedit string, drawn at the cursor.
+    preedit: RefCell<Option<String>>,
     last_blink_reset: Cell<Option<Instant>>,
     font_scale: Cell<f64>,
     cell_idle: Cell<bool>,
@@ -191,6 +212,11 @@ impl Surface {
             blink_timer: RefCell::new(None),
             password: Cell::new(false),
             bell: Cell::new(false),
+            im: gtk::IMMulticontext::new(),
+            im_composing: Cell::new(false),
+            in_keyevent: Cell::new(InKeyEvent::No),
+            im_commit: RefCell::new(None),
+            preedit: RefCell::new(None),
             last_blink_reset: Cell::new(None),
             font_scale: Cell::new(0.0),
             cell_idle: Cell::new(false),
@@ -225,6 +251,7 @@ impl Surface {
             let scale = area.native().and_then(|n| n.surface()).map_or(1.0, |s| s.scale());
             let Some(fonts) = load_fonts(scale) else { return };
             s.draw.borrow_mut().renderer = Some(Renderer::new(crate::gl::context(), fonts));
+            s.im.set_client_widget(Some(area));
             s.font_scale.set(scale);
             s.schedule_cell_size();
         });
@@ -233,6 +260,7 @@ impl Surface {
             if let Some(s) = weak.upgrade() {
                 area.make_current();
                 s.draw.borrow_mut().renderer = None;
+                s.im.set_client_widget(None::<&gtk::Widget>);
             }
         });
         let (weak, h) = (Rc::downgrade(self), handler.clone());
@@ -298,6 +326,7 @@ impl Surface {
         let (weak, h) = (Rc::downgrade(self), handler.clone());
         focus.connect_enter(move |_| {
             if let Some(s) = weak.upgrade() {
+                s.im.focus_in();
                 s.set_focused(true);
                 h(Event::Focused { pane: s.pane });
             }
@@ -305,6 +334,7 @@ impl Surface {
         let weak = Rc::downgrade(self);
         focus.connect_leave(move |_| {
             if let Some(s) = weak.upgrade() {
+                s.im.focus_out();
                 s.set_focused(false);
             }
         });
@@ -312,11 +342,73 @@ impl Surface {
 
         let keys = gtk::EventControllerKey::new();
         let (weak, h) = (Rc::downgrade(self), handler.clone());
-        keys.connect_key_pressed(move |_, keyval, _, state| {
+        keys.connect_key_pressed(move |keys, keyval, _, state| {
             let Some(s) = weak.upgrade() else { return glib::Propagation::Proceed };
-            if h(Event::Key { pane: s.pane, keyval, state }) { glib::Propagation::Stop } else { glib::Propagation::Proceed }
+            let Some(event) = keys.current_event() else { return glib::Propagation::Proceed };
+            // ghostty's keyEvent: the input method sees the key first.
+            s.update_ime_position();
+            s.in_keyevent.set(if s.im_composing.get() { InKeyEvent::Composing } else { InKeyEvent::NotComposing });
+            let handled = s.im.filter_keypress(&event);
+            let was = s.in_keyevent.replace(InKeyEvent::No);
+            let text = s.im_commit.take();
+            if handled && (s.im_composing.get() || was == InKeyEvent::Composing || text.is_none()) {
+                return glib::Propagation::Stop;
+            }
+            if !h(Event::Key { pane: s.pane, keyval, state, text }) {
+                return glib::Propagation::Proceed;
+            }
+            // A key the terminal used ends a composition.
+            if s.im_composing.get() {
+                s.im.reset();
+                s.set_preedit(None);
+            }
+            glib::Propagation::Stop
+        });
+        let weak = Rc::downgrade(self);
+        keys.connect_key_released(move |keys, _, _, _| {
+            if let (Some(s), Some(event)) = (weak.upgrade(), keys.current_event()) {
+                s.im.filter_keypress(&event);
+            }
         });
         self.area.add_controller(keys);
+
+        let weak = Rc::downgrade(self);
+        self.im.connect_preedit_start(move |_| {
+            if let Some(s) = weak.upgrade() {
+                s.im_composing.set(true);
+                s.im_commit.take();
+                s.update_ime_position();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.im.connect_preedit_changed(move |im| {
+            if let Some(s) = weak.upgrade() {
+                s.im_composing.set(true);
+                let (text, _, _) = im.preedit_string();
+                s.set_preedit(Some(text.to_string()));
+                s.update_ime_position();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.im.connect_preedit_end(move |_| {
+            if let Some(s) = weak.upgrade() {
+                s.im_composing.set(false);
+                s.set_preedit(None);
+            }
+        });
+        let (weak, h) = (Rc::downgrade(self), handler.clone());
+        self.im.connect_commit(move |_, text| {
+            let Some(s) = weak.upgrade() else { return };
+            // Text committed by a key press that was not composing goes out
+            // with that key (ghostty's im_buf).
+            if s.in_keyevent.get() == InKeyEvent::NotComposing {
+                *s.im_commit.borrow_mut() = Some(text.to_owned());
+                return;
+            }
+            s.im_composing.set(false);
+            s.set_preedit(None);
+            h(Event::Text { pane: s.pane, text: text.to_owned() });
+        });
 
         // Drag a pane by its drag handle (ghostty's surface_drag_source).
         let source = gtk::DragSource::builder().actions(gdk::DragAction::MOVE).build();
@@ -508,6 +600,35 @@ impl Surface {
         }
     }
 
+    fn set_preedit(&self, text: Option<String>) {
+        if *self.preedit.borrow() != text {
+            *self.preedit.borrow_mut() = text;
+            self.draw.borrow_mut().full = true;
+            self.area.queue_render();
+        }
+    }
+
+    /// ghostty's updateImePosition: the candidate window goes below the
+    /// middle of the cursor cell.
+    fn update_ime_position(&self) {
+        let d = self.draw.borrow();
+        let (Some(renderer), Some(shared)) = (d.renderer.as_ref(), d.shared.as_ref()) else { return };
+        let (cw, ch) = renderer.cell_size();
+        let (cw, ch) = (f64::from(cw), f64::from(ch));
+        let scale = self.font_scale.get();
+        let pad = f64::from(padding(scale));
+        let (x, y) = {
+            let term = shared.term.lock();
+            let cursor = term.cursor();
+            (f64::from(cursor.x), f64::from(cursor.y))
+        };
+        let px = (x * cw + pad + cw / 2.0) / scale;
+        let bottom = (y * ch + pad + ch) / scale;
+        let top = (bottom - ch / scale).floor();
+        let height = (bottom.ceil() - top).max(1.0);
+        self.im.set_cursor_location(&gdk::Rectangle::new(px.floor() as i32, top as i32, 1, height as i32));
+    }
+
     /// ghostty's setBellRinging: a focused surface never starts ringing.
     pub fn set_bell_ringing(&self, ringing: bool) {
         if ringing && self.focused.get() {
@@ -546,7 +667,12 @@ impl Surface {
             shared.want_lock.store(false, Ordering::Release);
             compose::copy_pane(grid, &mut term, d.full);
             let focused = self.focused.get();
-            let cursor = if self.password.get() {
+            let preedit = self.preedit.borrow();
+            let cursor = if let Some(text) = preedit.as_deref().filter(|t| !t.is_empty()) {
+                // ghostty draws the preedit over the cursor's row and no cursor.
+                compose::preedit(grid, &term, text);
+                None
+            } else if self.password.get() {
                 compose::lock_cursor(&term, 0)
             } else if !focused || !term.cursor().blinking || d.blink_on {
                 compose::pane_cursor(&term, 0, focused)
