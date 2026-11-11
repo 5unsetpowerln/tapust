@@ -36,6 +36,8 @@ struct Pane {
     title: String,
     /// ghostty's surface title override (Change Terminal Title).
     title_override: Option<String>,
+    /// The working directory the terminal reported (OSC 7), ghostty's pwd.
+    pwd: Option<String>,
 }
 
 /// A tab: ghostty's Tab (a vertical box) holding a SplitTree whose tree_bin
@@ -674,13 +676,21 @@ impl App {
             self.queue_reconcile();
             return;
         }
-        let title = io.shared.term.lock().title().to_owned();
+        let (title, pwd) = {
+            let term = io.shared.term.lock();
+            (term.title().to_owned(), term.reported_cwd().map(str::to_owned))
+        };
         p.surface.output();
         p.surface.area.queue_render();
+        let mut changed = pwd != p.pwd;
+        p.pwd = pwd;
         if title != p.title {
             p.title = title.clone();
             st.session.set_pane_title(pane, &title);
-            drop(st);
+            changed = true;
+        }
+        drop(st);
+        if changed {
             self.queue_reconcile();
         }
     }
@@ -737,7 +747,7 @@ impl App {
                     let handler: crate::surface::Handler =
                         Rc::new(move |event| weak.upgrade().is_some_and(|app| app.handle(event)));
                     let surface = Surface::new(pane, st.term_bg, handler);
-                    st.panes.insert(pane, Pane { surface, io: None, cwd, title: String::new(), title_override: None });
+                    st.panes.insert(pane, Pane { surface, io: None, cwd, title: String::new(), title_override: None, pwd: None });
                 }
                 Effect::Destroy { pane } => {
                     let removed = self.state.borrow_mut().panes.remove(&pane);
@@ -892,6 +902,12 @@ impl App {
             self.rebuild(info.index, info.id);
             let title = self.tab_title(info);
             page.set_title(&title);
+            // ghostty binds the tab's tooltip to its active surface's pwd.
+            let pwd = {
+                let st = self.state.borrow();
+                info.panes.iter().find(|p| p.active).and_then(|p| st.panes.get(&p.pane)).and_then(|p| p.pwd.clone())
+            };
+            page.set_tooltip(pwd.as_deref().unwrap_or(""));
             if info.active {
                 self.tab_view.set_selected_page(&page);
                 // The override only replaces the header bar's title; the
