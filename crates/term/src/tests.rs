@@ -1,5 +1,6 @@
 use crate::{
-    Attrs, Cell, Color, CursorShape, MouseEncoding, MouseMode, Palette, Rgb, Style, Terminal, Underline, Width,
+    Attrs, Cell, Color, CursorShape, Message, MouseEncoding, MouseMode, Palette, ProgressReport, Rgb, Style, Terminal,
+    Underline, Width,
 };
 
 fn term(cols: u16, rows: u16) -> Terminal {
@@ -1166,4 +1167,131 @@ fn osc_7_follows_ghostty() {
     }
     feed(&mut t, "\x1b]2;title\x07\x1b]7;\x07");
     assert_eq!((t.reported_cwd(), t.title()), (None, "title"));
+}
+
+fn messages(t: &mut Terminal, s: &str) -> Vec<Message> {
+    feed(t, s);
+    t.take_messages()
+}
+
+fn notification(title: &str, body: &str) -> Vec<Message> {
+    vec![Message::DesktopNotification { title: title.to_owned(), body: body.to_owned() }]
+}
+
+#[test]
+fn osc_9_is_a_notification_unless_conemu_parses_it() {
+    let mut t = term(10, 2);
+    assert_eq!(messages(&mut t, "\x1b]9;Hello world\x07"), notification("", "Hello world"));
+    assert_eq!(messages(&mut t, "\x1b]9;H\x1b\\"), notification("", "H"));
+    // Incomplete ConEmu commands fall back to notifications.
+    for body in
+        ["", "1", "1a", "10;", "10;5", "10x", "11", "13", "2", "2a", "3", "3a", "4", "4;", "4;5", "4;5a", "6", "9"]
+    {
+        assert_eq!(messages(&mut t, &format!("\x1b]9;{body}\x07")), notification("", body), "{body:?}");
+    }
+    // ConEmu commands ghostty parses and ignores.
+    for data in ["1;420", "1;", "10", "10;1", "11;c", "2;hello", "3;foo", "3;", "5", "5abc", "6;m", "7;p", "8;v"] {
+        assert_eq!(messages(&mut t, &format!("\x1b]9;{data}\x07")), [], "{data:?}");
+    }
+    // Without the `;` nothing is captured.
+    assert_eq!(messages(&mut t, "\x1b]9\x07"), []);
+}
+
+#[test]
+fn osc_9_conemu_pwd_and_prompt() {
+    let mut t = term(10, 3);
+    feed(&mut t, "\x1b]9;9;file://localhost/x\x07");
+    assert_eq!(t.reported_cwd(), Some("/x"));
+    feed(&mut t, "out\x1b]9;12\x07");
+    assert_eq!(t.line_prompt(t.view_top() + 1), crate::PromptMark::Prompt);
+    assert!(t.cursor_at_prompt());
+}
+
+#[test]
+fn osc_9_4_reports_progress_like_ghostty() {
+    use crate::ProgressState::{Error, Indeterminate, Pause, Remove, Set};
+    let mut t = term(10, 2);
+    for (data, state, progress) in [
+        ("1;100", Set, Some(100)),
+        ("1;900", Set, Some(100)),
+        ("1;9", Set, Some(9)),
+        ("1;94", Set, Some(94)),
+        ("1", Set, Some(0)),
+        ("1x", Set, Some(0)),
+        ("1;", Set, None),
+        ("1;4_2", Set, None),
+        ("1;+5", Set, None),
+        ("1;100;", Set, None),
+        ("1;99999999999999999999999", Set, None),
+        ("0;", Remove, None),
+        ("0;;", Remove, None),
+        ("0;100", Remove, None),
+        ("2", Error, None),
+        ("2;100", Error, Some(100)),
+        ("3;50", Indeterminate, None),
+        ("4", Pause, None),
+        ("4;100", Pause, Some(100)),
+    ] {
+        let report = ProgressReport { state, progress };
+        assert_eq!(messages(&mut t, &format!("\x1b]9;4;{data}\x07")), [Message::ProgressReport(report)], "{data:?}");
+    }
+}
+
+#[test]
+fn osc_777_notify() {
+    let mut t = term(10, 2);
+    assert_eq!(messages(&mut t, "\x1b]777;notify;Title;Body\x07"), notification("Title", "Body"));
+    assert_eq!(messages(&mut t, "\x1b]777;notify;T;a;b\x07"), notification("T", "a;b"));
+    assert_eq!(messages(&mut t, "\x1b]777;notify;;\x07"), notification("", ""));
+    for data in ["notify;T", "notify", "other;T;B", ""] {
+        assert_eq!(messages(&mut t, &format!("\x1b]777;{data}\x07")), [], "{data:?}");
+    }
+}
+
+#[test]
+fn notifications_fit_ghosttys_buffers() {
+    let mut t = term(10, 2);
+    let got = messages(&mut t, &format!("\x1b]777;notify;{};{}\x07", "a".repeat(70), "b".repeat(300)));
+    assert_eq!(got, notification(&"a".repeat(63), &"b".repeat(255)));
+    // A cut never splits a character.
+    let got = messages(&mut t, &format!("\x1b]777;notify;{};x\x07", "\u{e9}".repeat(40)));
+    assert_eq!(got, notification(&"\u{e9}".repeat(31), "x"));
+    // The text after `9;` and `777;` must leave room for a terminator in 2048 bytes.
+    let body = "a".repeat(2047);
+    assert_eq!(messages(&mut t, &format!("\x1b]9;{body}\x07")), notification("", &body[..255]));
+    assert_eq!(messages(&mut t, &format!("\x1b]9;{body}a\x07")), []);
+    let tail = "c".repeat(2047 - "notify;t;".len());
+    assert_eq!(messages(&mut t, &format!("\x1b]777;notify;t;{tail}\x07")), notification("t", &tail[..255]));
+    assert_eq!(messages(&mut t, &format!("\x1b]777;notify;t;{tail}c\x07")), []);
+}
+
+#[test]
+fn osc_133_start_and_stop_commands() {
+    let mut t = term(10, 2);
+    assert_eq!(messages(&mut t, "\x1b]133;C\x07"), [Message::StartCommand]);
+    for (data, code) in [
+        ("D", 0),
+        ("D;", 0),
+        ("D;0", 0),
+        ("D;5", 5),
+        ("D;+7", 7),
+        ("D;5;aid=1", 5),
+        ("D;-1", 1),
+        ("D;256", 1),
+        ("D;abc", 0),
+        ("D;aid=1", 0),
+    ] {
+        assert_eq!(messages(&mut t, &format!("\x1b]133;{data}\x07")), [Message::StopCommand(code)], "{data:?}");
+    }
+    assert_eq!(messages(&mut t, "\x1b]133;Dx\x07"), []);
+}
+
+#[test]
+fn ris_removes_the_progress_report() {
+    let mut t = term(10, 2);
+    let remove = Message::ProgressReport(ProgressReport { state: crate::ProgressState::Remove, progress: None });
+    assert_eq!(messages(&mut t, "\x1b]9;a\x07\x1bc"), [notification("", "a").remove(0), remove]);
+    // The reset action resets without telling the surface.
+    t.full_reset();
+    assert_eq!(t.take_messages(), []);
 }

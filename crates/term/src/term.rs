@@ -9,7 +9,9 @@ use crate::grid::{Grid, PromptMark, ReflowCursor, attach_mark, blankify};
 use crate::palette::{default_palette, parse_color};
 use crate::parser::Params;
 use crate::style::{Pen, StyleTable, apply_sgr};
-use crate::{CursorShape, Dirty, Modes, MouseEncoding, MouseMode, Palette, Rgb};
+use crate::{
+    CursorShape, Dirty, Message, Modes, MouseEncoding, MouseMode, Palette, ProgressReport, ProgressState, Rgb,
+};
 
 const WIDTH_SHIFT: u32 = 21;
 const WIDTH_MASK: u64 = 3 << WIDTH_SHIFT;
@@ -158,6 +160,7 @@ pub(crate) struct Term {
     seen_title: bool,
     pub cwd: Option<String>,
     pub bell: bool,
+    pub messages: Vec<Message>,
     pub palette: Palette,
     /// What OSC 104/110/111 and RIS reset the palette to.
     pub base_palette: Palette,
@@ -213,6 +216,7 @@ impl Term {
             seen_title: false,
             cwd: None,
             bell: false,
+            messages: Vec::new(),
             palette: default_palette(),
             base_palette: default_palette(),
             last_char: 0,
@@ -728,13 +732,21 @@ impl Term {
             b'B' => self.set_semantic(Semantic::Input, false),
             b'I' => self.set_semantic(Semantic::Input, true),
             b'C' => {
+                self.messages.push(Message::StartCommand);
                 self.set_semantic(Semantic::Output, false);
                 let meta = self.grid.meta_mut(self.y);
                 if meta.prompt != PromptMark::None && self.x == 0 {
                     meta.prompt = PromptMark::None;
                 }
             }
-            b'D' => self.set_semantic(Semantic::Output, false),
+            b'D' => {
+                // ghostty's StreamHandler.semanticPrompt: the first option
+                // is the exit code (0 if absent or invalid, 1 if not a byte).
+                let code =
+                    options.split(|&b| b == b';').next().and_then(|v| std::str::from_utf8(v).ok()?.parse::<i32>().ok());
+                self.messages.push(Message::StopCommand(code.map_or(0, |c| u8::try_from(c).unwrap_or(1))));
+                self.set_semantic(Semantic::Output, false);
+            }
             b'L' if options.is_empty() => self.fresh_line(),
             _ => {}
         }
@@ -1054,9 +1066,10 @@ impl Term {
     }
 
     /// RIS.
-    fn full_reset(&mut self) {
+    pub fn full_reset(&mut self) {
         let hist = self.primary().hist_cap();
         let replies = std::mem::take(&mut self.replies);
+        let messages = std::mem::take(&mut self.messages);
         let cwd = self.cwd.take();
         let bell = self.bell;
         let base = std::mem::take(&mut self.base_palette);
@@ -1064,6 +1077,7 @@ impl Term {
         self.palette = base.clone();
         self.base_palette = base;
         self.replies = replies;
+        self.messages = messages;
         self.cwd = cwd;
         self.bell = bell;
     }
@@ -1226,7 +1240,12 @@ impl Term {
             }
             (0, b'M') => self.reverse_index(),
             (0, b'H') => self.tabs[self.x] = true,
-            (0, b'c') => self.full_reset(),
+            (0, b'c') => {
+                self.full_reset();
+                // ghostty's StreamHandler.fullReset also clears the progress bar.
+                self.messages
+                    .push(Message::ProgressReport(ProgressReport { state: ProgressState::Remove, progress: None }));
+            }
             (0, b'=') => self.modes.app_keypad = true,
             (0, b'>') => self.modes.app_keypad = false,
             (0, b'N') => {
@@ -1371,6 +1390,8 @@ impl Term {
             Some(i) => (&data[..i], &data[i + 1..]),
             None => (data, &data[data.len()..]),
         };
+        // ghostty only captures what follows the number's `;`.
+        let has_rest = cmd.len() < data.len();
         let Some(cmd) = std::str::from_utf8(cmd).ok().and_then(|s| s.parse::<u16>().ok()) else {
             return;
         };
@@ -1410,6 +1431,18 @@ impl Term {
                 self.mark_all_dirty();
             }
             7 => self.report_pwd(rest),
+            9 if has_rest => match parse_osc9(rest) {
+                Osc9::Notification(body) => self.desktop_notification(b"", body),
+                Osc9::Progress(report) => self.messages.push(Message::ProgressReport(report)),
+                Osc9::Pwd(url) => self.report_pwd(url),
+                Osc9::Prompt => self.semantic_prompt(b"A"),
+                Osc9::Ignored => {}
+            },
+            777 if has_rest => {
+                if let Some((title, body)) = parse_osc777(rest) {
+                    self.desktop_notification(title, body);
+                }
+            }
             133 => self.semantic_prompt(rest),
             22 => {
                 if rest.is_empty() {
@@ -1449,6 +1482,19 @@ impl Term {
         if matches!(cmd, 110 | 111) {
             self.mark_all_dirty();
         }
+    }
+
+    /// ghostty's DesktopNotification.init: the title and the body cut to
+    /// fit its buffers, never inside a UTF-8 sequence.
+    fn desktop_notification(&mut self, title: &[u8], body: &[u8]) {
+        fn cut(s: &[u8], cap: usize) -> String {
+            let mut len = s.len().min(cap);
+            while len > 0 && len < s.len() && s[len] & 0xC0 == 0x80 {
+                len -= 1;
+            }
+            String::from_utf8_lossy(&s[..len]).into_owned()
+        }
+        self.messages.push(Message::DesktopNotification { title: cut(title, 63), body: cut(body, 255) });
     }
 
     fn color_reply(&mut self, prefix: &str, c: Rgb, st: &[u8]) {
@@ -1554,6 +1600,76 @@ fn mouse_shape(name: &str) -> Option<&'static str> {
         "fleur" => "all-scroll",
         _ => return None,
     })
+}
+
+/// ghostty's osc.Parser.MAX_BUF: the fixed buffer that holds what follows
+/// `9;` or `777;`. Parsers that terminate their text need one more byte.
+const OSC_BUF: usize = 2048;
+
+/// What ghostty's OSC 9 parser makes of the text after `9;`.
+enum Osc9<'a> {
+    /// An iTerm2 notification with this body.
+    Notification(&'a [u8]),
+    Progress(ProgressReport),
+    /// ConEmu's 9;9, handled as OSC 7.
+    Pwd(&'a [u8]),
+    /// ConEmu's 9;12, handled as OSC 133;A.
+    Prompt,
+    /// Invalid, or a ConEmu command ghostty does not implement.
+    Ignored,
+}
+
+/// ghostty's osc9.parse: ConEmu's commands when the text matches one,
+/// otherwise an iTerm2 notification.
+fn parse_osc9(data: &[u8]) -> Osc9<'_> {
+    if data.len() > OSC_BUF {
+        return Osc9::Ignored;
+    }
+    let terminated = |cmd| {
+        if data.len() < OSC_BUF { cmd } else { Osc9::Ignored }
+    };
+    match data {
+        // Sleep, xterm emulation, comment.
+        [b'1', b';', ..] | [b'1', b'0'] | [b'1', b'0', b';', b'0'..=b'3', ..] | [b'1', b'1', b';', ..] => Osc9::Ignored,
+        [b'1', b'2', ..] => Osc9::Prompt,
+        // Message box, tab title, GUI macro, run process, environment variable.
+        [b'2' | b'3' | b'6' | b'7' | b'8', b';', ..] => Osc9::Ignored,
+        [b'4', b';', state @ b'0'..=b'4', rest @ ..] => {
+            let state = match state {
+                b'0' => ProgressState::Remove,
+                b'1' => ProgressState::Set,
+                b'2' => ProgressState::Error,
+                b'3' => ProgressState::Indeterminate,
+                _ => ProgressState::Pause,
+            };
+            let mut progress = (state == ProgressState::Set).then_some(0);
+            if matches!(state, ProgressState::Set | ProgressState::Error | ProgressState::Pause)
+                && let [b';', value @ ..] = rest
+            {
+                // ghostty's lib.parseInt takes no sign for an unsigned type.
+                progress = std::str::from_utf8(value)
+                    .ok()
+                    .filter(|v| !v.starts_with('+'))
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .map(|p| p.min(100) as u8);
+            }
+            Osc9::Progress(ProgressReport { state, progress })
+        }
+        // Wait for input.
+        [b'5', ..] => Osc9::Ignored,
+        [b'9', b';', url @ ..] => terminated(Osc9::Pwd(url)),
+        _ => terminated(Osc9::Notification(data)),
+    }
+}
+
+/// ghostty's rxvt_extension.parse: `notify;TITLE;BODY` after `777;`.
+fn parse_osc777(data: &[u8]) -> Option<(&[u8], &[u8])> {
+    if data.len() >= OSC_BUF {
+        return None;
+    }
+    let rest = data.strip_prefix(b"notify;")?;
+    let t = rest.iter().position(|&b| b == b';')?;
+    Some((&rest[..t], &rest[t + 1..]))
 }
 
 /// The path of an OSC 7 URL: `file://host/path` (percent-decoded) or

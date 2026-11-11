@@ -120,6 +120,37 @@ pub struct Modes {
     pub alternate_scroll: bool,
 }
 
+/// The state of a ConEmu progress report (OSC 9;4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgressState {
+    Remove,
+    Set,
+    Error,
+    Indeterminate,
+    Pause,
+}
+
+/// ghostty's ProgressReport: the state and the percentage (0 to 100).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProgressReport {
+    pub state: ProgressState,
+    pub progress: Option<u8>,
+}
+
+/// What the program asks of the terminal's surface, in the order it was
+/// received (ghostty's surface messages from the stream handler).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Message {
+    /// OSC 9 or OSC 777;notify, the title cut to 63 bytes and the body to 255.
+    DesktopNotification { title: String, body: String },
+    /// OSC 9;4, and a removal at RIS.
+    ProgressReport(ProgressReport),
+    /// OSC 133;C: the command's output starts.
+    StartCommand,
+    /// OSC 133;D with the command's exit code.
+    StopCommand(u8),
+}
+
 /// Dirty marks for the viewport rows: a row is dirty when anything that
 /// affects its rendering changed since the last [`Terminal::clear_dirty`].
 #[derive(Clone, Debug, Default)]
@@ -294,6 +325,17 @@ impl Terminal {
     /// True once for each BEL received since the last call.
     pub fn take_bell(&mut self) -> bool {
         std::mem::take(&mut self.term.bell)
+    }
+
+    /// The messages received since the last call, oldest first.
+    pub fn take_messages(&mut self) -> Vec<Message> {
+        std::mem::take(&mut self.term.messages)
+    }
+
+    /// ghostty's Terminal.fullReset (the reset action): RIS without the
+    /// messages a program's RIS sends.
+    pub fn full_reset(&mut self) {
+        self.term.full_reset();
     }
 
     /// Scrolls the view into the scrollback by `delta` lines (positive =
