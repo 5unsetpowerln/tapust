@@ -641,8 +641,12 @@ impl Term {
         self.pending_wrap = false;
         if self.y == self.bottom {
             let blank = self.blank();
-            if self.grid.scroll_up_one(self.top, self.bottom, blank, !self.alt_active) && self.view_offset != 0 {
-                self.view_offset = (self.view_offset + 1).min(self.grid.hist_len());
+            if self.grid.scroll_up_one(self.top, self.bottom, blank, !self.alt_active) {
+                if self.view_offset != 0 {
+                    self.view_offset = (self.view_offset + 1).min(self.grid.hist_len());
+                }
+            } else if self.selection.is_some() {
+                self.selection_region_up();
             }
             self.mark_all_dirty();
         } else if self.y + 1 < self.rows {
@@ -772,7 +776,46 @@ impl Term {
         if pushed != 0 && self.view_offset != 0 {
             self.view_offset = (self.view_offset + pushed).min(self.grid.hist_len());
         }
+        if pushed == 0 && self.top == 0 && self.bottom == self.rows - 1 && self.selection.is_some() {
+            self.selection_erase_top(n);
+        }
         self.mark_all_dirty();
+    }
+
+    /// Moves each end of the selection on the screen to the row and column
+    /// `f` returns for its row and column, if any.
+    fn move_selection(&mut self, f: impl Fn(usize, u16) -> Option<(usize, u16)>) {
+        let row0 = self.grid.pushed();
+        let rows = self.rows as u64;
+        let Some(sel) = &mut self.selection else { return };
+        for p in [&mut sel.start, &mut sel.end] {
+            if !(row0..row0 + rows).contains(&p.line) {
+                continue;
+            }
+            if let Some((y, col)) = f((p.line - row0) as usize, p.col) {
+                *p = Point { line: row0 + y as u64, col };
+            }
+        }
+    }
+
+    /// ghostty's cursorScrollRegionUp, for a linefeed that scrolls a region
+    /// or a screen without scrollback in place: the ends in the region move
+    /// up with their rows, those on the region's first row to the row above,
+    /// or to the first cell of screen row 0 (the start of the page).
+    fn selection_region_up(&mut self) {
+        let (top, bottom) = (self.top, self.bottom);
+        self.move_selection(|y, col| match y {
+            0 if top == 0 => Some((0, 0)),
+            _ if (top..=bottom).contains(&y) => Some((y - 1, col)),
+            _ => None,
+        });
+    }
+
+    /// ghostty's eraseRow of the top row, `n` times, for SU on a full screen
+    /// without scrollback: the ends move up with their rows and stay in
+    /// their column on reaching the top row.
+    fn selection_erase_top(&mut self, n: usize) {
+        self.move_selection(|y, col| Some((y.saturating_sub(n), col)));
     }
 
     fn scroll_down(&mut self, n: usize) {

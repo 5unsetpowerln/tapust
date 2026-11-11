@@ -1485,3 +1485,38 @@ fn narrowing_reflow_keeps_line_numbers_valid() {
     assert_eq!((t.first_line(), t.view_top(), t.end_line()), (0, 2, 7));
     assert_eq!(t.line(0).unwrap()[0].char(), Some('a'));
 }
+
+#[test]
+fn region_scrolls_move_the_selection_like_ghosttys_pins() {
+    // A linefeed at the bottom of a region below the top moves the ends in
+    // the region up with their rows, the first row's to the row above.
+    let mut t = Terminal::new(10, 6, 100);
+    t.feed(b"r0\r\nr1\r\nr2\r\nr3\r\nr4\r\nr5\x1b[3;5r\x1b[5;1H");
+    let sel = select(&mut t, (2, 1), (3, 1));
+    t.feed(b"\n");
+    let top = t.view_top();
+    assert_eq!(t.selection().unwrap().start, Point { line: top + 1, ..sel.start });
+    assert_eq!(t.selection().unwrap().end, Point { line: top + 2, ..sel.end });
+    assert_eq!(chars(ends(&t)), (Some('1'), Some('3')));
+    // Inserting, deleting and scrolling down move rows, not the selection.
+    let sel = select(&mut t, (2, 0), (3, 0));
+    t.feed(b"\x1b[3;1H\x1b[L\x1b[M\x1b[T");
+    assert_eq!(t.selection(), Some(sel));
+}
+
+#[test]
+fn alternate_screen_scrolls_move_the_selection_like_ghosttys_pins() {
+    let mut t = Terminal::new(10, 4, 100);
+    t.feed(b"\x1b[?1049ha0\r\na1\r\na2\r\na3");
+    // A linefeed: ends move up, one on the top row to its first cell.
+    select(&mut t, (0, 1), (2, 1));
+    t.feed(b"\n");
+    let top = t.view_top();
+    let s = t.selection().unwrap();
+    assert_eq!((s.start, s.end), (Point { line: top, col: 0 }, Point { line: top + 1, col: 1 }));
+    // SU erases top rows: ends move up and keep their column at the top.
+    select(&mut t, (1, 1), (3, 1));
+    t.feed(b"\x1b[2S");
+    let s = t.selection().unwrap();
+    assert_eq!((s.start, s.end), (Point { line: top, col: 1 }, Point { line: top + 1, col: 1 }));
+}
