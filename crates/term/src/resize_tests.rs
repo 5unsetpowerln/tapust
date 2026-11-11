@@ -1856,7 +1856,8 @@ fn the_inactive_primary_screen_resizes_with_its_own_cursor() {
 
 // ---- tapust's own resize rules -------------------------------------------
 
-// tapust differs from ghostty: a selection end does not keep a trailing row without text, and goes with it.
+// tapust differs from ghostty: a selection end does not keep a trailing row without text; a selection
+// left with nothing goes away.
 #[test]
 fn selection_ends_do_not_keep_trailing_blank_rows() {
     let mut t = with_history(10, 5);
@@ -1865,7 +1866,7 @@ fn selection_ends_do_not_keep_trailing_blank_rows() {
     t.resize(10, 2);
     assert_eq!(t.history_len(), 0);
     assert_eq!(viewport(&t), "top");
-    assert_eq!(t.selection().unwrap().end, Point { line: t.first_line(), col: 0 });
+    assert_eq!(t.selection(), None);
 }
 
 // tapust differs from ghostty: a saved cursor whose row leaves the screen is clamped to it, not homed.

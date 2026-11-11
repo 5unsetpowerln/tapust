@@ -400,13 +400,18 @@ impl Terminal {
         self.term.grid.slot_meta(slot).grapheme(x)
     }
 
-    /// ghostty's Screen.selection of the active screen. An end whose line is
-    /// no longer stored reads as the first cell of the oldest stored line,
-    /// where ghostty moves the pins of discarded rows.
+    /// The active screen's selection, first end first. Once lines leave the
+    /// scrollback, it starts at the oldest stored line, or is gone if no
+    /// selected line is left.
     pub fn selection(&self) -> Option<Selection> {
         let first = self.first_line();
-        let stored = |p: Point| if p.line < first { Point { line: first, col: 0 } } else { p };
-        self.term.selection.map(|s| Selection { start: stored(s.start), end: stored(s.end), ..s })
+        let (start, end) = self.term.selection?.ordered();
+        // Nothing is left once the last selected line is gone.
+        if end.line < first {
+            return None;
+        }
+        let start = if start.line < first { Point { line: first, col: 0 } } else { start };
+        Some(Selection { start, end, ..self.term.selection? })
     }
 
     /// ghostty's Screen.select: replaces the active screen's selection, which

@@ -130,7 +130,8 @@ fn resize_screen(grid: &Grid, cols: usize, rows: usize, reflow: bool, redraw: Re
         pins.len() - 1
     });
     let selection = t.selection.as_ref().map(|s| {
-        for p in [s.start, s.end] {
+        let (start, end) = s.ordered();
+        for p in [start, end] {
             pins.push(p.line.checked_sub(first).map_or((0, 0), |line| (line as usize, p.col as usize)));
         }
         pins.len() - 2
@@ -158,14 +159,19 @@ fn resize_screen(grid: &Grid, cols: usize, rows: usize, reflow: bool, redraw: Re
             s.x += 1;
         }
     }
-    if let (Some(s), Some(i)) = (t.selection.as_mut(), selection) {
+    if let Some(i) = selection {
         let first = grid.first_line();
-        // An end on a row cut below the screen is discarded like one dropped from the history.
-        let point = |(line, col): (usize, usize)| {
-            let (line, col) = if line < hist + rows { (line, col) } else { (0, 0) };
-            Point { line: first + line as u64, col: col as u16 }
+        let rect = t.selection.is_some_and(|s| s.rect);
+        let point = |(line, col): (usize, usize)| Point { line: first + line as u64, col: col as u16 };
+        let (start, end) = (pins[i], pins[i + 1]);
+        // An end on a row cut below the screen moves to the last cell kept
+        // above it; a selection with nothing kept is gone.
+        let last_kept = (hist + rows - 1, if rect { end.1 } else { cols - 1 });
+        *t.selection = match (start.0 < hist + rows, end.0 < hist + rows) {
+            (true, true) => Some(Selection { start: point(start), end: point(end), rect }),
+            (true, false) => Some(Selection { start: point(start), end: point(last_kept), rect }),
+            _ => None,
         };
-        (s.start, s.end) = (point(pins[i]), point(pins[i + 1]));
     }
     if let Some(i) = view {
         *t.view_offset = hist.saturating_sub(pins[i].0);
@@ -729,12 +735,13 @@ impl Term {
         self.pending_wrap = false;
         if self.y == self.bottom {
             let blank = self.blank();
-            if self.grid.scroll_up_one(self.top, self.bottom, blank, !self.alt_active) {
-                if self.view_offset != 0 {
-                    self.view_offset = (self.view_offset + 1).min(self.grid.hist_len());
-                }
-            } else if self.selection.is_some() {
-                self.selection_region_up();
+            let row0 = self.grid.pushed();
+            let saved = self.grid.scroll_up_one(self.top, self.bottom, blank, !self.alt_active);
+            if saved && self.view_offset != 0 {
+                self.view_offset = (self.view_offset + 1).min(self.grid.hist_len());
+            }
+            if self.selection.is_some() {
+                self.scroll_selection(row0, self.top, self.bottom, 1, true, usize::from(saved));
             }
             self.mark_all_dirty();
         } else if self.y + 1 < self.rows {
@@ -869,55 +876,69 @@ impl Term {
 
     fn scroll_up(&mut self, n: usize) {
         let blank = self.blank();
+        let row0 = self.grid.pushed();
         let pushed = self.grid.scroll_up(self.top, self.bottom, n, blank, !self.alt_active);
         if pushed != 0 && self.view_offset != 0 {
             self.view_offset = (self.view_offset + pushed).min(self.grid.hist_len());
         }
-        if pushed == 0 && self.top == 0 && self.bottom == self.rows - 1 && self.selection.is_some() {
-            self.selection_erase_top(n);
-        }
+        self.scroll_selection(row0, self.top, self.bottom, n, true, pushed);
         self.mark_all_dirty();
     }
 
-    /// Moves each end of the selection on the screen to the row and column
-    /// `f` returns for its row and column, if any.
-    fn move_selection(&mut self, f: impl Fn(usize, u16) -> Option<(usize, u16)>) {
-        let row0 = self.grid.pushed();
-        let rows = self.rows as u64;
-        let Some(sel) = &mut self.selection else { return };
-        for p in [&mut sel.start, &mut sel.end] {
-            if !(row0..row0 + rows).contains(&p.line) {
-                continue;
+    /// Keeps the selection on its text after rows `top..=bottom` of the
+    /// screen whose first row was line `row0` scrolled `n` rows up (`up`) or
+    /// down in place, `saved` of them into the scrollback. Ends move with
+    /// their cells; an end on discarded text moves to the nearest kept cell
+    /// inside the selection, and a selection with no text left is cleared.
+    fn scroll_selection(&mut self, row0: u64, top: usize, bottom: usize, n: usize, up: bool, saved: usize) {
+        let Some(sel) = self.selection else { return };
+        let (mut first, mut last) = sel.ordered();
+        let (n, height) = (n.min(bottom + 1 - top) as u64, (bottom + 1 - top) as u64);
+        let (top, bottom) = (row0 + top as u64, row0 + bottom as u64);
+        if saved > 0 {
+            // Saved rows keep their numbers, but the rows below the region
+            // stay where they are while the screen's numbering moves on.
+            for p in [&mut first, &mut last].into_iter().filter(|p| p.line > bottom) {
+                p.line += saved as u64;
             }
-            if let Some((y, col)) = f((p.line - row0) as usize, p.col) {
-                *p = Point { line: row0 + y as u64, col };
-            }
+            self.selection = Some(Selection { start: first, end: last, rect: sel.rect });
+            return;
         }
-    }
-
-    /// ghostty's cursorScrollRegionUp, for a linefeed that scrolls a region
-    /// or a screen without scrollback in place: the ends in the region move
-    /// up with their rows, those on the region's first row to the row above,
-    /// or to the first cell of screen row 0 (the start of the page).
-    fn selection_region_up(&mut self) {
-        let (top, bottom) = (self.top, self.bottom);
-        self.move_selection(|y, col| match y {
-            0 if top == 0 => Some((0, 0)),
-            _ if (top..=bottom).contains(&y) => Some((y - 1, col)),
+        // The discarded lines, and the lines where the kept text just before
+        // and just after them is now.
+        let (gone, before, after) = if up {
+            (top..top + n, top.checked_sub(1), if n < height { top } else { bottom + 1 })
+        } else {
+            (bottom + 1 - n..bottom + 1, if n < height { Some(bottom) } else { top.checked_sub(1) }, bottom + 1)
+        };
+        let before = before.filter(|&l| l >= self.grid.first_line());
+        let after = (after < row0 + self.rows as u64).then_some(after);
+        let last_col = self.cols as u16 - 1;
+        let moved = |p: Point| {
+            if !(top..=bottom).contains(&p.line) {
+                Some(p)
+            } else if gone.contains(&p.line) {
+                None
+            } else if up {
+                Some(Point { line: p.line - n, ..p })
+            } else {
+                Some(Point { line: p.line + n, ..p })
+            }
+        };
+        let first = moved(first).or_else(|| after.map(|line| Point { line, col: if sel.rect { first.col } else { 0 } }));
+        let last = moved(last).or_else(|| before.map(|line| Point { line, col: if sel.rect { last.col } else { last_col } }));
+        self.selection = match (first, last) {
+            (Some(start), Some(end)) if start.line < end.line || start.line == end.line && start.col <= end.col => {
+                Some(Selection { start, end, rect: sel.rect })
+            }
             _ => None,
-        });
-    }
-
-    /// ghostty's eraseRow of the top row, `n` times, for SU on a full screen
-    /// without scrollback: the ends move up with their rows and stay in
-    /// their column on reaching the top row.
-    fn selection_erase_top(&mut self, n: usize) {
-        self.move_selection(|y, col| Some((y.saturating_sub(n), col)));
+        };
     }
 
     fn scroll_down(&mut self, n: usize) {
         let blank = self.blank();
         self.grid.scroll_down(self.top, self.bottom, n, blank);
+        self.scroll_selection(self.grid.pushed(), self.top, self.bottom, n, false, 0);
         self.mark_all_dirty();
     }
 
@@ -1118,6 +1139,7 @@ impl Term {
         }
         let blank = self.blank();
         self.grid.scroll_down(self.y, self.bottom, n, blank);
+        self.scroll_selection(self.grid.pushed(), self.y, self.bottom, n, false, 0);
         self.x = 0;
         self.pending_wrap = false;
         self.mark_all_dirty();
@@ -1129,6 +1151,7 @@ impl Term {
         }
         let blank = self.blank();
         self.grid.scroll_up(self.y, self.bottom, n, blank, false);
+        self.scroll_selection(self.grid.pushed(), self.y, self.bottom, n, true, 0);
         self.x = 0;
         self.pending_wrap = false;
         self.mark_all_dirty();

@@ -1366,7 +1366,7 @@ fn erasing_and_scrolling_keep_the_selection() {
     assert_eq!(t.selection(), Some(sel));
     assert_eq!(chars(ends(&t)), (Some('a'), Some('c')));
     let sel = select(&mut t, (0, 1), (2, 5));
-    feed(&mut t, "\x1b[2J\x1b[H\x1b[J\x1b[1J\x1b[Kxyz\x1b[2;1H\x1b[M\x1b[S");
+    feed(&mut t, "\x1b[2J\x1b[H\x1b[J\x1b[1J\x1b[Kxyz");
     assert_eq!(t.selection(), Some(sel));
 }
 
@@ -1423,40 +1423,6 @@ fn reflow_clamps_a_point_in_trailing_blanks() {
 }
 
 #[test]
-fn discarded_ends_move_to_the_oldest_line() {
-    let mut t = Terminal::new(10, 2, 2);
-    feed(&mut t, "a\r\nb\r\nc");
-    let first = t.first_line();
-    let sel = Selection { start: Point { line: first, col: 3 }, end: Point { line: first + 2, col: 0 }, rect: false };
-    t.set_selection(Some(sel));
-    assert_eq!(chars(ends(&t)), (None, Some('c')));
-    // "a" and "b" leave the two-line scrollback.
-    feed(&mut t, "\r\nd\r\ne\r\nf");
-    let s = t.selection().unwrap();
-    assert_eq!(s.start, Point { line: t.first_line(), col: 0 });
-    assert_eq!(s.end, sel.end);
-    assert_eq!(chars(ends(&t)), (Some('c'), Some('c')));
-    // ED 3 discards the history.
-    feed(&mut t, "\x1b[3J");
-    let s = t.selection().unwrap();
-    assert_eq!((s.start, s.end), (Point { line: t.first_line(), col: 0 }, Point { line: t.first_line(), col: 0 }));
-    // Lines the reflow drops from the history too.
-    let mut t = Terminal::new(8, 2, 2);
-    feed(&mut t, "11111111\r\n22\r\n33\r\n44");
-    let first = t.first_line();
-    t.set_selection(Some(Selection {
-        start: Point { line: first, col: 2 },
-        end: Point { line: first + 2, col: 1 },
-        rect: false,
-    }));
-    t.resize(4, 2);
-    assert_eq!(t.history_len(), 2);
-    let s = t.selection().unwrap();
-    assert_eq!(s.start, Point { line: t.first_line(), col: 0 });
-    assert_eq!(chars(ends(&t)), (Some('1'), Some('3')));
-}
-
-#[test]
 fn alternate_screen_resize_moves_the_selection_with_its_rows() {
     let mut t = term(10, 4);
     feed(&mut t, "\x1b[?1049h\x1b[Hrow0\r\nrow1\r\nrow2\r\nrow3");
@@ -1467,14 +1433,15 @@ fn alternate_screen_resize_moves_the_selection_with_its_rows() {
     let s = t.selection().unwrap();
     assert_eq!(s.start, Point { line: t.first_line(), col: 0 });
     assert_eq!(s.end, Point { line: t.view_top(), col: 4 });
-    // tapust differs from ghostty: the cursor's row stays and the end on the row cut below it is discarded.
+    // tapust differs from ghostty: the cursor's row stays, and the end on
+    // the row cut below it moves to the last kept cell.
     feed(&mut t, "\x1b[H");
     select(&mut t, (0, 1), (1, 2));
     t.resize(5, 1);
     assert_eq!(screen(&t), ["row2"]);
     assert_eq!(pos(&t), (0, 0));
     let s = t.selection().unwrap();
-    assert_eq!((s.start, s.end), (Point { line: t.view_top(), col: 1 }, Point { line: t.first_line(), col: 0 }));
+    assert_eq!((s.start, s.end), (Point { line: t.view_top(), col: 1 }, Point { line: t.view_top(), col: 4 }));
 }
 
 #[test]
@@ -1489,41 +1456,6 @@ fn narrowing_reflow_keeps_line_numbers_valid() {
 }
 
 #[test]
-fn region_scrolls_move_the_selection_like_ghosttys_pins() {
-    // A linefeed at the bottom of a region below the top moves the ends in
-    // the region up with their rows, the first row's to the row above.
-    let mut t = Terminal::new(10, 6, 100);
-    t.feed(b"r0\r\nr1\r\nr2\r\nr3\r\nr4\r\nr5\x1b[3;5r\x1b[5;1H");
-    let sel = select(&mut t, (2, 1), (3, 1));
-    t.feed(b"\n");
-    let top = t.view_top();
-    assert_eq!(t.selection().unwrap().start, Point { line: top + 1, ..sel.start });
-    assert_eq!(t.selection().unwrap().end, Point { line: top + 2, ..sel.end });
-    assert_eq!(chars(ends(&t)), (Some('1'), Some('3')));
-    // Inserting, deleting and scrolling down move rows, not the selection.
-    let sel = select(&mut t, (2, 0), (3, 0));
-    t.feed(b"\x1b[3;1H\x1b[L\x1b[M\x1b[T");
-    assert_eq!(t.selection(), Some(sel));
-}
-
-#[test]
-fn alternate_screen_scrolls_move_the_selection_like_ghosttys_pins() {
-    let mut t = Terminal::new(10, 4, 100);
-    t.feed(b"\x1b[?1049ha0\r\na1\r\na2\r\na3");
-    // A linefeed: ends move up, one on the top row to its first cell.
-    select(&mut t, (0, 1), (2, 1));
-    t.feed(b"\n");
-    let top = t.view_top();
-    let s = t.selection().unwrap();
-    assert_eq!((s.start, s.end), (Point { line: top, col: 0 }, Point { line: top + 1, col: 1 }));
-    // SU erases top rows: ends move up and keep their column at the top.
-    select(&mut t, (1, 1), (3, 1));
-    t.feed(b"\x1b[2S");
-    let s = t.selection().unwrap();
-    assert_eq!((s.start, s.end), (Point { line: top, col: 1 }, Point { line: top + 1, col: 1 }));
-}
-
-#[test]
 fn narrowing_a_wide_char_after_a_full_row_does_not_overflow() {
     let mut t = Terminal::new(10, 3, 100);
     // U+4E2D and U+6587 are wide.
@@ -1532,4 +1464,68 @@ fn narrowing_a_wide_char_after_a_full_row_does_not_overflow() {
     // "ghij" and a wide char fill a row exactly, so the next one starts the
     // next row.
     assert_eq!(screen(&t), ["ghij\u{4e2d}", "\u{6587}\u{4e2d}\u{6587}"]);
+}
+
+#[test]
+fn discarded_lines_shrink_or_clear_the_selection() {
+    let mut t = Terminal::new(10, 2, 2);
+    feed(&mut t, "a\r\nb\r\nc");
+    let first = t.first_line();
+    let sel = Selection { start: Point { line: first, col: 0 }, end: Point { line: first + 2, col: 0 }, rect: false };
+    t.set_selection(Some(sel));
+    // "a" and "b" leave the two-line scrollback: the selection starts at "c".
+    feed(&mut t, "\r\nd\r\ne\r\nf");
+    let s = t.selection().unwrap();
+    assert_eq!((s.start, s.end), (Point { line: t.first_line(), col: 0 }, sel.end));
+    // ED 3 discards the rest of it.
+    feed(&mut t, "\x1b[3J");
+    assert_eq!(t.selection(), None);
+}
+
+#[test]
+fn region_scrolls_keep_the_selection_on_its_text() {
+    let mut t = Terminal::new(10, 6, 100);
+    t.feed(b"r0\r\nr1\r\nr2\r\nr3\r\nr4\r\nr5\x1b[3;5r\x1b[5;1H");
+    // Rows 2 to 4 scroll up and "r2" is discarded: the start moves to the
+    // region's new first row, the end moves up with "r3".
+    select(&mut t, (2, 1), (3, 1));
+    t.feed(b"\n");
+    let top = t.view_top();
+    let s = t.selection().unwrap();
+    assert_eq!((s.start, s.end), (Point { line: top + 2, col: 0 }, Point { line: top + 2, col: 1 }));
+    assert_eq!(chars(ends(&t)), (Some('r'), Some('3')));
+    // An end on discarded text keeps the part above the region.
+    select(&mut t, (1, 0), (2, 1));
+    t.feed(b"\n");
+    let s = t.selection().unwrap();
+    assert_eq!((s.start, s.end), (Point { line: top + 1, col: 0 }, Point { line: top + 1, col: 9 }));
+    // With nothing kept, the selection goes away.
+    select(&mut t, (2, 0), (2, 1));
+    t.feed(b"\n");
+    assert_eq!(t.selection(), None);
+    // Inserted and deleted lines move the text and the selection with it.
+    let mut t = Terminal::new(10, 4, 100);
+    t.feed(b"a0\r\na1\r\na2\r\na3\x1b[2;1H");
+    select(&mut t, (2, 0), (2, 1));
+    t.feed(b"\x1b[L");
+    assert_eq!(t.selection().unwrap().start.line, t.view_top() + 3);
+    assert_eq!(chars(ends(&t)), (Some('a'), Some('2')));
+    t.feed(b"\x1b[2M");
+    assert_eq!(t.selection().unwrap().start.line, t.view_top() + 1);
+    assert_eq!(chars(ends(&t)), (Some('a'), Some('2')));
+}
+
+#[test]
+fn alternate_screen_scrolls_keep_the_selection_on_its_text() {
+    let mut t = Terminal::new(10, 4, 100);
+    t.feed(b"\x1b[?1049ha0\r\na1\r\na2\r\na3");
+    select(&mut t, (0, 1), (2, 1));
+    t.feed(b"\n");
+    let top = t.view_top();
+    let s = t.selection().unwrap();
+    // "a0" is gone: the selection starts at "a1", now the first row.
+    assert_eq!((s.start, s.end), (Point { line: top, col: 0 }, Point { line: top + 1, col: 1 }));
+    // SU 2 discards "a1" and "a2", leaving nothing selected.
+    t.feed(b"\x1b[2S");
+    assert_eq!(t.selection(), None);
 }
