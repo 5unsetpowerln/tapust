@@ -181,7 +181,8 @@ impl Term {
             modes: Modes::default(),
             cursor_visible: true,
             cursor_shape: CursorShape::Block,
-            cursor_blink: false,
+            // ghostty's default for DEC mode 12 (cursor-style-blink unset).
+            cursor_blink: true,
             top: 0,
             bottom: rows - 1,
             tabs: default_tabs(cols),

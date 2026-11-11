@@ -1008,7 +1008,7 @@ fn input_and_mouse_modes() {
 fn cursor_style_and_visibility() {
     let mut t = term(10, 2);
     let c = t.cursor();
-    assert!(c.visible && !c.blinking && c.shape == CursorShape::Block);
+    assert!(c.visible && c.blinking && c.shape == CursorShape::Block);
     for (seq, shape, blink) in [
         ("\x1b[6 q", CursorShape::Bar, false),
         ("\x1b[5 q", CursorShape::Bar, true),
