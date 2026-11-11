@@ -1061,8 +1061,7 @@ fn dirty_rows() {
 #[test]
 fn configured_palette_survives_resets() {
     let mut t = Terminal::new(10, 3, 0);
-    let mut configured = Palette::default();
-    configured.foreground = Rgb { r: 1, g: 2, b: 3 };
+    let mut configured = Palette { foreground: Rgb { r: 1, g: 2, b: 3 }, ..Palette::default() };
     configured.indexed[1] = Rgb { r: 4, g: 5, b: 6 };
     t.set_default_palette(configured.clone());
     assert_eq!(*t.palette(), configured);
