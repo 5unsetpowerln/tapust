@@ -70,6 +70,8 @@ pub struct Surface {
     pub focused: Cell<bool>,
     split: Cell<bool>,
     size: Cell<(u16, u16)>,
+    /// The GLArea's size in device pixels.
+    pixels: Cell<(i32, i32)>,
 }
 
 fn load_fonts(scale: f64) -> Option<Fonts> {
@@ -192,6 +194,7 @@ impl Surface {
             focused: Cell::new(false),
             split: Cell::new(false),
             size: Cell::new((0, 0)),
+            pixels: Cell::new((0, 0)),
         });
         surface.connect(handler);
         surface
@@ -245,8 +248,11 @@ impl Surface {
                 d.full = true;
                 (cols, rows, (cw, ch))
             };
-            let old = s.size.replace((cols, rows));
-            if old != (cols, rows) && old != (0, 0) && s.created.elapsed() >= theme::RESIZE_OVERLAY_DELAY {
+            s.size.set((cols, rows));
+            // ghostty shows the overlay whenever the pixel size changes,
+            // except for the first size.
+            let old = s.pixels.replace((width, height));
+            if old != (width, height) && old != (0, 0) && s.created.elapsed() >= theme::RESIZE_OVERLAY_DELAY {
                 s.schedule_resize_overlay();
             }
             h(Event::Resized { pane: s.pane, cols, rows, cell });

@@ -966,7 +966,7 @@ impl App {
     }
 
     fn toast(&self, text: &str) {
-        let toast = adw::Toast::builder().title(text).timeout(1).build();
+        let toast = adw::Toast::builder().title(text).timeout(3).build();
         self.toasts.add_toast(toast);
     }
 
