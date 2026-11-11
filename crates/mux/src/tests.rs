@@ -7,7 +7,19 @@ use std::time::{Duration, Instant};
 use crate::*;
 
 const M: Metrics =
-    Metrics { width: 1276, height: 796, cell_width: 10, cell_height: 20, padding_x: 2, padding_y: 2, divider: 1 };
+    Metrics {
+        width: 1276,
+        height: 796,
+        top: 0,
+        divider: 1,
+        min_width: 14,
+        min_height: 24,
+        scale: 1.0,
+        cell_width: 10,
+        cell_height: 20,
+        padding_x: 2,
+        padding_y: 2,
+    };
 
 fn new_session() -> Session {
     Session::new(M).0
@@ -90,7 +102,7 @@ fn split_horizontal_halves() {
     ok(&mut s, split(true));
     // GtkPaned: round((1276 - 1) * 0.5) = 638 for the first pane.
     assert_eq!(rects(&s), [(0, 0, 638, 796), (639, 0, 637, 796)]);
-    assert_eq!(s.view().dividers, [Rect { x: 638, y: 0, w: 1, h: 796 }]);
+    assert_eq!(s.view().dividers, [Divider { rect: Rect { x: 638, y: 0, w: 1, h: 796 }, after: 1, horizontal: true }]);
 }
 
 #[test]
@@ -280,7 +292,11 @@ fn full_vertical_split_after_horizontal() {
     assert_eq!(rects(&s), [(0, 0, 638, 398), (639, 0, 637, 398), (0, 399, 1276, 397)]);
     assert_eq!(
         s.view().dividers,
-        [Rect { x: 638, y: 0, w: 1, h: 398 }, Rect { x: 0, y: 398, w: 1276, h: 1 }]
+        // The inner divider comes after pane 0; the root's after both upper panes.
+        [
+            Divider { rect: Rect { x: 638, y: 0, w: 1, h: 398 }, after: 1, horizontal: true },
+            Divider { rect: Rect { x: 0, y: 398, w: 1276, h: 1 }, after: 2, horizontal: false },
+        ]
     );
 }
 
@@ -294,15 +310,16 @@ fn equalize_evens_out() {
 }
 
 #[test]
-fn split_without_room_is_refused() {
-    // A pane needs one cell inside its padding: 14 pixels across.
+fn split_without_room_grows_the_layout() {
+    // ghostty never refuses a split: GTK raises the window's minimum size
+    // and lays the tree out at that minimum, past the window's edge if the
+    // compositor keeps the window smaller.
     let mut s = Session::new(Metrics { width: 30, ..M }).0;
     ok(&mut s, split(true));
     assert_eq!(rects(&s), [(0, 0, 15, 796), (16, 0, 14, 796)]);
-    let out = run(&mut s, split(true));
-    assert_eq!(out.error.as_deref(), Some("no space for new pane"));
-    assert_eq!(out.effects, []);
-    assert_eq!(run(&mut s, full_split(true)).error.as_deref(), Some("no space for new pane"));
+    ok(&mut s, split(true));
+    assert_eq!(s.min_area(), (44, 24));
+    assert_eq!(rects(&s), [(0, 0, 14, 796), (15, 0, 14, 796), (30, 0, 14, 796)]);
 }
 
 #[test]
@@ -312,8 +329,8 @@ fn small_window_keeps_the_minimum_sizes_in_order() {
     ok(&mut s, split(false));
     assert_eq!(rects(&s), [(0, 0, 1276, 50), (0, 51, 1276, 24), (0, 76, 1276, 24)]);
     s.resize(Metrics { height: 60, ..M });
-    // Every pane keeps its minimum: GtkPaned lets the last one stick out
-    // past the bottom of the window.
+    // Every pane keeps its minimum: the tree is laid out at its minimum
+    // height, past the bottom of the window.
     assert_eq!(rects(&s), [(0, 0, 1276, 24), (0, 25, 1276, 24), (0, 50, 1276, 24)]);
     assert!(s.windows()[0].panes.iter().all(|p| M.grid(p.rect).1 == 1));
 }

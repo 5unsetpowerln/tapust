@@ -27,7 +27,8 @@ use window::Window;
 /// Pane identifier (tmux `%N`), never reused within a session.
 pub type PaneId = u32;
 
-/// A rectangle in pixels, relative to the top-left of the area the panes share.
+/// A rectangle in logical pixels (GTK's widget coordinates), relative to the
+/// top-left of the area the panes share.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Rect {
     pub x: u32,
@@ -36,19 +37,38 @@ pub struct Rect {
     pub h: u32,
 }
 
-/// The client's pixel geometry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A rectangle in device pixels, relative to the window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct DeviceRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// The client's geometry. Splits are laid out in logical pixels, as GTK
+/// allocates ghostty's widgets; terminal grids are measured in the device
+/// pixels each pane covers.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Metrics {
-    /// The area the panes of a window share.
+    /// The area the panes of a window share, in logical pixels.
     pub width: u32,
     pub height: u32,
+    /// Where that area starts in the window (below the tab bar), in logical pixels.
+    pub top: u32,
+    /// Width of the divider between split panes, in logical pixels.
+    pub divider: u32,
+    /// The smallest a pane may get, in logical pixels.
+    pub min_width: u32,
+    pub min_height: u32,
+    /// Device pixels per logical pixel.
+    pub scale: f64,
+    /// The cell size and the space on each side of a pane's grid (ghostty's
+    /// `window-padding-x`/`-y`), in device pixels.
     pub cell_width: u32,
     pub cell_height: u32,
-    /// Space on each side of a pane's grid (ghostty's `window-padding-x`/`-y`).
     pub padding_x: u32,
     pub padding_y: u32,
-    /// Width of the divider between split panes.
-    pub divider: u32,
 }
 
 impl Metrics {
@@ -56,13 +76,28 @@ impl Metrics {
         Rect { x: 0, y: 0, w: self.width, h: self.height }
     }
 
-    /// The terminal grid that fits in a pane of `rect`, at least one cell.
+    /// The device pixels a pane at `rect` covers: ghostty rounds both edges
+    /// (`snappedAxis` in its GTK scale.zig), half away from zero.
+    pub fn device(&self, rect: Rect) -> DeviceRect {
+        let s = self.scale;
+        let snap = |origin: u32, size: u32| {
+            let start = (f64::from(origin) * s).round();
+            let end = (f64::from(origin + size) * s).round();
+            (start as i32, (end - start).max(0.0) as u32)
+        };
+        let (x, w) = snap(rect.x, rect.w);
+        let (y, h) = snap(self.top + rect.y, rect.h);
+        DeviceRect { x, y, w, h }
+    }
+
+    /// The terminal grid that fits in a pane at `rect`, at least one cell.
     pub fn grid(&self, rect: Rect) -> (u16, u16) {
+        let d = self.device(rect);
         let fit = |size: u32, padding: u32, cell: u32| {
             let n = size.saturating_sub(2 * padding) / cell.max(1);
             u16::try_from(n.max(1)).unwrap_or(u16::MAX)
         };
-        (fit(rect.w, self.padding_x, self.cell_width), fit(rect.h, self.padding_y, self.cell_height))
+        (fit(d.w, self.padding_x, self.cell_width), fit(d.h, self.padding_y, self.cell_height))
     }
 }
 
@@ -151,9 +186,20 @@ pub struct PaneView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct View {
     pub panes: Vec<PaneView>,
-    pub dividers: Vec<Rect>,
+    pub dividers: Vec<Divider>,
     /// The prompt or message tmux would show on the status line.
     pub overlay: Option<Overlay>,
+}
+
+/// The divider of a split. GtkPaned draws its first child, the divider and
+/// then its second child, so a divider is drawn after the first `after`
+/// panes of the view and before the others.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Divider {
+    pub rect: Rect,
+    pub after: usize,
+    /// The split puts its panes side by side (the divider is a vertical line).
+    pub horizontal: bool,
 }
 
 /// A prompt or message.
@@ -303,6 +349,12 @@ impl Session {
     /// splits keep their ratios.
     pub fn resize(&mut self, metrics: Metrics) -> Vec<Effect> {
         self.op(|s| s.set_metrics(metrics))
+    }
+
+    /// The smallest pane area the windows can be laid out in, in logical
+    /// pixels; the GUI makes it the window's minimum size, as GTK does.
+    pub fn min_area(&self) -> (u32, u32) {
+        self.min_area_of_windows()
     }
 
     /// Offers a key to the key tables (prefix, repeat, prompts).

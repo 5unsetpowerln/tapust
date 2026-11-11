@@ -2,7 +2,7 @@
 //! last-pane stack, zoom, directional selection) over ghostty's split tree.
 
 use crate::split::{Node, Side};
-use crate::{Metrics, PaneId, Rect};
+use crate::{Divider, Metrics, PaneId, Rect};
 
 #[derive(Clone, Debug)]
 pub(crate) struct Pane {
@@ -38,6 +38,9 @@ pub(crate) struct Window {
     /// tmux `@N`, never reused within a session.
     pub id: u32,
     pub metrics: Metrics,
+    /// What the tab view allocates to the window's tree: the pane area, or
+    /// more when the window cannot be that small.
+    pub area: Rect,
     /// `w->panes`, kept in the tree's order; a pane's index is its position.
     pub panes: Vec<Pane>,
     /// `w->last_panes`, most recent first.
@@ -45,7 +48,7 @@ pub(crate) struct Window {
     pub active: PaneId,
     pub tree: Node,
     /// The dividers of the last layout.
-    pub dividers: Vec<Rect>,
+    pub dividers: Vec<Divider>,
     pub zoomed: bool,
     pub was_zoomed: bool,
     /// Set by rename-window, which turns automatic-rename off.
@@ -58,6 +61,7 @@ impl Window {
         let mut w = Window {
             id,
             metrics,
+            area: metrics.area(),
             panes: vec![pane],
             last_panes: Vec::new(),
             active,
@@ -114,8 +118,7 @@ impl Window {
     /// zoomed pane, else the split tree. Only the current window is laid out,
     /// as libadwaita allocates only the selected tab.
     pub(crate) fn relayout(&mut self) {
-        let m = self.metrics;
-        let area = m.area();
+        let (m, area) = (self.metrics, self.area);
         let mut placed = Vec::new();
         self.dividers.clear();
         if self.zoomed {
@@ -139,19 +142,6 @@ impl Window {
         let mut order = Vec::with_capacity(self.panes.len());
         self.tree.leaves(&mut order);
         self.panes.sort_by_key(|p| order.iter().position(|&wp| wp == p.id));
-    }
-
-    /// Whether pane `wp` (or the whole window when `full`) has room for a new
-    /// pane on `side` next to it.
-    pub(crate) fn can_split(&self, wp: PaneId, side: Side, full: bool) -> bool {
-        let m = &self.metrics;
-        let (have, need) = if full {
-            (m.area(), self.tree.min_size(side.horizontal, m))
-        } else {
-            (self.pane(wp).rect, Node::Leaf(wp).min_size(side.horizontal, m))
-        };
-        let have = if side.horizontal { have.w } else { have.h };
-        have >= need + m.divider + Node::Leaf(wp).min_size(side.horizontal, m)
     }
 
     /// window_add_pane and layout_split_pane: `pane` splits `at` (or the
@@ -183,11 +173,11 @@ impl Window {
         self.tree_changed();
     }
 
-    /// ghostty's resize_split for the active pane, by `amount` pixels.
+    /// ghostty's resize_split for the active pane, by `amount` logical pixels.
     pub(crate) fn resize_split(&mut self, horizontal: bool, amount: i32) {
-        let m = self.metrics;
+        let (m, area) = (self.metrics, self.area);
         let wp = self.active;
-        self.tree.resize(wp, horizontal, amount, m.area(), &m);
+        self.tree.resize(wp, horizontal, amount, area, &m);
         self.tree_changed();
     }
 
@@ -324,7 +314,7 @@ impl Window {
     pub(crate) fn find(&self, wp: PaneId, dir: crate::Direction) -> Option<PaneId> {
         use crate::Direction::{Down, Left, Right, Up};
         let p = self.pane(wp).rect;
-        let (d, area) = (self.metrics.divider, self.metrics.area());
+        let (d, area) = (self.metrics.divider, self.area);
         let across = |n: &Rect| Self::overlaps(n.y, n.y + n.h.saturating_sub(1), p.y, p.y + p.h);
         let along = |n: &Rect| Self::overlaps(n.x, n.x + n.w.saturating_sub(1), p.x, p.x + p.w);
         match dir {

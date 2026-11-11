@@ -1,8 +1,9 @@
 //! OpenGL 3.3 renderer.
 //!
 //! After clearing to the window background:
-//! 1. Backgrounds: one quad per pane grid whose fragment shader looks up the
-//!    cell under each pixel in the pane's `cols x rows` RGBA texture.
+//! 1. Backgrounds: one quad per pane whose fragment shader looks up the cell
+//!    under each pixel in the pane's `cols x rows` RGBA texture, and shows
+//!    the pane's background around the cells.
 //! 2. Foreground: one instanced draw of quads in window pixels for glyphs
 //!    (from one RGBA atlas) and rectangles (cursors, underlines, box-drawing
 //!    lines, dividers, the tab bar and dialogs).
@@ -23,6 +24,9 @@ const FLAG_RECT: u32 = 2;
 const FLAG_ROUND: u32 = 4;
 /// Only the 1px outline of a rounded rectangle.
 const FLAG_RING: u32 = 8;
+/// A rectangle whose alpha is `uv[1] / 65535`, precise enough to blend like
+/// GTK's renderer does with float alphas.
+const FLAG_ALPHA16: u32 = 16;
 
 /// A quad whose top-left corner is at `pos` in window pixels.
 #[derive(Clone, Copy, Debug, Default)]
@@ -81,10 +85,11 @@ struct GridCache {
 }
 
 struct BgUniforms {
+    rect: glow::UniformLocation,
     origin: glow::UniformLocation,
-    size: glow::UniformLocation,
     cell: glow::UniformLocation,
     viewport: glow::UniformLocation,
+    pad_bg: glow::UniformLocation,
 }
 
 pub struct Renderer {
@@ -108,12 +113,11 @@ pub struct Renderer {
 }
 
 const BG_VS: &str = r#"#version 330 core
-uniform vec2 u_origin;
-uniform vec2 u_size;
+uniform vec4 u_rect;
 uniform vec2 u_viewport;
 void main() {
     vec2 corner = vec2(gl_VertexID & 1, (gl_VertexID >> 1) & 1);
-    vec2 ndc = (u_origin + corner * u_size) / u_viewport * 2.0 - 1.0;
+    vec2 ndc = (u_rect.xy + corner * u_rect.zw) / u_viewport * 2.0 - 1.0;
     gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
 }
 "#;
@@ -123,11 +127,16 @@ uniform sampler2D u_bg;
 uniform vec2 u_origin;
 uniform vec2 u_cell;
 uniform vec2 u_viewport;
+uniform vec4 u_pad_bg;
 out vec4 frag;
 void main() {
     vec2 px = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
     ivec2 cell = ivec2(floor((px - u_origin) / u_cell));
-    frag = texelFetch(u_bg, clamp(cell, ivec2(0), textureSize(u_bg, 0) - 1), 0);
+    if (any(lessThan(cell, ivec2(0))) || any(greaterThanEqual(cell, textureSize(u_bg, 0)))) {
+        frag = u_pad_bg;
+    } else {
+        frag = texelFetch(u_bg, cell, 0);
+    }
 }
 "#;
 
@@ -142,6 +151,7 @@ out vec2 v_uv;
 out vec2 v_local;
 flat out vec2 v_size;
 flat out float v_radius;
+flat out float v_alpha;
 flat out vec4 v_color;
 flat out uint v_flags;
 void main() {
@@ -149,6 +159,7 @@ void main() {
     v_local = corner * vec2(a_size);
     v_size = vec2(a_size);
     v_radius = float(a_uv.x);
+    v_alpha = float(a_uv.y) / 65535.0;
     vec2 px = vec2(a_pos) + corner * vec2(a_size);
     vec2 ndc = px / u_viewport * 2.0 - 1.0;
     gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
@@ -164,12 +175,13 @@ in vec2 v_uv;
 in vec2 v_local;
 flat in vec2 v_size;
 flat in float v_radius;
+flat in float v_alpha;
 flat in vec4 v_color;
 flat in uint v_flags;
 out vec4 frag;
 void main() {
     if ((v_flags & 2u) != 0u) {
-        float a = v_color.a;
+        float a = (v_flags & 16u) != 0u ? v_alpha : v_color.a;
         if ((v_flags & 4u) != 0u) {
             // Signed distance to a rounded box, antialiased over one pixel.
             vec2 half_size = v_size * 0.5;
@@ -278,10 +290,11 @@ impl Renderer {
         unsafe {
             let bg_program = program(&gl, BG_VS, BG_FS);
             let bg_uniforms = BgUniforms {
+                rect: uniform(&gl, bg_program, "u_rect"),
                 origin: uniform(&gl, bg_program, "u_origin"),
-                size: uniform(&gl, bg_program, "u_size"),
                 cell: uniform(&gl, bg_program, "u_cell"),
                 viewport: uniform(&gl, bg_program, "u_viewport"),
+                pad_bg: uniform(&gl, bg_program, "u_pad_bg"),
             };
             let fg_program = program(&gl, FG_VS, FG_FS);
             let fg_viewport = uniform(&gl, fg_program, "u_viewport");
@@ -494,6 +507,42 @@ impl Renderer {
                     pen += g.advance as i32;
                 }
             }
+            Shape::Area { x0, y0, x1, y1, color, alpha } => {
+                // Every pixel gets the alpha times the part of it the area
+                // covers: up to three spans per axis (partial, whole, partial).
+                let spans = |a: f64, b: f64| {
+                    let mut out: Vec<(i32, i32, f64)> = Vec::with_capacity(3);
+                    if b <= a {
+                        return out;
+                    }
+                    let (first, last) = (a.floor() as i32, b.ceil() as i32 - 1);
+                    if first == last {
+                        out.push((first, 1, b - a));
+                        return out;
+                    }
+                    out.push((first, 1, f64::from(first + 1) - a));
+                    if last - first > 1 {
+                        out.push((first + 1, last - first - 1, 1.0));
+                    }
+                    out.push((last, 1, b - f64::from(last)));
+                    out
+                };
+                let [r, g, b] = *color;
+                for &(x, w, cx) in &spans(*x0, *x1) {
+                    for &(y, h, cy) in &spans(*y0, *y1) {
+                        let a = (alpha * cx * cy * 65535.0).round() as u16;
+                        if a > 0 {
+                            out.push(Instance {
+                                pos: [x as i16, y as i16],
+                                size: [w as u16, h as u16],
+                                uv: [0, a],
+                                color: [r, g, b, 0xff],
+                                flags: FLAG_RECT | FLAG_ALPHA16,
+                            });
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -622,7 +671,7 @@ impl Renderer {
         let gl = &self.gl;
         let (vw, vh) = (self.viewport.0 as f32, self.viewport.1 as f32);
         unsafe {
-            let bg = frame.default_bg.map(|c| c as f32 / 255.0);
+            let bg = frame.window_bg.map(|c| c as f32 / 255.0);
             gl.disable(glow::BLEND);
             gl.clear_color(bg[0], bg[1], bg[2], bg[3]);
             gl.clear(glow::COLOR_BUFFER_BIT);
@@ -635,8 +684,10 @@ impl Renderer {
                 let cache = &self.grids[&grid.id];
                 gl.bind_texture(glow::TEXTURE_2D, Some(cache.texture));
                 gl.uniform_2_f32(Some(&self.bg_uniforms.origin), grid.x as f32, grid.y as f32);
-                let size = (grid.cols() as i32 * cw, grid.rows() as i32 * ch);
-                gl.uniform_2_f32(Some(&self.bg_uniforms.size), size.0 as f32, size.1 as f32);
+                let (x, y, w, h) = grid.pane;
+                gl.uniform_4_f32(Some(&self.bg_uniforms.rect), x as f32, y as f32, w as f32, h as f32);
+                let pad = grid.bg.map(|c| c as f32 / 255.0);
+                gl.uniform_4_f32(Some(&self.bg_uniforms.pad_bg), pad[0], pad[1], pad[2], pad[3]);
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
             }
             if !upload.is_empty() {

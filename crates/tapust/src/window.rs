@@ -69,28 +69,47 @@ impl GlWindow {
     }
 
     /// Resizes the surface and returns the geometry of the pane area below
-    /// the `top` pixels reserved for the tab bar.
+    /// the `top` logical pixels reserved for the tab bar.
     pub fn resize(&mut self, size: PhysicalSize<u32>, top: u32) -> Metrics {
         let (w, h) = (size.width.max(1), size.height.max(1));
         self.surface.resize(&self.context, NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap());
         self.renderer.resize(w, h);
         let (cell_width, cell_height) = self.renderer.cell_size();
         let scale = self.window.scale_factor();
-        // ghostty converts the padding from points at 96 dpi and floors it.
+        let logical = |px: u32| (f64::from(px) / scale).round() as u32;
+        // GTK never makes the window smaller than AdwApplicationWindow's minimum.
+        let (width, height) = (logical(w).max(theme::WINDOW_MIN.0), logical(h).max(theme::WINDOW_MIN.1));
+        // ghostty's split minimum: one cell, rounded up to logical pixels, plus
+        // the padding converted from points at 96 dpi and floored. The pane's
+        // GtkScrolledWindow also keeps room for a vertical scrollbar.
+        let logical_padding = (theme::PADDING_POINTS * 96.0 / 72.0).floor() as u32;
+        let min_cell = |px: u32| (f64::from(px) / scale).ceil() as u32 + 2 * logical_padding;
+        // The padding on the device: points at 96 dpi times the scale, floored.
         let padding = (theme::PADDING_POINTS * 96.0 / 72.0 * scale).floor() as u32;
         Metrics {
-            width: w,
-            height: h.saturating_sub(top),
+            width,
+            height: height.saturating_sub(top),
+            top,
+            // libadwaita's one-pixel separator.
+            divider: 1,
+            min_width: min_cell(cell_width),
+            min_height: min_cell(cell_height).max(theme::SCROLLBAR_MIN_HEIGHT),
+            scale,
             cell_width,
             cell_height,
             padding_x: padding,
             padding_y: padding,
-            // libadwaita's one logical pixel separator.
-            divider: (scale.round() as u32).max(1),
         }
     }
 
-    /// The tab bar height in pixels for this window's scale.
+    /// Keeps the window at least as large as its content, as GTK sets the
+    /// toplevel's minimum size: `area` is the panes' minimum in logical pixels.
+    pub fn set_min_size(&self, (width, height): (u32, u32), top: u32) {
+        let min = LogicalSize::new(width.max(theme::WINDOW_MIN.0), (top + height).max(theme::WINDOW_MIN.1));
+        self.window.set_min_inner_size(Some(min));
+    }
+
+    /// The tab bar height in device pixels.
     pub fn tab_bar_height(&self) -> u32 {
         (theme::TAB_BAR_HEIGHT * self.window.scale_factor()).round() as u32
     }

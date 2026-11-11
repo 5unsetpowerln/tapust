@@ -35,10 +35,20 @@ pub const UI_FONT_POINTS: f32 = 11.0;
 /// `window-padding-x` / `window-padding-y` (top-left and bottom-right), in points.
 pub const PADDING_POINTS: f64 = 2.0;
 
-/// The split divider: libadwaita's 1px `paned > separator` over the window background.
-pub const DIVIDER: [u8; 4] = [0x43, 0x43, 0x47, 0xff];
-/// `unfocused-split-fill` (the background) at `1 - unfocused-split-opacity` (0.30).
-pub const UNFOCUSED_DIM: [u8; 4] = [0x28, 0x2C, 0x34, 77];
+/// The split divider (`paned > separator`, one logical pixel): ghostty fills
+/// it with the window background and libadwaita adds an inset shadow of the
+/// foreground (Yaru's #f7f7f7) at `--border-opacity` (15% on the dark side).
+pub const DIVIDER_SHADOW: [u8; 3] = [0xf7, 0xf7, 0xf7];
+pub const DIVIDER_SHADOW_ALPHA: f64 = 0.15;
+/// ghostty's `widget.unfocused-split`: `unfocused-split-fill` (the
+/// background) at opacity `1 - unfocused-split-opacity`.
+pub const UNFOCUSED_FILL: [u8; 3] = [0x28, 0x2C, 0x34];
+pub const UNFOCUSED_ALPHA: f64 = 1.0 - 0.7;
+/// libadwaita's smallest vertical scrollbar (a 40px slider in a trough with
+/// 9px margins), which a pane's GtkScrolledWindow keeps room for.
+pub const SCROLLBAR_MIN_HEIGHT: u32 = 58;
+/// AdwApplicationWindow's minimum size, in logical pixels.
+pub const WINDOW_MIN: (u32, u32) = (360, 200);
 /// `cursor-style-blink` interval.
 pub const BLINK: std::time::Duration = std::time::Duration::from_millis(600);
 
@@ -60,7 +70,8 @@ pub mod adw {
     pub const DESTRUCTIVE: [u8; 4] = [0xc0, 0x1c, 0x28, 0xff];
     pub const SUGGESTED: [u8; 4] = [0x35, 0x84, 0xe4, 0xff];
     pub const TOAST_BG: [u8; 4] = [0x50, 0x50, 0x53, 0xff];
-    pub const WINDOW_BG: [u8; 4] = [0x22, 0x22, 0x26, 0xff];
+    /// Yaru's window background: Ubuntu's libadwaita loads the Yaru stylesheet.
+    pub const WINDOW_BG: [u8; 4] = [0x2c, 0x2c, 0x2c, 0xff];
 }
 
 /// ghostty's resize overlay: shown 750 ms, not during the first 250 ms.

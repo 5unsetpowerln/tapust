@@ -61,10 +61,12 @@ pub struct App {
     command: Option<Vec<String>>,
     debug: bool,
     /// The window size in pixels, the geometry of the pane area and the
-    /// height of the tab bar above it (0 while hidden).
+    /// height of the tab bar above it in logical pixels (0 while hidden).
     size: winit::dpi::PhysicalSize<u32>,
     metrics: Option<Metrics>,
     top: u32,
+    /// The terminal background, shown around each pane's cells.
+    term_bg: [u8; 4],
     title: String,
     /// Panes showing ghostty's `cols x rows` overlay after a resize, until when.
     resize_overlays: HashMap<PaneId, Instant>,
@@ -77,11 +79,11 @@ pub struct App {
 impl App {
     pub fn new(proxy: EventLoopProxy<UserEvent>, command: Option<Vec<String>>) -> App {
         let palette = theme::palette();
-        let default_bg = compose::resolve(term::Color::Default, &palette, palette.background);
+        let term_bg = compose::resolve(term::Color::Default, &palette, palette.background);
         App {
             proxy,
             window: None,
-            frame: Frame::new(default_bg),
+            frame: Frame::new(theme::adw::WINDOW_BG),
             session: None,
             panes: HashMap::new(),
             view: None,
@@ -98,6 +100,7 @@ impl App {
             size: winit::dpi::PhysicalSize::new(1, 1),
             metrics: None,
             top: 0,
+            term_bg,
             title: String::new(),
             resize_overlays: HashMap::new(),
             started: Instant::now(),
@@ -181,9 +184,12 @@ impl App {
     fn relayout(&mut self) -> bool {
         let Some(window) = self.window.as_mut() else { return true };
         let tabs = self.session.as_ref().is_some_and(|s| s.windows().len() > 1);
-        self.top = if tabs { window.tab_bar_height() } else { 0 };
+        self.top = if tabs { theme::TAB_BAR_HEIGHT as u32 } else { 0 };
         let metrics = window.resize(self.size, self.top);
         window.window.request_redraw();
+        if let Some(session) = &self.session {
+            window.set_min_size(session.min_area(), self.top);
+        }
         if self.metrics == Some(metrics) {
             return true;
         }
@@ -196,9 +202,17 @@ impl App {
         self.apply(effects)
     }
 
-    /// A pane rectangle of the session in window pixels.
+    /// The device pixels of a pane at `r`, snapped as ghostty snaps them.
     fn window_rect(&self, r: Rect) -> (i32, i32, i32, i32) {
-        (r.x as i32, (self.top + r.y) as i32, r.w as i32, r.h as i32)
+        let d = self.metrics.expect("metrics").device(r);
+        (d.x, d.y, d.w as i32, d.h as i32)
+    }
+
+    /// The fractional device pixels a widget at `r` covers.
+    fn device_area(&self, r: Rect) -> (f64, f64, f64, f64) {
+        let m = self.metrics.expect("metrics");
+        let (x, y) = (f64::from(r.x) * m.scale, f64::from(m.top + r.y) * m.scale);
+        (x, y, x + f64::from(r.w) * m.scale, y + f64::from(r.h) * m.scale)
     }
 
     /// Takes a new view when the session changed. A changed layout gets new
@@ -214,15 +228,16 @@ impl App {
         if layout_changed || self.full {
             let mut old: HashMap<u32, Grid> = self.frame.grids.drain(..).map(|g| (g.id, g)).collect();
             for pv in &view.panes {
-                let (x, y, _, _) = self.window_rect(pv.rect);
-                let (x, y) = (x + m.padding_x as i32, y + m.padding_y as i32);
-                let (cols, rows) = m.grid(pv.rect);
+                let d = m.device(pv.rect);
+                let pane = (d.x, d.y, d.w, d.h);
+                let origin = (d.x + m.padding_x as i32, d.y + m.padding_y as i32);
+                let size = m.grid(pv.rect);
                 let grid = match old.remove(&pv.pane) {
-                    Some(mut g) if (g.cols(), g.rows()) == (cols, rows) => {
-                        (g.x, g.y) = (x, y);
+                    Some(mut g) if (g.cols(), g.rows()) == size => {
+                        ((g.x, g.y), g.pane) = (origin, pane);
                         g
                     }
-                    _ => Grid::new(pv.pane, x, y, cols, rows, self.frame.default_bg),
+                    _ => Grid::new(pv.pane, pane, origin, size, self.term_bg),
                 };
                 self.frame.grids.push(grid);
             }
@@ -426,14 +441,29 @@ impl App {
                 pane.title = term.title().to_owned();
             }
         }
-        // ghostty's unfocused-split-opacity: a veil over the whole pane, padding included.
-        for pv in view.panes.iter().filter(|pv| split && !pv.active) {
-            let (x, y, w, h) = self.window_rect(pv.rect);
-            shapes.push(Shape::fill(x, y, w, h, theme::UNFOCUSED_DIM));
-        }
-        for &divider in &view.dividers {
-            let (x, y, w, h) = self.window_rect(divider);
-            shapes.push(Shape::fill(x, y, w, h, theme::DIVIDER));
+        // In GtkPaned's order: a split's first pane, its divider, its second
+        // pane. A pane's veil (ghostty's unfocused-split-opacity) covers the
+        // widget's own fractional rectangle, padding included.
+        let m = self.metrics.expect("metrics");
+        let mut dividers = view.dividers.iter().peekable();
+        for (i, pv) in view.panes.iter().enumerate() {
+            while let Some(d) = dividers.next_if(|d| d.after == i) {
+                let (x0, y0, mut x1, mut y1) = self.device_area(d.rect);
+                // The second pane, drawn after the divider, covers it from
+                // that pane's snapped edge on.
+                if d.horizontal {
+                    x1 = x1.min((f64::from(d.rect.x + d.rect.w) * m.scale).round());
+                } else {
+                    y1 = y1.min((f64::from(m.top + d.rect.y + d.rect.h) * m.scale).round());
+                }
+                let [r, g, b, _] = theme::adw::WINDOW_BG;
+                shapes.push(Shape::Area { x0, y0, x1, y1, color: [r, g, b], alpha: 1.0 });
+                shapes.push(Shape::Area { x0, y0, x1, y1, color: theme::DIVIDER_SHADOW, alpha: theme::DIVIDER_SHADOW_ALPHA });
+            }
+            if split && !pv.active {
+                let (x0, y0, x1, y1) = self.device_area(pv.rect);
+                shapes.push(Shape::Area { x0, y0, x1, y1, color: theme::UNFOCUSED_FILL, alpha: theme::UNFOCUSED_ALPHA });
+            }
         }
         if self.top > 0 {
             self.tab_bar_shapes(&mut shapes);
@@ -574,6 +604,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.window = Some(window);
         self.metrics = Some(metrics);
         let (session, effects) = Session::new(metrics);
+        self.window.as_ref().expect("window").set_min_size(session.min_area(), 0);
         self.session = Some(session);
         if !self.apply(effects) || self.panes.is_empty() {
             event_loop.exit();

@@ -5,7 +5,7 @@
 //! which places the divider from its previous size, and ghostty moves the
 //! divider back to the ratio only when it strays more than 0.001.
 
-use crate::{Metrics, PaneId, Rect};
+use crate::{Divider, Metrics, PaneId, Rect};
 
 #[derive(Clone, Debug)]
 pub(crate) enum Node {
@@ -275,12 +275,11 @@ impl Node {
         }
     }
 
-    /// The smallest size along an axis: a pane keeps one cell inside its
-    /// padding, like ghostty's split minimum size.
+    /// The smallest size along an axis, as GtkPaned measures it.
     pub(crate) fn min_size(&self, horizontal: bool, m: &Metrics) -> u32 {
         match self {
-            Node::Leaf(_) if horizontal => m.cell_width + 2 * m.padding_x,
-            Node::Leaf(_) => m.cell_height + 2 * m.padding_y,
+            Node::Leaf(_) if horizontal => m.min_width,
+            Node::Leaf(_) => m.min_height,
             Node::Split(s) => {
                 let (a, b) = (s.first.min_size(horizontal, m), s.second.min_size(horizontal, m));
                 if s.horizontal == horizontal { a + m.divider + b } else { a.max(b) }
@@ -289,13 +288,13 @@ impl Node {
     }
 
     /// Allocates `rect` to the tree, appending each pane's rectangle and each divider.
-    pub(crate) fn layout(&mut self, rect: Rect, m: &Metrics, panes: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<Rect>) {
+    pub(crate) fn layout(&mut self, rect: Rect, m: &Metrics, panes: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<Divider>) {
         match self {
             Node::Leaf(wp) => panes.push((*wp, rect)),
             Node::Split(s) => {
                 let (first, divider, second) = s.allocate(rect, m);
                 s.first.layout(first, m, panes, dividers);
-                dividers.push(divider);
+                dividers.push(Divider { rect: divider, after: panes.len(), horizontal: s.horizontal });
                 s.second.layout(second, m, panes, dividers);
             }
         }
@@ -354,13 +353,25 @@ mod tests {
     use super::*;
 
     const M: Metrics =
-        Metrics { width: 1276, height: 796, cell_width: 10, cell_height: 20, padding_x: 2, padding_y: 2, divider: 1 };
+        Metrics {
+        width: 1276,
+        height: 796,
+        top: 0,
+        divider: 1,
+        min_width: 14,
+        min_height: 24,
+        scale: 1.0,
+        cell_width: 10,
+        cell_height: 20,
+        padding_x: 2,
+        padding_y: 2,
+    };
     const AREA: Rect = Rect { x: 0, y: 0, w: 1276, h: 796 };
     const RIGHT: Side = Side { horizontal: true, before: false };
     const DOWN: Side = Side { horizontal: false, before: false };
 
     /// A layout by new GtkPaned widgets, as after each change of the tree.
-    fn layout(tree: &mut Node) -> (Vec<(PaneId, Rect)>, Vec<Rect>) {
+    fn layout(tree: &mut Node) -> (Vec<(PaneId, Rect)>, Vec<Divider>) {
         tree.rebuild();
         let (mut panes, mut dividers) = (Vec::new(), Vec::new());
         tree.layout(AREA, &M, &mut panes, &mut dividers);
@@ -406,7 +417,7 @@ mod tests {
         let (panes, dividers) = layout(&mut tree);
         // GtkPaned: round((1276 - 1) * 0.5) = 638 for the first child.
         assert_eq!(panes, vec![(0, rect(0, 0, 638, 796)), (1, rect(639, 0, 637, 796))]);
-        assert_eq!(dividers, vec![rect(638, 0, 1, 796)]);
+        assert_eq!(dividers, vec![Divider { rect: rect(638, 0, 1, 796), after: 1, horizontal: true }]);
     }
 
     #[test]

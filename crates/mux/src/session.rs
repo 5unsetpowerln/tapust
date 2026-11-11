@@ -46,7 +46,10 @@ impl Session {
         f(self);
         if !self.dead {
             // Other windows keep their layout until they are selected.
-            self.cur_mut().relayout();
+            let area = self.layout_area();
+            let w = self.cur_mut();
+            w.area = area;
+            w.relayout();
         }
         self.generation += 1;
         self.collect_effects(&before)
@@ -236,6 +239,23 @@ impl Session {
         }
     }
 
+    /// The smallest the pane area can be: the largest minimum of all the
+    /// windows' trees, as GTK raises a window's minimum size to its content's.
+    pub(crate) fn min_area_of_windows(&self) -> (u32, u32) {
+        let m = &self.metrics;
+        self.winlinks.values().fold((0, 0), |(w, h), win| {
+            (w.max(win.tree.min_size(true, m)), h.max(win.tree.min_size(false, m)))
+        })
+    }
+
+    /// The size libadwaita's tab view gives the selected page: a GTK window is
+    /// never smaller than its content's minimum, and the tab view's minimum
+    /// is the largest of all its pages, hidden ones included.
+    fn layout_area(&self) -> crate::Rect {
+        let (w, h) = self.min_area_of_windows();
+        crate::Rect { x: 0, y: 0, w: w.max(self.metrics.width), h: h.max(self.metrics.height) }
+    }
+
     /// The client's pixel geometry changed: every window takes the new area
     /// (the others are laid out for it when they are selected).
     pub(crate) fn set_metrics(&mut self, metrics: Metrics) {
@@ -337,9 +357,8 @@ impl Session {
         let w = self.cur_mut();
         let wp = w.active;
         w.push_zoom(true, false);
-        if !w.can_split(wp, side, full) {
-            return Err("no space for new pane".to_owned());
-        }
+        // ghostty always splits; a window too small for the new minimum is
+        // laid out at that minimum (see layout_area) and grows if it can.
         let pane = self.new_pane();
         let id = pane.id;
         let (w, point) = self.cur_point();
@@ -392,11 +411,12 @@ impl Session {
             return Err("adjustment too large".to_owned());
         };
         let m = w.metrics;
+        // tmux counts cells; ghostty moves dividers by logical pixels.
         let (horizontal, cell) = match dir {
-            Direction::Left | Direction::Right => (true, m.cell_width as i32),
-            Direction::Up | Direction::Down => (false, m.cell_height as i32),
+            Direction::Left | Direction::Right => (true, m.cell_width),
+            Direction::Up | Direction::Down => (false, m.cell_height),
         };
-        let amount = adjust.saturating_mul(cell);
+        let amount = (f64::from(adjust) * f64::from(cell) / m.scale).round().min(f64::from(i32::MAX)) as i32;
         let amount = if matches!(dir, Direction::Left | Direction::Up) { -amount } else { amount };
         w.resize_split(horizontal, amount);
         Ok(())

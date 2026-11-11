@@ -26,12 +26,16 @@ impl FrameCell {
     }
 }
 
-/// A pane's cells, drawn with cell (0, 0) at (`x`, `y`) in window pixels.
+/// A pane's cells, drawn with cell (0, 0) at (`x`, `y`) in window pixels,
+/// inside the pane's rectangle `pane` (x, y, width, height), which shows `bg`
+/// around the cells (ghostty's padding).
 pub struct Grid {
     /// Identifies the pane across frames, so the renderer can keep its work.
     pub id: u32,
     pub x: i32,
     pub y: i32,
+    pub pane: (i32, i32, u32, u32),
+    pub bg: [u8; 4],
     cols: u16,
     rows: u16,
     cells: Vec<FrameCell>,
@@ -39,11 +43,13 @@ pub struct Grid {
 }
 
 impl Grid {
-    pub fn new(id: u32, x: i32, y: i32, cols: u16, rows: u16, bg: [u8; 4]) -> Grid {
+    pub fn new(id: u32, pane: (i32, i32, u32, u32), (x, y): (i32, i32), (cols, rows): (u16, u16), bg: [u8; 4]) -> Grid {
         Grid {
             id,
             x,
             y,
+            pane,
+            bg,
             cols,
             rows,
             cells: vec![FrameCell::blank(bg); cols as usize * rows as usize],
@@ -109,30 +115,28 @@ pub struct FrameCursor {
 }
 
 /// Drawn above the grids, in window pixels.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Shape {
     /// A rectangle; `radius` rounds its corners and `ring` keeps only a 1px outline.
     Rect { x: i32, y: i32, w: i32, h: i32, color: [u8; 4], radius: u16, ring: bool },
     /// One line of text whose line box starts at (`x`, `y`).
     Text { x: i32, y: i32, text: String, color: [u8; 4], face: crate::font::Face },
-}
-
-impl Shape {
-    pub fn fill(x: i32, y: i32, w: i32, h: i32, color: [u8; 4]) -> Shape {
-        Shape::Rect { x, y, w, h, color, radius: 0, ring: false }
-    }
+    /// A rectangle with fractional edges, `color` at `alpha`; a pixel it
+    /// covers partly gets that part of the alpha, as GTK's renderer draws
+    /// widgets at fractional scales.
+    Area { x0: f64, y0: f64, x1: f64, y1: f64, color: [u8; 3], alpha: f64 },
 }
 
 pub struct Frame {
     pub grids: Vec<Grid>,
     pub cursors: Vec<FrameCursor>,
     pub shapes: Vec<Shape>,
-    /// The window background outside the grids (ghostty's padding color).
-    pub default_bg: [u8; 4],
+    /// The window background, wherever no pane is.
+    pub window_bg: [u8; 4],
 }
 
 impl Frame {
-    pub fn new(default_bg: [u8; 4]) -> Frame {
-        Frame { grids: Vec::new(), cursors: Vec::new(), shapes: Vec::new(), default_bg }
+    pub fn new(window_bg: [u8; 4]) -> Frame {
+        Frame { grids: Vec::new(), cursors: Vec::new(), shapes: Vec::new(), window_bg }
     }
 }
