@@ -683,3 +683,15 @@ fn new_window_after_shuffles_up() {
     ok(&mut s, Command::LastWindow);
     assert_eq!(s.current(), 1);
 }
+
+#[test]
+fn kill_window_by_id_leaves_the_current_window() {
+    let mut s = new_session();
+    ok(&mut s, Command::NewWindow { cwd_of_active: false, after: false });
+    ok(&mut s, Command::NewWindow { cwd_of_active: false, after: false });
+    let effects = s.kill_window_id(1);
+    assert!(effects.iter().any(|e| matches!(e, Effect::Destroy { .. })));
+    let ids: Vec<u32> = s.windows().iter().map(|w| w.id).collect();
+    assert_eq!(ids, vec![0, 2]);
+    assert_eq!(s.windows().iter().find(|w| w.active).map(|w| w.id), Some(2));
+}

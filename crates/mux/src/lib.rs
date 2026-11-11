@@ -353,6 +353,15 @@ impl Session {
         self.op(|s| s.destroy_pane(pane))
     }
 
+    /// kill-window -t @`id`.
+    pub fn kill_window_id(&mut self, id: u32) -> Vec<Effect> {
+        self.op(|s| {
+            if let Some(idx) = s.window_by_id(id) {
+                s.kill_window(idx);
+            }
+        })
+    }
+
     /// rename-window -t @`id`.
     pub fn rename_window_id(&mut self, id: u32, name: &str) {
         self.rename_window(id, name);

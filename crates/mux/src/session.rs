@@ -209,7 +209,7 @@ impl Session {
     }
 
     /// server_kill_window(w, 1)
-    fn kill_window(&mut self, idx: u32) {
+    pub(crate) fn kill_window(&mut self, idx: u32) {
         if let Some(w) = self.winlinks.get_mut(&idx) {
             w.unzoom();
         }
