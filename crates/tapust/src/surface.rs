@@ -44,6 +44,8 @@ pub enum Event {
     PastePrimary,
     /// The surface's selection appeared or went away (the Copy action).
     SelectionChanged,
+    /// A touchpad swipe asks for the next (or previous) tab.
+    SwipeTab { next: bool },
     /// A right click not reported to the program opens the context menu.
     ContextMenu { pane: PaneId, x: f64, y: f64 },
     /// The cell size in device pixels is known or changed (ghostty's
@@ -125,6 +127,10 @@ pub struct Surface {
     precision_scroll: Cell<bool>,
     /// Wheel movement not yet worth a row (ghostty's pending_scroll_y).
     pending_scroll: Cell<f64>,
+    /// Horizontal touchpad movement toward a tab switch, and the timer that
+    /// forgets it.
+    pending_swipe: Cell<f64>,
+    swipe_reset: RefCell<Option<glib::SourceId>>,
     selection: RefCell<Option<Selection>>,
     gesture: RefCell<Gesture>,
     /// Mouse buttons held (bit per button number), for motion reports.
@@ -337,6 +343,8 @@ impl Surface {
             pointer: Cell::new((0.0, 0.0)),
             precision_scroll: Cell::new(false),
             pending_scroll: Cell::new(0.0),
+            pending_swipe: Cell::new(0.0),
+            swipe_reset: RefCell::new(None),
             selection: RefCell::new(None),
             gesture: RefCell::new(Gesture::default()),
             buttons: Cell::new(0),
@@ -551,6 +559,14 @@ impl Surface {
             glib::Propagation::Stop
         });
         self.area.add_controller(wheel);
+        let tilt = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::HORIZONTAL);
+        let weak = Rc::downgrade(self);
+        tilt.connect_scroll(move |tilt, dx, _| {
+            let Some(s) = weak.upgrade() else { return glib::Propagation::Proceed };
+            s.horizontal_scroll(dx, tilt.unit(), tilt.current_event_state());
+            glib::Propagation::Stop
+        });
+        self.area.add_controller(tilt);
 
         let weak = Rc::downgrade(self);
         self.im.connect_preedit_start(move |_| {
@@ -939,7 +955,7 @@ impl Surface {
                 }
                 (self.handler)(Event::ContextMenu { pane: self.pane, x, y });
             }
-            mouse::Button::Four | mouse::Button::Five => {}
+            mouse::Button::Four | mouse::Button::Five | mouse::Button::Six | mouse::Button::Seven => {}
         }
     }
 
@@ -1258,6 +1274,45 @@ impl Surface {
         }
         drop(term);
         shared.write(&bytes);
+    }
+
+    /// ghostty's ecMouseScrollHorizontal: a touchpad swipe past 120 units
+    /// switches tabs (negative to the next), forgotten after 500ms without
+    /// input; a tilted wheel is reported as buttons 6 and 7 to a program
+    /// that asks for the mouse.
+    fn horizontal_scroll(self: &Rc<Self>, dx: f64, unit: gdk::ScrollUnit, state: gdk::ModifierType) {
+        if unit == gdk::ScrollUnit::Surface {
+            if let Some(id) = self.swipe_reset.take() {
+                id.remove();
+            }
+            let pending = self.pending_swipe.get() + dx;
+            if pending.abs() < theme::SWIPE_TAB {
+                self.pending_swipe.set(pending);
+                let weak = Rc::downgrade(self);
+                let id = glib::timeout_add_local_once(theme::SWIPE_RESET, move || {
+                    if let Some(s) = weak.upgrade() {
+                        s.swipe_reset.take();
+                        s.pending_swipe.set(0.0);
+                    }
+                });
+                *self.swipe_reset.borrow_mut() = Some(id);
+                return;
+            }
+            self.pending_swipe.set(0.0);
+            (self.handler)(Event::SwipeTab { next: pending < 0.0 });
+            return;
+        }
+        let delta = (-dx * self.font_scale.get()).round() as i64;
+        if delta == 0 {
+            return;
+        }
+        let button = if delta > 0 { mouse::Button::Six } else { mouse::Button::Seven };
+        let mods = mods_of(state);
+        for _ in 0..delta.unsigned_abs() {
+            if !self.report(Some(button), mouse::Action::Press, mods) {
+                return;
+            }
+        }
     }
 
     /// The grid cell under the pointer, clamped to the grid, and the

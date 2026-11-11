@@ -12,6 +12,10 @@ pub enum Button {
     Four,
     /// Wheel down.
     Five,
+    /// Wheel tilted right.
+    Six,
+    /// Wheel tilted left.
+    Seven,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -63,6 +67,8 @@ fn button_code(mode: MouseMode, encoding: MouseEncoding, event: &Event) -> u8 {
         Some(Button::Right) => 2,
         Some(Button::Four) => 64,
         Some(Button::Five) => 65,
+        Some(Button::Six) => 66,
+        Some(Button::Seven) => 67,
     };
     if mode != MouseMode::X10 {
         let m = event.mods;

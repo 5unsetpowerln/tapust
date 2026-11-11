@@ -70,3 +70,8 @@ pub const SCROLL_PRECISION: f64 = 1.0;
 pub const CLICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 /// How often ghostty scrolls while a selection is dragged past the edge.
 pub const SELECTION_SCROLL: std::time::Duration = std::time::Duration::from_millis(15);
+
+/// ghostty's gtk-horizontal-tab-scroll: touchpad units to a tab switch, and
+/// how long the movement is remembered.
+pub const SWIPE_TAB: f64 = 120.0;
+pub const SWIPE_RESET: std::time::Duration = std::time::Duration::from_millis(500);

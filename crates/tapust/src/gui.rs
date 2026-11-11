@@ -684,6 +684,14 @@ impl App {
                 });
                 true
             }
+            Event::SwipeTab { next } => {
+                if next {
+                    self.tab_view.select_next_page();
+                } else {
+                    self.tab_view.select_previous_page();
+                }
+                true
+            }
             Event::ContextMenu { pane, x, y } => {
                 // ghostty's menu signal: actions are synced before it opens.
                 self.sync_copy_action();
