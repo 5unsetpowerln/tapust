@@ -15,7 +15,9 @@ mod term;
 #[cfg(test)]
 mod tests;
 
-pub use cell::{Attrs, Cell, Color, Style, StyleId, Underline, Width};
+pub use cell::{Attrs, Cell, Color, Semantic, Style, StyleId, Underline, Width};
+pub use grid::PromptMark;
+pub use term::PromptClick;
 
 /// Columns `c` takes on the grid: 1 or 2, 0 for controls and combining marks.
 pub fn char_width(c: char) -> usize {
@@ -250,6 +252,26 @@ impl Terminal {
     /// The working directory reported with OSC 7, as a path.
     pub fn reported_cwd(&self) -> Option<&str> {
         self.term.cwd.as_deref()
+    }
+
+    /// ghostty's cursorIsAtPrompt: never on the alternate screen; on a row
+    /// marked as a prompt, or while the shell prints its prompt or input.
+    pub fn cursor_at_prompt(&self) -> bool {
+        let t = &self.term;
+        if t.alt_active {
+            return false;
+        }
+        t.grid.meta(t.y).prompt != PromptMark::None || t.semantic != Semantic::Output
+    }
+
+    /// How a click at the prompt should move the cursor, if the shell said.
+    pub fn prompt_click(&self) -> Option<&PromptClick> {
+        self.term.prompt_click.as_ref()
+    }
+
+    /// The prompt mark of absolute line `line`.
+    pub fn line_prompt(&self, line: u64) -> PromptMark {
+        self.line_slot(line).map_or(PromptMark::None, |slot| self.term.grid.slot_meta(slot).prompt)
     }
 
     /// The pointer's CSS cursor name: `text`, `default` while reporting the

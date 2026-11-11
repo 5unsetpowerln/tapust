@@ -23,7 +23,8 @@ pub enum Width {
 /// - bits 0..21: Unicode scalar value (0 means empty)
 /// - bits 21..23: [`Width`]
 /// - bit 23: the cell has extra (combining) codepoints in its row's grapheme table
-/// - bits 24..32: reserved
+/// - bits 24..26: [`Semantic`] content (OSC 133) of a printed cell
+/// - bits 26..32: reserved
 /// - bits 32..48: style id (0 = default style)
 /// - bits 48..64: reserved
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -37,6 +38,8 @@ impl Cell {
     const WIDTH_SHIFT: u32 = 21;
     const GRAPHEME_BIT: u64 = 1 << 23;
     const STYLE_SHIFT: u32 = 32;
+    pub(crate) const SEMANTIC_SHIFT: u32 = 24;
+    pub(crate) const SEMANTIC_MASK: u64 = 3 << Self::SEMANTIC_SHIFT;
 
     #[inline(always)]
     pub const fn new(cp: u32, width: Width, style: StyleId) -> Cell {
@@ -50,6 +53,16 @@ impl Cell {
     }
 
     #[inline(always)]
+    /// What the shell said the cell is (OSC 133): output unless printed
+    /// while a prompt or the input was being written.
+    pub fn semantic(self) -> Semantic {
+        match (self.0 & Self::SEMANTIC_MASK) >> Self::SEMANTIC_SHIFT {
+            1 => Semantic::Prompt,
+            2 => Semantic::Input,
+            _ => Semantic::Output,
+        }
+    }
+
     pub fn char(self) -> Option<char> {
         match self.codepoint() {
             0 => None,
@@ -165,4 +178,13 @@ impl Style {
         underline: Underline::None,
         attrs: Attrs(0),
     };
+}
+
+/// ghostty's semantic content of a cell, from OSC 133 shell integration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Semantic {
+    #[default]
+    Output = 0,
+    Prompt = 1,
+    Input = 2,
 }

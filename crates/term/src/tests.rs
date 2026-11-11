@@ -1125,3 +1125,27 @@ fn mouse_shape_follows_osc_22_and_reporting() {
     feed(&mut t, "\x1b[?1000l");
     assert_eq!(t.mouse_shape(), "text");
 }
+
+#[test]
+fn osc_133_marks_prompts_input_and_output() {
+    use crate::{PromptClick, PromptMark, Semantic};
+    let mut t = term(20, 4);
+    assert!(!t.cursor_at_prompt());
+    feed(&mut t, "out\x1b]133;A;click_events=1\x07$ \x1b]133;B\x07ls");
+    // A fresh line was started for the prompt.
+    let top = t.view_top();
+    assert_eq!(t.line_prompt(top + 1), PromptMark::Prompt);
+    assert!(t.cursor_at_prompt());
+    assert_eq!(t.prompt_click(), Some(&PromptClick::Events(true)));
+    let row = t.line(top + 1).unwrap();
+    assert_eq!((row[0].semantic(), row[2].semantic()), (Semantic::Prompt, Semantic::Input));
+    feed(&mut t, "\r\n\x1b]133;C\x07file\r\n\x1b]133;D;0\x07");
+    assert!(!t.cursor_at_prompt());
+    assert_eq!(t.line(top + 2).unwrap()[0].semantic(), Semantic::Output);
+    // A multi-line prompt continues on the next row.
+    feed(&mut t, "\x1b]133;A\x07a\r\nb");
+    assert_eq!(t.line_prompt(t.end_line() - 1), PromptMark::Continuation);
+    // The alternate screen is never at a prompt.
+    feed(&mut t, "\x1b[?1049h");
+    assert!(!t.cursor_at_prompt());
+}

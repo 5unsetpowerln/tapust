@@ -11,12 +11,23 @@ const FREE: u16 = u16::MAX;
 /// Upper bound of a grapheme cluster's UTF-8 length.
 const MAX_GRAPHEME: usize = 256;
 
+/// ghostty's row semantic_prompt values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PromptMark {
+    #[default]
+    None,
+    Prompt,
+    Continuation,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RowMeta {
     /// Upper bound of the written columns: cells at `occ..` are `Cell::EMPTY`.
     pub occ: u16,
     /// The row was soft-wrapped and its logical line continues on the next row.
     pub wrapped: bool,
+    /// ghostty's row semantic_prompt: the row starts a prompt or continues one.
+    pub prompt: PromptMark,
     /// Entries of `graphemes` in use, oldest first.
     glen: u32,
     /// Combining codepoints: (column, base character followed by its marks).
@@ -287,6 +298,7 @@ impl Grid {
             m.occ = cols as u16;
         }
         m.wrapped = false;
+        m.prompt = PromptMark::None;
         m.clear_graphemes();
     }
 

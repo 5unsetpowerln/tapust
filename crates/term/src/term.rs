@@ -4,8 +4,8 @@ use std::io::Write as _;
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::cell::{Cell, StyleId, Width};
-use crate::grid::{Grid, ReflowCursor, attach_mark, blankify};
+use crate::cell::{Cell, Semantic, StyleId, Width};
+use crate::grid::{Grid, PromptMark, ReflowCursor, attach_mark, blankify};
 use crate::palette::{default_palette, parse_color};
 use crate::parser::Params;
 use crate::style::{Pen, StyleTable, apply_sgr};
@@ -137,6 +137,12 @@ pub(crate) struct Term {
     pub focused: bool,
     /// The pointer's CSS cursor name (OSC 22, mouse reporting).
     pub mouse_shape: &'static str,
+    /// ghostty's cursor semantic_content: what the shell is printing now
+    /// (OSC 133), and whether input ends at the end of the line.
+    pub semantic: Semantic,
+    semantic_clear_eol: bool,
+    /// How a click at the prompt moves the cursor (OSC 133;A options).
+    pub prompt_click: Option<PromptClick>,
     top: usize,
     bottom: usize,
     tabs: Vec<bool>,
@@ -190,6 +196,9 @@ impl Term {
             cursor_blink: true,
             focused: true,
             mouse_shape: "text",
+            semantic: Semantic::Output,
+            semantic_clear_eol: false,
+            prompt_click: None,
             top: 0,
             bottom: rows - 1,
             tabs: default_tabs(cols),
@@ -278,7 +287,7 @@ impl Term {
         self.other.remap_styles(&remap);
         // Printing may hold the template across this call, so resolve it now.
         let id = self.styles.intern(self.pen).unwrap_or(StyleId::DEFAULT);
-        self.tpl = (id.0 as u64) << 32;
+        self.tpl = (id.0 as u64) << 32 | self.semantic_bits();
         self.tpl_pen = self.pen;
         self.pen_dirty = false;
         self.blank_dirty = true;
@@ -291,7 +300,7 @@ impl Term {
             self.pen_dirty = false;
             if self.pen != self.tpl_pen {
                 let pen = self.pen;
-                self.tpl = (self.intern(pen).0 as u64) << 32;
+                self.tpl = (self.intern(pen).0 as u64) << 32 | self.semantic_bits();
                 self.tpl_pen = pen;
             }
         }
@@ -626,6 +635,80 @@ impl Term {
             self.mark_all_dirty();
         } else if self.y + 1 < self.rows {
             self.y += 1;
+        }
+        if self.semantic != Semantic::Output {
+            self.semantic_line_end();
+        }
+    }
+
+    /// ghostty's index for a prompt or input line: input that ends at the
+    /// end of the line becomes output, otherwise the new row continues the
+    /// prompt.
+    #[cold]
+    fn semantic_line_end(&mut self) {
+        if self.semantic_clear_eol {
+            self.set_semantic(Semantic::Output, false);
+        } else {
+            self.grid.meta_mut(self.y).prompt = PromptMark::Continuation;
+        }
+    }
+
+    fn semantic_bits(&self) -> u64 {
+        (self.semantic as u64) << Cell::SEMANTIC_SHIFT
+    }
+
+    fn set_semantic(&mut self, semantic: Semantic, clear_eol: bool) {
+        self.semantic = semantic;
+        self.semantic_clear_eol = clear_eol;
+        self.tpl = (self.tpl & !Cell::SEMANTIC_MASK) | self.semantic_bits();
+    }
+
+    /// ghostty's semanticPromptFreshLine: a new line unless at its start.
+    fn fresh_line(&mut self) {
+        if self.x != 0 {
+            self.carriage_return();
+            self.index();
+        }
+    }
+
+    /// OSC 133 (ghostty's Terminal.semanticPrompt).
+    fn semantic_prompt(&mut self, rest: &[u8]) {
+        let (&action, options) = match rest.split_first() {
+            Some((a, [])) => (a, &[][..]),
+            Some((a, [b';', options @ ..])) => (a, options),
+            _ => return,
+        };
+        let option = |key: &[u8]| {
+            options.split(|&b| b == b';').find_map(|kv| kv.strip_prefix(key).and_then(|v| v.strip_prefix(b"=")))
+        };
+        let prompt = |t: &mut Self| {
+            let continuation = matches!(option(b"k"), Some(b"c" | b"s"));
+            t.set_semantic(Semantic::Prompt, false);
+            t.grid.meta_mut(t.y).prompt = if continuation { PromptMark::Continuation } else { PromptMark::Prompt };
+        };
+        match action {
+            b'A' | b'N' => {
+                self.fresh_line();
+                prompt(self);
+                if let Some(v) = option(b"click_events") {
+                    self.prompt_click = Some(PromptClick::Events(v == b"1"));
+                } else if let Some(v) = option(b"cl") {
+                    self.prompt_click = Some(PromptClick::Cl(String::from_utf8_lossy(v).into_owned()));
+                }
+            }
+            b'P' => prompt(self),
+            b'B' => self.set_semantic(Semantic::Input, false),
+            b'I' => self.set_semantic(Semantic::Input, true),
+            b'C' => {
+                self.set_semantic(Semantic::Output, false);
+                let meta = self.grid.meta_mut(self.y);
+                if meta.prompt != PromptMark::None && self.x == 0 {
+                    meta.prompt = PromptMark::None;
+                }
+            }
+            b'D' => self.set_semantic(Semantic::Output, false),
+            b'L' if options.is_empty() => self.fresh_line(),
+            _ => {}
         }
     }
 
@@ -1298,6 +1381,7 @@ impl Term {
                 self.mark_all_dirty();
             }
             7 => self.cwd = parse_cwd(rest),
+            133 => self.semantic_prompt(rest),
             22 => {
                 if rest.is_empty() {
                     self.mouse_shape = if self.modes.mouse_mode == MouseMode::None { "text" } else { "default" };
@@ -1392,6 +1476,15 @@ impl Term {
         self.dirty.rows = vec![0; rows.div_ceil(64)];
         self.set_all_dirty();
     }
+}
+
+/// How the shell wants clicks at its prompt (OSC 133;A click_events or cl).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PromptClick {
+    /// click_events=1: clicks are reported as SGR mouse events.
+    Events(bool),
+    /// cl=line, cl=m, cl=v or cl=w: clicks move the cursor with arrow keys.
+    Cl(String),
 }
 
 /// ghostty's OSC 22 names: CSS cursor names and their X11 aliases, as CSS.
