@@ -44,6 +44,8 @@ pub enum Event {
     PastePrimary,
     /// The surface's selection appeared or went away (the Copy action).
     SelectionChanged,
+    /// A right click not reported to the program opens the context menu.
+    ContextMenu { pane: PaneId, x: f64, y: f64 },
     /// The cell size in device pixels is known or changed (ghostty's
     /// cell_size action).
     CellSize { cell: (u32, u32) },
@@ -139,6 +141,8 @@ pub struct Surface {
     cursor: Cell<&'static str>,
     /// The link under the pointer while ctrl is held, and its text.
     hover: RefCell<Option<(Selection, String)>>,
+    /// ghostty's context_menu, made on the first right click.
+    menu: RefCell<Option<gtk::PopoverMenu>>,
     last_blink_reset: Cell<Option<Instant>>,
     font_scale: Cell<f64>,
     cell_idle: Cell<bool>,
@@ -166,6 +170,14 @@ fn resolve_path(dir: &str, path: &str) -> String {
         }
     }
     format!("/{}", parts.join("/"))
+}
+
+impl Drop for Surface {
+    fn drop(&mut self) {
+        if let Some(menu) = self.menu.take() {
+            menu.unparent();
+        }
+    }
 }
 
 /// ghostty's internal_os.open on Linux.
@@ -334,6 +346,7 @@ impl Surface {
             mods: Cell::new(mouse::Mods::default()),
             cursor: Cell::new("text"),
             hover: RefCell::new(None),
+            menu: RefCell::new(None),
             last_blink_reset: Cell::new(None),
             font_scale: Cell::new(0.0),
             cell_idle: Cell::new(false),
@@ -924,6 +937,7 @@ impl Surface {
                     self.set_selection(Some(word));
                     self.copy_primary();
                 }
+                (self.handler)(Event::ContextMenu { pane: self.pane, x, y });
             }
             mouse::Button::Four | mouse::Button::Five => {}
         }
@@ -1032,6 +1046,24 @@ impl Surface {
         if let Some((id, _)) = self.autoscroll.take() {
             id.remove();
         }
+    }
+
+    /// Opens ghostty's context menu at (`x`, `y`) on the GLArea; closing it
+    /// gives the surface its focus back.
+    pub fn popup_menu(&self, x: f64, y: f64) {
+        let menu = self.menu.borrow_mut().get_or_insert_with(|| {
+            let menu = gtk::PopoverMenu::from_model_full(&crate::gui::context_menu(), gtk::PopoverMenuFlags::NESTED);
+            menu.set_halign(gtk::Align::Start);
+            menu.set_has_arrow(false);
+            menu.set_parent(&self.area);
+            let area = self.area.clone();
+            menu.connect_closed(move |_| {
+                area.grab_focus();
+            });
+            menu
+        }).clone();
+        menu.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        menu.popup();
     }
 
     /// ghostty's link hover: with exactly ctrl held (shift too while a

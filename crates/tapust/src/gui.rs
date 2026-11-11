@@ -237,25 +237,77 @@ fn split_menu() -> gio::Menu {
     menu
 }
 
+fn section(items: &[(&str, &str)]) -> gio::Menu {
+    let s = gio::Menu::new();
+    for (label, action) in items {
+        menu_item(&s, label, action);
+    }
+    s
+}
+
+fn targeted(label: &str, action: &str, target: &str) -> gio::MenuItem {
+    let item = gio::MenuItem::new(Some(label), None);
+    item.set_action_and_target_value(Some(action), Some(&target.to_variant()));
+    item
+}
+
+/// ghostty's Config submenu; tapust has no configuration to act on.
+fn config_menu() -> gio::Menu {
+    let config = gio::Menu::new();
+    config.append_item(&targeted("Open Configuration in OS Editor", "app.open-config", "os-open"));
+    config.append_item(&targeted("Open Configuration in New Window", "app.open-config", "new-window"));
+    menu_item(&config, "Reload Configuration", "app.reload-config");
+    config
+}
+
+/// ghostty's context_menu_model for the surface.
+pub fn context_menu() -> gio::Menu {
+    let menu = gio::Menu::new();
+    menu.append_section(
+        None,
+        &section(&[
+            ("Copy", "win.copy"),
+            ("Paste", "win.paste"),
+            ("Notify on Next Command Finish", "win.notify-on-next-command-finish"),
+        ]),
+    );
+    menu.append_section(None, &section(&[("Clear", "win.clear"), ("Reset", "win.reset")]));
+    let split = section(&[
+        ("Change Title\u{2026}", "win.prompt-surface-title"),
+        ("Split Up", "win.split-up"),
+        ("Split Down", "win.split-down"),
+        ("Split Left", "win.split-left"),
+        ("Split Right", "win.split-right"),
+        ("Close Split", "win.close-split"),
+    ]);
+    let tab = section(&[("Change Tab Title\u{2026}", "win.prompt-tab-title"), ("New Tab", "win.new-tab")]);
+    tab.append_item(&targeted("Close Tab", "win.close-tab", "this"));
+    let window = section(&[
+        ("Change Window Title\u{2026}", "win.prompt-window-title"),
+        ("New Window", "win.new-window"),
+        ("Close Window", "win.close"),
+    ]);
+    let submenus = gio::Menu::new();
+    submenus.append_submenu(Some("Split"), &split);
+    submenus.append_submenu(Some("Tab"), &tab);
+    submenus.append_submenu(Some("Window"), &window);
+    menu.append_section(None, &submenus);
+    let config = gio::Menu::new();
+    config.append_submenu(Some("Config"), &config_menu());
+    menu.append_section(None, &config);
+    menu
+}
+
 /// ghostty's main_menu.
 fn main_menu() -> gio::Menu {
     let menu = gio::Menu::new();
-    let section = |items: &[(&str, &str)]| {
-        let s = gio::Menu::new();
-        for (label, action) in items {
-            menu_item(&s, label, action);
-        }
-        s
-    };
     menu.append_section(None, &section(&[("Copy", "win.copy"), ("Paste", "win.paste")]));
     menu.append_section(
         None,
         &section(&[("Change Window Title\u{2026}", "win.prompt-window-title"), ("New Window", "win.new-window"), ("Close Window", "win.close")]),
     );
     let tab = section(&[("Change Tab Title\u{2026}", "win.prompt-tab-title"), ("New Tab", "win.new-tab")]);
-    let close_tab = gio::MenuItem::new(Some("Close Tab"), None);
-    close_tab.set_action_and_target_value(Some("win.close-tab"), Some(&"this".to_variant()));
-    tab.append_item(&close_tab);
+    tab.append_item(&targeted("Close Tab", "win.close-tab", "this"));
     menu.append_section(None, &tab);
     let split = section(&[
         ("Change Title\u{2026}", "win.prompt-surface-title"),
@@ -269,15 +321,7 @@ fn main_menu() -> gio::Menu {
     menu.append_section(None, &splits);
     menu.append_section(None, &section(&[("Clear", "win.clear"), ("Reset", "win.reset")]));
     let tools = section(&[("Command Palette", "win.toggle-command-palette"), ("Terminal Inspector", "win.toggle-inspector")]);
-    let config = gio::Menu::new();
-    let os_open = gio::MenuItem::new(Some("Open Configuration in OS Editor"), None);
-    os_open.set_action_and_target_value(Some("app.open-config"), Some(&"os-open".to_variant()));
-    config.append_item(&os_open);
-    let new_window = gio::MenuItem::new(Some("Open Configuration in New Window"), None);
-    new_window.set_action_and_target_value(Some("app.open-config"), Some(&"new-window".to_variant()));
-    config.append_item(&new_window);
-    menu_item(&config, "Reload Configuration", "app.reload-config");
-    tools.append_submenu(Some("Config"), &config);
+    tools.append_submenu(Some("Config"), &config_menu());
     menu.append_section(None, &tools);
     menu.append_section(None, &section(&[("About tapust", "win.about"), ("Quit", "app.quit")]));
     menu
@@ -513,6 +557,7 @@ impl App {
             }
         }));
         add("close", Box::new(|app| app.confirm_close_window()));
+        add("close-split", Box::new(|app| app.confirm_close_split()));
         add("copy", Box::new(|app| app.copy()));
         add("paste", Box::new(|app| app.paste()));
         add("reset", Box::new(|app| app.reset()));
@@ -637,6 +682,14 @@ impl App {
                         app.paste_text(&text, false);
                     }
                 });
+                true
+            }
+            Event::ContextMenu { pane, x, y } => {
+                // ghostty's menu signal: actions are synced before it opens.
+                self.sync_copy_action();
+                if let Some(p) = self.state.borrow().panes.get(&pane) {
+                    p.surface.popup_menu(x, y);
+                }
                 true
             }
             Event::SelectionChanged => {
@@ -1221,6 +1274,20 @@ impl App {
                 && response == "close"
             {
                 app.command(Command::KillWindow);
+            }
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    /// ghostty's close-split confirmation.
+    fn confirm_close_split(self: &Rc<Self>) {
+        let dialog = close_dialog("Close Split?", "The currently running process in this split will be terminated.");
+        let weak = Rc::downgrade(self);
+        dialog.connect_response(None, move |_, response| {
+            if let Some(app) = weak.upgrade()
+                && response == "close"
+            {
+                app.command(Command::KillPane);
             }
         });
         dialog.present(Some(&self.window));
