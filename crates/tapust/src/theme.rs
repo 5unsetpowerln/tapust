@@ -75,3 +75,13 @@ pub const SELECTION_SCROLL: std::time::Duration = std::time::Duration::from_mill
 /// how long the movement is remembered.
 pub const SWIPE_TAB: f64 = 120.0;
 pub const SWIPE_RESET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Blueprint's `styles [...]`: adds style classes to those the widget sets
+/// itself. Setting `css-classes` would drop them, such as the `horizontal`
+/// of an oriented widget, which some of libadwaita's sizes depend on.
+pub fn styled<W: gtk::prelude::IsA<gtk::Widget>>(widget: W, classes: &[&str]) -> W {
+    for class in classes {
+        gtk::prelude::WidgetExt::add_css_class(&widget, class);
+    }
+    widget
+}

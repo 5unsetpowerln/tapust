@@ -117,7 +117,7 @@ impl SplitWidget {
         let paned = gtk::Paned::builder().orientation(orientation).shrink_start_child(false).shrink_end_child(false).build();
         paned.set_start_child(Some(start));
         paned.set_end_child(Some(end));
-        let bin = adw::Bin::builder().css_classes(["split"]).child(&adw::Bin::builder().child(&paned).build()).build();
+        let bin = theme::styled(adw::Bin::builder().child(&adw::Bin::builder().child(&paned).build()).build(), &["split"]);
         let split = Rc::new(SplitWidget {
             bin,
             paned,
@@ -1085,7 +1085,10 @@ impl App {
                 let tree_bin = adw::Bin::builder().hexpand(true).vexpand(true).build();
                 let split_tree = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
                 split_tree.append(&tree_bin);
-                let tab = gtk::Box::builder().orientation(gtk::Orientation::Vertical).hexpand(true).vexpand(true).css_classes(["tab"]).build();
+                let tab = theme::styled(
+                    gtk::Box::builder().orientation(gtk::Orientation::Vertical).hexpand(true).vexpand(true).build(),
+                    &["tab"],
+                );
                 tab.append(&split_tree);
                 let page = self.tab_view.append(&tab);
                 self.state.borrow_mut().tabs.insert(info.id, Tab { page, tree_bin, built: None, splits: Vec::new() });
@@ -1502,19 +1505,24 @@ impl App {
         let view = gtk::TextView::builder().cursor_visible(false).editable(false).monospace(true).build();
         view.buffer().set_text(text);
         let scroll = gtk::ScrolledWindow::builder().child(&view).build();
-        let stack = gtk::Stack::builder().css_classes(["clipboard-contents"]).width_request(500).height_request(200).build();
+        let stack = theme::styled(
+            gtk::Stack::builder().width_request(500).height_request(200).build(),
+            &["clipboard-contents"],
+        );
         stack.add_titled(&scroll, Some("part-0"), "text/plain;charset=utf-8");
-        let overlay = gtk::Overlay::builder().css_classes(["osd", "clipboard-overlay"]).child(&stack).build();
+        let overlay = theme::styled(gtk::Overlay::builder().child(&stack).build(), &["osd", "clipboard-overlay"]);
         let parts = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
         parts.append(&overlay);
         // The remember switch is hidden for pastes but stays in the list,
         // where it keeps the parts row from being the last row.
-        let remember = adw::SwitchRow::builder()
-            .title("Remember choice for this split")
-            .subtitle("Reload configuration to show this prompt again")
-            .css_classes(["card"])
-            .visible(false)
-            .build();
+        let remember = theme::styled(
+            adw::SwitchRow::builder()
+                .title("Remember choice for this split")
+                .subtitle("Reload configuration to show this prompt again")
+                .visible(false)
+                .build(),
+            &["card"],
+        );
         let list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).build();
         list.append(&parts);
         list.append(&remember);

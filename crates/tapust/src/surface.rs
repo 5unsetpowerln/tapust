@@ -250,17 +250,19 @@ impl Surface {
         let overlay = gtk::Overlay::builder().focusable(false).focus_on_click(false).child(&page).build();
 
         // ghostty's ResizeOverlay: a centered `background` label shown 750 ms.
-        let resize_label = gtk::Label::builder()
-            .css_classes(["background", "resize-overlay"])
-            .can_focus(false)
-            .can_target(false)
-            .focusable(false)
-            .focus_on_click(false)
-            .selectable(false)
-            .justify(gtk::Justification::Center)
-            .halign(gtk::Align::Center)
-            .valign(gtk::Align::Center)
-            .build();
+        let resize_label = theme::styled(
+            gtk::Label::builder()
+                .can_focus(false)
+                .can_target(false)
+                .focusable(false)
+                .focus_on_click(false)
+                .selectable(false)
+                .justify(gtk::Justification::Center)
+                .halign(gtk::Align::Center)
+                .valign(gtk::Align::Center)
+                .build(),
+            &["background", "resize-overlay"],
+        );
         let inner = adw::Bin::builder().child(&resize_label).build();
         let resize_bin = adw::Bin::builder()
             .visible(false)
@@ -273,7 +275,10 @@ impl Surface {
         overlay.add_overlay(&resize_bin);
         // ghostty's url_left and url_right: the hovered link's text.
         let url_label = |align| {
-            gtk::Label::builder().css_classes(["background", "url-overlay"]).visible(false).halign(align).valign(gtk::Align::End).build()
+            theme::styled(
+                gtk::Label::builder().visible(false).halign(align).valign(gtk::Align::End).build(),
+                &["background", "url-overlay"],
+            )
         };
         let (url_left, url_right) = (url_label(gtk::Align::Start), url_label(gtk::Align::End));
         let url_motion = gtk::EventControllerMotion::new();
@@ -286,27 +291,27 @@ impl Surface {
         overlay.add_overlay(&url_right);
 
         let veil = gtk::Revealer::builder().transition_duration(0).can_focus(false).can_target(false).focusable(false).build();
-        veil.set_child(Some(&gtk::DrawingArea::builder().css_classes(["unfocused-split"]).build()));
+        veil.set_child(Some(&theme::styled(gtk::DrawingArea::builder().build(), &["unfocused-split"])));
         overlay.add_overlay(&veil);
 
-        let drag_handle = gtk::CenterBox::builder()
-            .halign(gtk::Align::Fill)
-            .valign(gtk::Align::Start)
-            .visible(false)
-            .css_classes(["drag-handle"])
-            .build();
+        let drag_handle = theme::styled(
+            gtk::CenterBox::builder().halign(gtk::Align::Fill).valign(gtk::Align::Start).visible(false).build(),
+            &["drag-handle"],
+        );
         drag_handle.set_center_widget(Some(&gtk::Image::from_icon_name("view-more-horizontal-symbolic")));
         drag_handle.set_cursor_from_name(Some("grab"));
         overlay.add_overlay(&drag_handle);
 
-        let drop_overlay = gtk::DrawingArea::builder()
-            .halign(gtk::Align::Fill)
-            .valign(gtk::Align::Fill)
-            .can_focus(false)
-            .can_target(false)
-            .focusable(false)
-            .css_classes(["drop-overlay"])
-            .build();
+        let drop_overlay = theme::styled(
+            gtk::DrawingArea::builder()
+                .halign(gtk::Align::Fill)
+                .valign(gtk::Align::Fill)
+                .can_focus(false)
+                .can_target(false)
+                .focusable(false)
+                .build(),
+            &["drop-overlay"],
+        );
         overlay.add_overlay(&drop_overlay);
 
         let scroll_bin = SurfaceBin::new(&overlay);
