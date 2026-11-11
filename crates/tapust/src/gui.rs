@@ -555,6 +555,17 @@ impl App {
     }
 
     fn start_timers(self: &Rc<Self>) {
+        // ghostty's termios timer: polls each PTY for a password prompt.
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(theme::TERMIOS_POLL, move || {
+            let Some(app) = weak.upgrade() else { return glib::ControlFlow::Break };
+            for p in app.state.borrow().panes.values() {
+                if let Some(io) = &p.io {
+                    p.surface.set_password_input(io.shared.password_input());
+                }
+            }
+            glib::ControlFlow::Continue
+        });
         let weak = Rc::downgrade(self);
         glib::timeout_add_local(NAME_INTERVAL, move || {
             let Some(app) = weak.upgrade() else { return glib::ControlFlow::Break };

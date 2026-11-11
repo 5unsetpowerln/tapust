@@ -195,6 +195,16 @@ pub struct Shared<T> {
 }
 
 impl<T> Shared<T> {
+    /// ghostty's password input heuristic: the line discipline is canonical
+    /// but does not echo.
+    pub fn password_input(&self) -> bool {
+        let mut tio: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(self.master, &mut tio) } == -1 {
+            return false;
+        }
+        tio.c_lflag & libc::ICANON != 0 && tio.c_lflag & libc::ECHO == 0
+    }
+
     /// Writes input for the application: directly when the PTY takes it,
     /// otherwise the rest is queued for the I/O thread, keeping byte order.
     pub fn write(&self, bytes: &[u8]) {

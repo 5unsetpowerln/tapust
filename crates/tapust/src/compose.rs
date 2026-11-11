@@ -89,21 +89,33 @@ pub fn copy_pane(grid: &mut Grid, term: &mut Terminal, full: bool) {
 
 /// The cursor of the pane drawn in `frame.grids[grid]`, if visible. A pane
 /// that does not have the keyboard focus gets ghostty's hollow block.
+/// ghostty's lock cursor at a password prompt: drawn even when the cursor
+/// is hidden, unfocused or blinked off.
+pub fn lock_cursor(term: &Terminal, grid: usize) -> Option<FrameCursor> {
+    let cursor = term.cursor();
+    (cursor.x < term.cols() && cursor.y < term.rows()).then(|| cursor_at(term, grid, CursorStyle::Lock))
+}
+
 pub fn pane_cursor(term: &Terminal, grid: usize, focused: bool) -> Option<FrameCursor> {
     let cursor = term.cursor();
     if !cursor.visible || cursor.x >= term.cols() || cursor.y >= term.rows() {
         return None;
     }
-    let palette = term.palette();
-    let cell = term.row(cursor.y)[cursor.x as usize];
-    let (fg, bg) = style_colors(term.style(cell.style()), palette, term.modes().reverse_video);
     let style = match (focused, cursor.shape) {
         (false, _) => CursorStyle::Hollow,
         (true, CursorShape::Block) => CursorStyle::Block,
         (true, CursorShape::Underline) => CursorStyle::Underline,
         (true, CursorShape::Bar) => CursorStyle::Bar,
     };
-    Some(FrameCursor {
+    Some(cursor_at(term, grid, style))
+}
+
+fn cursor_at(term: &Terminal, grid: usize, style: CursorStyle) -> FrameCursor {
+    let cursor = term.cursor();
+    let palette = term.palette();
+    let cell = term.row(cursor.y)[cursor.x as usize];
+    let (fg, bg) = style_colors(term.style(cell.style()), palette, term.modes().reverse_video);
+    FrameCursor {
         grid,
         x: cursor.x,
         y: cursor.y,
@@ -111,5 +123,5 @@ pub fn pane_cursor(term: &Terminal, grid: usize, focused: bool) -> Option<FrameC
         color: palette.cursor.map(rgba).unwrap_or(fg),
         text_color: bg,
         wide: cell.width() == Width::Wide,
-    })
+    }
 }

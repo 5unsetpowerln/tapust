@@ -63,6 +63,8 @@ pub struct Surface {
     resize_hide: RefCell<Option<glib::SourceId>>,
     resize_idle: Cell<bool>,
     blink_timer: RefCell<Option<glib::SourceId>>,
+    /// The PTY looks like a password prompt (ghostty's password_input).
+    password: Cell<bool>,
     last_blink_reset: Cell<Option<Instant>>,
     font_scale: Cell<f64>,
     cell_idle: Cell<bool>,
@@ -182,6 +184,7 @@ impl Surface {
             resize_hide: RefCell::new(None),
             resize_idle: Cell::new(false),
             blink_timer: RefCell::new(None),
+            password: Cell::new(false),
             last_blink_reset: Cell::new(None),
             font_scale: Cell::new(0.0),
             cell_idle: Cell::new(false),
@@ -494,6 +497,12 @@ impl Surface {
         }
     }
 
+    pub fn set_password_input(&self, on: bool) {
+        if self.password.replace(on) != on {
+            self.area.queue_render();
+        }
+    }
+
     pub fn cell_size(&self) -> Option<(u32, u32)> {
         self.draw.borrow().renderer.as_ref().map(|r| r.cell_size())
     }
@@ -512,11 +521,14 @@ impl Surface {
             shared.want_lock.store(false, Ordering::Release);
             compose::copy_pane(grid, &mut term, d.full);
             let focused = self.focused.get();
-            if (!focused || !term.cursor().blinking || d.blink_on)
-                && let Some(cursor) = compose::pane_cursor(&term, 0, focused)
-            {
-                d.frame.cursors.push(cursor);
-            }
+            let cursor = if self.password.get() {
+                compose::lock_cursor(&term, 0)
+            } else if !focused || !term.cursor().blinking || d.blink_on {
+                compose::pane_cursor(&term, 0, focused)
+            } else {
+                None
+            };
+            d.frame.cursors.extend(cursor);
         }
         d.full = false;
         renderer.draw(&mut d.frame);

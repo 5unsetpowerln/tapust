@@ -56,3 +56,6 @@ pub const ICON: &str = "utilities-terminal";
 /// ghostty refocuses the active surface this long after the tab overview
 /// closes.
 pub const OVERVIEW_FOCUS: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How often ghostty checks the PTY's termios for a password prompt.
+pub const TERMIOS_POLL: std::time::Duration = std::time::Duration::from_millis(200);

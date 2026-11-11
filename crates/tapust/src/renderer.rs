@@ -544,6 +544,12 @@ impl Renderer {
                 }
                 CursorStyle::Underline => upload.push(Self::rect(x, y + ch - 2, width, 2, cursor.color)),
                 CursorStyle::Bar => upload.push(Self::rect(x, y, 2, ch, cursor.color)),
+                CursorStyle::Lock => {
+                    // ghostty renders U+F023 (the Nerd Font lock) in the
+                    // cursor color in place of a cursor shape.
+                    let lock = FrameCell { ch: 0xF023, fg: cursor.color, bg: [0; 4], flags: 0 };
+                    self.push_cell(&mut upload, x, y, &lock, cursor.color);
+                }
                 CursorStyle::Hollow => {
                     // A 1px outline, like ghostty's block_hollow with cursor_thickness 1.
                     upload.push(Self::rect(x, y, width, 1, cursor.color));

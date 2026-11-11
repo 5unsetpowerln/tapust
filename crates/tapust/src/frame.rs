@@ -98,6 +98,8 @@ pub enum CursorStyle {
     Bar,
     /// The outline ghostty draws in unfocused panes and windows.
     Hollow,
+    /// The lock glyph ghostty draws while a password is typed.
+    Lock,
 }
 
 /// Where and how to draw a cursor: a cell of `frame.grids[grid]`.
