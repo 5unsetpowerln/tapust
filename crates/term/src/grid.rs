@@ -118,6 +118,16 @@ impl RowMeta {
         }
     }
 
+    /// Frees the entries of columns `from..`.
+    fn free_graphemes_from(&mut self, from: usize) {
+        let live = self.glen as usize;
+        for g in &mut self.graphemes[..live] {
+            if g.0 != FREE && g.0 as usize >= from {
+                g.0 = FREE;
+            }
+        }
+    }
+
     /// Follows cells `from + n..` moving left by `n`; cells `from..from + n` are deleted.
     pub fn shift_graphemes_left(&mut self, from: usize, n: usize) {
         let live = self.glen as usize;
@@ -179,7 +189,7 @@ pub(crate) struct Grid {
     hist_cap: usize,
     free: Vec<u32>,
     /// Lines ever moved into the scrollback, including those dropped since:
-    /// the absolute number of screen row 0. A reflow counts the rows above
+    /// the absolute number of screen row 0. A resize counts the rows above
     /// the screen, so the oldest stored line keeps its number.
     pushed: u64,
 }
@@ -225,11 +235,6 @@ impl Grid {
     #[inline(always)]
     pub fn slot_meta(&self, slot: usize) -> &RowMeta {
         &self.meta[slot]
-    }
-
-    #[inline(always)]
-    pub fn row(&self, y: usize) -> &[Cell] {
-        self.slot_cells(self.slot(y))
     }
 
     #[inline(always)]
@@ -503,274 +508,375 @@ impl Grid {
         g
     }
 
-    /// Resizes without reflow (alternate screen): rows are truncated or padded
-    /// at the right and the bottom; rows are dropped from the top if needed to
-    /// keep row `keep_y` on screen. Returns the grid and the shift applied to y.
-    /// `points` (line from the oldest stored line, column) stay on their
-    /// cells as ghostty's tracked pins do, clamped to the last column; those
-    /// on dropped rows go to the nearest remaining cell (see `reflowed`).
-    pub fn resized(&self, cols: usize, rows: usize, keep_y: usize, points: &mut [(usize, usize)]) -> (Grid, usize) {
-        let shift = (keep_y + 1).saturating_sub(rows);
-        for p in points {
-            *p = match p.0.checked_sub(self.hist.len() + shift) {
-                None => (0, 0),
-                Some(y) if y >= rows => (rows - 1, cols - 1),
-                Some(y) => (y, p.1.min(cols - 1)),
+    /// Resizes as ghostty's PageList.resize does, except that the cursor's
+    /// row stays on the screen, then drops the history the scrollback limit
+    /// does not allow. `pins` (line from the oldest stored line, column),
+    /// the cursor's first, follow their cells as ghostty's tracked pins.
+    /// Those on rows dropped from the history go to the first cell of the
+    /// oldest remaining row, those on rows cut below the screen to the line
+    /// after the screen.
+    pub fn resize(&self, cols: usize, rows: usize, reflow: bool, pins: &mut [(usize, usize)]) -> Grid {
+        let mut s = Resize::new(self);
+        let cursor_y = pins[0].0 - self.hist.len();
+        // More rows come from the history only for a cursor on the last row.
+        let pull = cursor_y + 1 >= self.rows;
+        if !reflow {
+            s.set_cols(cols, pins);
+            s.set_rows(rows, pull, pins);
+        } else if cols > self.cols {
+            s.reflow(cols, cursor_y, pins);
+            s.set_rows(rows, pull, pins);
+        } else {
+            s.set_rows(rows, pull, pins);
+            if cols < self.cols {
+                s.reflow(cols, pins[0].0 - s.top(), pins);
+            }
+        }
+        let hist = s.list.len() - rows;
+        let drop = hist.saturating_sub(self.hist_cap);
+        s.list.drain(..drop);
+        let end = s.list.len();
+        for p in pins.iter_mut() {
+            *p = match p.0 {
+                CUT => (end, p.1),
+                line => line.checked_sub(drop).map_or((0, 0), |line| (line, p.1)),
             };
         }
-        let mut screen = Vec::with_capacity(rows);
-        for y in 0..rows {
-            let mut r = NewRow::blank(cols);
-            let oy = y + shift;
-            if oy < self.rows {
-                let old = self.row(oy);
-                let m = self.meta(oy);
-                let n = cols.min(self.cols);
-                r.cells[..n].copy_from_slice(&old[..n]);
-                if n < self.cols && r.cells[n - 1].width() == Width::Wide {
-                    r.cells[n - 1] = blankify(r.cells[n - 1]);
-                }
-                r.meta.occ = (m.occ as usize).min(cols) as u16;
-                r.meta.wrapped = m.wrapped && cols == self.cols;
-                for (x, s) in m.graphemes().filter(|g| g.0 < n) {
-                    r.meta.push_grapheme(x, s);
-                }
-            }
-            screen.push(r);
-        }
-        (Grid::from_rows(cols, rows, self.hist_cap, Vec::new(), screen).with_pushed(self.pushed), shift)
+        let screen = s.list.split_off(hist - drop);
+        Grid::from_rows(cols, rows, self.hist_cap, s.list, screen).with_pushed(self.first_line() + hist as u64)
     }
 
-    /// Resizes with reflow: logical lines joined by soft-wrap marks are
-    /// rewrapped at the new width and the cursor stays on its content.
-    /// `points` (line from the oldest history line, column) move with their
-    /// cells as ghostty's tracked pins do in PageList.reflowRow. Those whose
-    /// rows are dropped go to the nearest remaining cell: the first cell of
-    /// the oldest line, or the last cell of the screen.
-    pub fn reflowed(
-        &self,
-        cols: usize,
-        rows: usize,
-        cur: ReflowCursor,
-        points: &mut [(usize, usize)],
-    ) -> (Grid, ReflowCursor) {
-        let lines = self.logical_lines(cur, points);
-        let (mut out, pos) = rewrap(&lines.lines, cols, &lines.marks);
-        let (mut cr, mut cc) = pos[0];
-        let mut pending = false;
-        if cur.pending {
-            if cc + 1 < cols {
-                cc += 1;
-            } else {
-                pending = true;
-            }
+    /// ghostty's clearPromptForRedraw for a cursor on line `line`: clears
+    /// the cursor's row, or with `all` every row from the start of its
+    /// prompt to the bottom of the screen. The rows keep their marks.
+    pub fn clear_prompt(&mut self, line: usize, all: bool) {
+        let end = if all { self.hist.len() + self.rows } else { line + 1 };
+        let Some(start) = (if all { self.prompt_start(line) } else { Some(line) }) else { return };
+        for l in start..end {
+            let slot = self.line_slot(l);
+            let (wrapped, prompt) = (self.meta[slot].wrapped, self.meta[slot].prompt);
+            self.clear_slot(slot, Cell::EMPTY);
+            (self.meta[slot].wrapped, self.meta[slot].prompt) = (wrapped, prompt);
         }
-        let total = out.len();
-        let start = total.saturating_sub(rows).min(cr);
-        out.truncate(start + rows);
-        let mut screen = out.split_off(start);
-        screen.resize_with(rows, || NewRow::blank(cols));
-        let hist_drop = start.saturating_sub(self.hist_cap);
-        let hist: Vec<NewRow> = out.into_iter().skip(hist_drop).collect();
-        for (p, &(r, c)) in points.iter_mut().zip(&pos[1..]) {
-            *p = if r < hist_drop {
-                (0, 0)
-            } else if r >= start + rows {
-                (hist.len() + rows - 1, cols - 1)
-            } else {
-                (r - hist_drop, c)
-            };
-        }
-        cr -= start;
-        let pushed = self.first_line() + start as u64;
-        let grid = Grid::from_rows(cols, rows, self.hist_cap, hist, screen).with_pushed(pushed);
-        (grid, ReflowCursor { x: cc.min(cols - 1), y: cr, pending })
     }
 
-    /// The logical lines and the marks of the cursor followed by `points`.
-    fn logical_lines(&self, cur: ReflowCursor, points: &[(usize, usize)]) -> Lines {
-        let total = self.hist.len() + self.rows;
-        let cursor_abs = self.hist.len() + cur.y;
-        let mut lines = Vec::new();
-        let mut line = Line::default();
-        let mut marks = vec![(0, Mark::At(0)); points.len() + 1];
-        for abs in 0..total {
-            let slot = self.line_slot(abs);
-            let row = self.slot_cells(slot);
-            let meta = &self.meta[slot];
-            let content = if meta.wrapped {
-                if row[self.cols - 1].width() == Width::SpacerHead { self.cols - 1 } else { self.cols }
-            } else {
-                row[..meta.occ as usize].iter().rposition(|c| *c != Cell::EMPTY).map_or(0, |p| p + 1)
-            };
-            let mut len = content;
-            let base = line.cells.len();
-            if abs == cursor_abs {
-                marks[0] = (lines.len(), Mark::At(base + cur.x));
-                len = len.max(cur.x + 1);
-            }
-            for (m, &(_, x)) in marks[1..].iter_mut().zip(points).filter(|(_, p)| p.0 == abs) {
-                // A point on a wrapped row's spacer head goes with the wide
-                // character that follows.
-                let at = if meta.wrapped || x < content {
-                    Mark::At(base + x.min(len))
-                } else {
-                    Mark::Blank { row: base, x }
-                };
-                *m = (lines.len(), at);
-            }
-            line.cells.extend_from_slice(&row[..len]);
-            for (col, s) in meta.graphemes() {
-                if col < len && row[col].has_grapheme() {
-                    line.graphemes.push((base + col, s.to_owned()));
-                }
-            }
-            if !meta.wrapped {
-                line.graphemes.sort_unstable_by_key(|g| g.0);
-                lines.push(std::mem::take(&mut line));
+    /// ghostty's promptIterator going up from line `line`: the nearest
+    /// prompt row, or the top of the nearest continuation rows. Continuation
+    /// rows that reach the oldest line give the lowest one, as in ghostty.
+    fn prompt_start(&self, line: usize) -> Option<usize> {
+        let mark = |l: usize| self.meta[self.line_slot(l)].prompt;
+        let mut l = line;
+        loop {
+            match mark(l) {
+                PromptMark::Prompt => return Some(l),
+                PromptMark::Continuation => break,
+                PromptMark::None => l = l.checked_sub(1)?,
             }
         }
-        if !line.cells.is_empty() {
-            line.graphemes.sort_unstable_by_key(|g| g.0);
-            lines.push(line);
+        let mut top = l;
+        while top > 0 {
+            match mark(top - 1) {
+                PromptMark::None => return Some(top),
+                PromptMark::Prompt => return Some(top - 1),
+                PromptMark::Continuation => top -= 1,
+            }
         }
-        // Blank lines below the cursor and the points are not content.
-        let keep = marks.iter().map(|m| m.0).max().unwrap_or(0);
-        while lines.len() > keep + 1 && lines.last().is_some_and(|l| l.cells.is_empty()) {
-            lines.pop();
-        }
-        Lines { lines, marks }
+        Some(l)
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ReflowCursor {
-    pub x: usize,
-    pub y: usize,
-    pub pending: bool,
-}
-
-#[derive(Default)]
-struct Line {
-    cells: Vec<Cell>,
-    graphemes: Vec<(usize, String)>,
-}
-
-/// Where a tracked cell is on its logical line.
-#[derive(Clone, Copy)]
-enum Mark {
-    /// The cell at this offset.
-    At(usize),
-    /// Column `x` in the trailing blanks of the line's last row, which
-    /// starts at offset `row`.
-    Blank { row: usize, x: usize },
-}
-
-struct Lines {
-    lines: Vec<Line>,
-    /// (line index, mark) of the cursor followed by the tracked points.
-    marks: Vec<(usize, Mark)>,
+/// ghostty's Cell.isEmpty: no text, no background, not part of a wide character.
+fn is_empty(c: Cell) -> bool {
+    c.codepoint() == 0 && c.width() == Width::Narrow && c.style() == StyleId::DEFAULT
 }
 
 struct NewRow {
     cells: Vec<Cell>,
     meta: RowMeta,
+    /// ghostty's wrap_continuation: the row continues a wrapped row above.
+    cont: bool,
 }
 
 impl NewRow {
     fn blank(cols: usize) -> NewRow {
-        NewRow { cells: vec![Cell::EMPTY; cols], meta: RowMeta::default() }
+        NewRow { cells: vec![Cell::EMPTY; cols], meta: RowMeta::default(), cont: false }
+    }
+
+    fn has_text(&self) -> bool {
+        self.cells[..self.meta.occ as usize].iter().any(|c| c.codepoint() != 0)
     }
 }
 
-/// Splits logical lines into rows of `cols` cells; returns the rows and the
-/// (row, column) each mark lands on. A line is extended with blank cells to
-/// hold its marks.
-fn rewrap(lines: &[Line], cols: usize, marks: &[(usize, Mark)]) -> (Vec<NewRow>, Vec<(usize, usize)>) {
-    let mut out: Vec<NewRow> = Vec::new();
-    let mut pos = vec![(0, 0); marks.len()];
-    // The offsets of the marks on the current line, once known.
-    let mut offsets = vec![None; marks.len()];
-    for (li, line) in lines.iter().enumerate() {
-        let mut graphemes = line.graphemes.iter().peekable();
-        let marked = marks.iter().any(|m| m.0 == li);
-        let mut len = line.cells.len();
-        if marked {
-            for (o, &(ml, m)) in offsets.iter_mut().zip(marks) {
-                *o = match m {
-                    Mark::At(off) if ml == li => {
-                        len = len.max(off + 1);
-                        Some(off)
-                    }
-                    _ => None,
-                };
+/// The line of a pin whose row a resize cut below the screen.
+const CUT: usize = usize::MAX;
+
+/// A screen being resized as ghostty's PageList: every stored row, oldest
+/// first, of which the last `rows` are the screen.
+struct Resize {
+    cols: usize,
+    rows: usize,
+    list: Vec<NewRow>,
+}
+
+impl Resize {
+    fn new(g: &Grid) -> Resize {
+        let total = g.hist.len() + g.rows;
+        let mut list: Vec<NewRow> = Vec::with_capacity(total);
+        for line in 0..total {
+            let slot = g.line_slot(line);
+            let (cells, m) = (g.slot_cells(slot), &g.meta[slot]);
+            let mut meta = RowMeta { occ: m.occ, wrapped: m.wrapped, prompt: m.prompt, ..RowMeta::default() };
+            for (x, s) in m.graphemes().filter(|g| cells[g.0].has_grapheme()) {
+                meta.push_grapheme(x, s);
             }
+            let cont = list.last().is_some_and(|r| r.meta.wrapped);
+            list.push(NewRow { cells: cells.to_vec(), meta, cont });
         }
-        out.push(NewRow::blank(cols));
-        let mut col = 0;
-        let mut i = 0;
-        loop {
-            if marked {
-                for (o, &(ml, m)) in offsets.iter_mut().zip(marks) {
-                    // ghostty first clamps a point in the trailing blanks to
-                    // the destination row where its source row starts.
-                    if let Mark::Blank { row, x } = m
-                        && ml == li
-                        && o.is_none()
-                        && i >= row
-                    {
-                        let dst_x = if col == cols { 0 } else { col };
-                        let off = row + x.min(cols - 1 - dst_x);
-                        len = len.max(off + 1);
-                        *o = Some(off);
-                    }
-                }
-            }
-            if i >= len {
-                break;
-            }
-            let mut c = line.cells.get(i).copied().unwrap_or(Cell::EMPTY);
-            let mut w = 1;
-            match c.width() {
-                Width::Wide if cols >= 2 => w = 2,
-                Width::Narrow => {}
-                _ => c = blankify(c),
-            }
-            if col + w > cols {
-                let r = out.last_mut().unwrap();
-                // A full row has no cell left for the spacer head.
-                if w == 2 && col < cols {
-                    r.cells[col] = Cell::new(0, Width::SpacerHead, StyleId::DEFAULT);
-                    r.meta.touch(col + 1);
-                }
-                r.meta.wrapped = true;
-                out.push(NewRow::blank(cols));
-                col = 0;
-            }
-            let ri = out.len() - 1;
-            let r = &mut out[ri];
-            r.cells[col] = c;
-            if w == 2 {
-                r.cells[col + 1] = Cell::new(0, Width::SpacerTail, c.style());
-            }
-            r.meta.touch(col + w);
-            while let Some((gi, s)) = graphemes.next_if(|g| g.0 <= i) {
-                if *gi == i {
-                    r.meta.push_grapheme(col, s);
-                }
-            }
-            if marked {
-                for (p, &o) in pos.iter_mut().zip(&offsets) {
-                    if o == Some(i) {
-                        *p = (ri, col);
-                    } else if w == 2 && o == Some(i + 1) {
-                        *p = (ri, col + 1);
-                    }
-                }
-            }
-            col += w;
-            i += if w == 2 && line.cells.get(i + 1).is_some_and(|n| n.width() == Width::SpacerTail) { 2 } else { 1 };
+        Resize { cols: g.cols, rows: g.rows, list }
+    }
+
+    /// The first screen row.
+    fn top(&self) -> usize {
+        self.list.len() - self.rows
+    }
+
+    fn push_blank(&mut self, n: usize) {
+        let cols = self.cols;
+        self.list.extend((0..n).map(|_| NewRow::blank(cols)));
+    }
+
+    /// ghostty's resizeWithoutReflow for the rows, but fewer rows keep the
+    /// cursor's row: trailing rows without text below it are dropped, then
+    /// top rows move to the history down to the cursor's row, then rows
+    /// below it are cut. More rows come from the history with `pull`, else
+    /// are blank.
+    fn set_rows(&mut self, rows: usize, pull: bool, pins: &mut [(usize, usize)]) {
+        if rows < self.rows {
+            let (top, cursor) = (self.top(), pins[0].0);
+            let below = self.list[cursor + 1..].iter().rev().take(self.rows - rows);
+            let screen = self.list.len() - below.take_while(|r| !r.has_text()).count() - top;
+            let up = (screen - rows).min(cursor - top);
+            self.cut(top + up + rows, pins);
+        } else if pull {
+            self.push_blank(rows.saturating_sub(self.list.len()));
+        } else {
+            self.push_blank(rows - self.rows);
+        }
+        self.rows = rows;
+    }
+
+    /// Drops the rows from `len` on; their pins go to `CUT`.
+    fn cut(&mut self, len: usize, pins: &mut [(usize, usize)]) {
+        self.list.truncate(len);
+        for p in pins.iter_mut().filter(|p| p.0 >= len) {
+            p.0 = CUT;
         }
     }
-    (out, pos)
+
+    /// ghostty's resizeWithoutReflow for the columns. Cut cells are cleared
+    /// along with a wide character cut in half, and pins move left into
+    /// the row. Rows copied into wider ones lose their wrap marks, and a
+    /// spacer head at the old last column becomes a blank.
+    fn set_cols(&mut self, cols: usize, pins: &mut [(usize, usize)]) {
+        let old = self.cols;
+        if cols < old {
+            for r in &mut self.list {
+                let start = if r.cells[cols - 1].width() == Width::Wide { cols - 1 } else { cols };
+                r.cells.truncate(start);
+                r.cells.resize(cols, Cell::EMPTY);
+                r.meta.occ = r.meta.occ.min(start as u16);
+                r.meta.free_graphemes_from(start);
+            }
+            for p in pins {
+                p.1 = p.1.min(cols - 1);
+            }
+        } else if cols > old {
+            for r in &mut self.list {
+                if r.cells[old - 1].width() == Width::SpacerHead {
+                    r.cells[old - 1] = blankify(r.cells[old - 1]);
+                }
+                r.cells.resize(cols, Cell::EMPTY);
+                r.meta.wrapped = false;
+                r.cont = false;
+            }
+        }
+        self.cols = cols;
+    }
+
+    /// ghostty's resizeCols: rewraps every row at `cols` columns. Blank rows
+    /// are added below so that the cursor, `cursor_y` rows from the top of
+    /// the screen, keeps the rows it had under it, less the rows its line
+    /// gained from wrapping. Unlike ghostty, rows that would push the
+    /// cursor's row into the history are cut below it instead.
+    fn reflow(&mut self, cols: usize, cursor_y: usize, pins: &mut [(usize, usize)]) {
+        let remaining = self.rows.saturating_sub(cursor_y + 1);
+        let wrapped = self.continued_rows(pins[0].0);
+        let mut w = Reflow { cols, out: vec![NewRow::blank(cols)], x: 0, pending_wrap: false, new_rows: 0 };
+        let mut moved = vec![false; pins.len()];
+        for (line, row) in std::mem::take(&mut self.list).into_iter().enumerate() {
+            w.row(&row, line, pins, &mut moved);
+        }
+        self.cols = cols;
+        self.list = w.out;
+        self.push_blank(self.rows.saturating_sub(self.list.len()));
+        let (top, line) = (self.top(), pins[0].0);
+        if line < top {
+            self.cut(line + self.rows, pins);
+        } else {
+            let below = self.rows - (line - top + 1);
+            let gained = self.continued_rows(line).saturating_sub(wrapped);
+            self.push_blank(remaining.saturating_sub(gained).saturating_sub(below));
+        }
+    }
+
+    /// The rows from the top of the screen down to `line` that continue a
+    /// wrapped row.
+    fn continued_rows(&self, line: usize) -> usize {
+        let top = self.top();
+        if line < top {
+            return 0;
+        }
+        self.list[top..=line].iter().filter(|r| r.cont).count()
+    }
+}
+
+/// ghostty's PageList.ReflowCursor: where the next reflowed cell goes.
+struct Reflow {
+    cols: usize,
+    out: Vec<NewRow>,
+    x: usize,
+    pending_wrap: bool,
+    /// Line breaks not written yet: blank rows are written only before text.
+    new_rows: usize,
+}
+
+impl Reflow {
+    fn last(&mut self) -> &mut NewRow {
+        self.out.last_mut().unwrap()
+    }
+
+    fn scroll(&mut self) {
+        self.out.push(NewRow::blank(self.cols));
+        self.x = 0;
+        self.pending_wrap = false;
+    }
+
+    /// ghostty's reflowRow of line `line`. The pins not `moved` yet that are
+    /// on the row follow their cells; those in its trailing blanks, except
+    /// the cursor's, first move left to fit the destination row. Unlike
+    /// ghostty, a row takes the prompt mark of the source row it starts at,
+    /// and a row that starts inside a marked source row continues it.
+    fn row(&mut self, src: &NewRow, line: usize, pins: &mut [(usize, usize)], moved: &mut [bool]) {
+        let mut len = src.cells.len();
+        if !src.meta.wrapped {
+            len = src.cells[..src.meta.occ as usize].iter().rposition(|&c| !is_empty(c)).map_or(0, |x| x + 1);
+            if len == 0 && src.meta.prompt != PromptMark::None {
+                len = 1;
+            }
+        }
+        let dst_x = if self.new_rows > 0 || self.pending_wrap { 0 } else { self.x };
+        let mut has_pins = false;
+        for (i, p) in pins.iter_mut().enumerate().filter(|(i, p)| !moved[*i] && p.0 == line) {
+            has_pins = true;
+            if i > 0 {
+                if p.1 >= len {
+                    p.1 = p.1.min(self.cols - 1 - dst_x);
+                }
+                len = len.max(p.1 + 1);
+            }
+        }
+        if !moved[0] && pins[0].0 == line {
+            len = len.max(pins[0].1 + 1);
+        }
+        if len == 0 {
+            if !src.cont {
+                self.new_rows += 1;
+            }
+            return;
+        }
+        for _ in 0..std::mem::take(&mut self.new_rows) {
+            self.scroll();
+        }
+        let mut x = 0;
+        while x < len {
+            if self.pending_wrap {
+                self.last().meta.wrapped = true;
+                self.scroll();
+                self.last().cont = true;
+            }
+            // A wide character goes to the next row after a spacer head, and
+            // its pins with it (ghostty leaves them on the spacer head).
+            if src.cells[x].width() == Width::Wide && self.cols > 1 && self.x == self.cols - 1 {
+                self.put(Cell::new(0, Width::SpacerHead, StyleId::DEFAULT), None);
+                continue;
+            }
+            if has_pins {
+                self.move_pins(line, x, pins, moved);
+            }
+            let mark = match src.meta.prompt {
+                _ if x == 0 => src.meta.prompt,
+                PromptMark::None => PromptMark::None,
+                _ => PromptMark::Continuation,
+            };
+            if self.write(src, x, mark) {
+                x += 1;
+            } else {
+                if has_pins {
+                    self.move_pins(line, x + 1, pins, moved);
+                }
+                x += 2;
+            }
+        }
+        if !src.meta.wrapped {
+            self.new_rows += 1;
+        }
+    }
+
+    fn move_pins(&self, line: usize, x: usize, pins: &mut [(usize, usize)], moved: &mut [bool]) {
+        let to = (self.out.len() - 1, self.x);
+        for (p, m) in pins.iter_mut().zip(moved) {
+            if !*m && *p == (line, x) {
+                (*p, *m) = (to, true);
+            }
+        }
+    }
+
+    /// ghostty's writeCell for column `x` of `src`, but for the spacer head
+    /// before a wide character; `mark` is the prompt mark of a row the cell
+    /// starts. False if the next column is skipped: one column cannot hold
+    /// a wide character, which becomes a blank without its tail.
+    fn write(&mut self, src: &NewRow, x: usize, mark: PromptMark) -> bool {
+        let c = src.cells[x];
+        let fits = match c.width() {
+            Width::SpacerHead => return true,
+            Width::SpacerTail if self.cols == 1 => return true,
+            Width::Wide => self.cols > 1,
+            _ => true,
+        };
+        if self.x == 0 {
+            self.last().meta.prompt = mark;
+        }
+        if fits {
+            let grapheme = if c.has_grapheme() { src.meta.grapheme(x as u16) } else { None };
+            self.put(c, grapheme);
+        } else {
+            self.put(Cell::EMPTY, None);
+        }
+        fits
+    }
+
+    fn put(&mut self, c: Cell, grapheme: Option<&str>) {
+        let (x, cols) = (self.x, self.cols);
+        let r = self.last();
+        r.cells[x] = c;
+        r.meta.touch(x + 1);
+        if let Some(g) = grapheme {
+            r.meta.push_grapheme(x, g);
+        }
+        if x == cols - 1 {
+            self.pending_wrap = true;
+        } else {
+            self.x += 1;
+        }
+    }
 }

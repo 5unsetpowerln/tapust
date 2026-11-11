@@ -1467,12 +1467,14 @@ fn alternate_screen_resize_moves_the_selection_with_its_rows() {
     let s = t.selection().unwrap();
     assert_eq!(s.start, Point { line: t.first_line(), col: 0 });
     assert_eq!(s.end, Point { line: t.view_top(), col: 4 });
-    // Rows cut at the bottom leave their ends on the last cell.
+    // tapust differs from ghostty: the cursor's row stays and the end on the row cut below it is discarded.
     feed(&mut t, "\x1b[H");
     select(&mut t, (0, 1), (1, 2));
     t.resize(5, 1);
+    assert_eq!(screen(&t), ["row2"]);
+    assert_eq!(pos(&t), (0, 0));
     let s = t.selection().unwrap();
-    assert_eq!((s.start, s.end), (Point { line: t.view_top(), col: 1 }, Point { line: t.view_top(), col: 4 }));
+    assert_eq!((s.start, s.end), (Point { line: t.view_top(), col: 1 }, Point { line: t.first_line(), col: 0 }));
 }
 
 #[test]

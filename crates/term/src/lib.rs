@@ -10,6 +10,8 @@ pub mod cell;
 mod grid;
 mod palette;
 mod parser;
+#[cfg(test)]
+mod resize_tests;
 mod selection;
 mod style;
 mod term;
@@ -195,9 +197,13 @@ impl Terminal {
         self.parser.advance(&mut self.term, bytes);
     }
 
-    /// Resizes the viewport, reflowing the primary screen and its scrollback
-    /// with the soft-wrap marks (the alternate screen is truncated or padded).
-    /// The selection's ends move with their cells. Marks every row dirty.
+    /// Resizes the viewport mostly as ghostty does: the primary screen and
+    /// its scrollback reflow with the soft-wrap marks while DECAWM is set,
+    /// the alternate screen is cut or padded. The cursor's row stays on the
+    /// screen. The cursors, the saved cursors (clamped to the screen), the
+    /// selection's ends and a view scrolled into the scrollback follow their
+    /// cells, tab stops stay, and a prompt the shell redraws (OSC 133) is
+    /// cleared. Ends a synchronized update and marks every row dirty.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.term.resize(cols.max(1) as usize, rows.max(1) as usize);
     }
@@ -353,7 +359,7 @@ impl Terminal {
 
     /// Absolute line numbers count every line that ever scrolled from the
     /// top of the active screen into its scrollback, so a line keeps its
-    /// number while output scrolls (a reflow renumbers the lines after the
+    /// number while output scrolls (a resize renumbers the lines after the
     /// oldest one). The oldest line still stored:
     pub fn first_line(&self) -> u64 {
         self.term.grid.first_line()

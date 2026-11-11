@@ -486,6 +486,20 @@ mod tests {
         assert_eq!(prompt_click_move(&t, at(&t, 0, 3), at(&t, 0, 5)), (0, 2));
     }
 
+    #[test]
+    fn a_reflow_keeps_a_split_input_one_prompt() {
+        // "$ echo abcdefghij" splits into "$ echo abc" and "defghij": 'e' to
+        // 'g' is still 11 input cells, as on one row.
+        let mut t = term(20, 4, "\x1b]133;A;redraw=0\x07$ \x1b]133;B\x07echo abcdefghij");
+        assert_eq!(prompt_click_move(&t, at(&t, 0, 2), at(&t, 0, 13)), (0, 11));
+        t.resize(10, 4);
+        assert_eq!(prompt_click_move(&t, at(&t, 0, 2), at(&t, 1, 3)), (0, 11));
+        let mut t = term(20, 5, "\x1b]133;A\x07$ \x1b]133;B\x07echo abcdefghij\r\n\x1b]133;C\x07out1\r\nout2");
+        t.resize(10, 5);
+        let s = output(&t, at(&t, 2, 1)).unwrap();
+        assert_eq!(text(&t, &s), "out1\nout2");
+    }
+
     /// ghostty's "Screen: selectOutput" test.
     #[test]
     fn output_selects_the_command_output_around_the_click() {

@@ -5,7 +5,7 @@ use std::io::Write as _;
 use unicode_width::UnicodeWidthChar;
 
 use crate::cell::{Cell, Semantic, StyleId, Width};
-use crate::grid::{Grid, PromptMark, ReflowCursor, attach_mark, blankify};
+use crate::grid::{Grid, PromptMark, attach_mark, blankify};
 use crate::palette::{default_palette, parse_color};
 use crate::parser::Params;
 use crate::style::{Pen, StyleTable, apply_sgr};
@@ -89,6 +89,90 @@ impl Default for Saved {
     }
 }
 
+/// ghostty keeps a cursor per screen. The active screen's is in `Term`; the
+/// inactive screen's stays where it was when the screen was left.
+#[derive(Clone, Copy, Default)]
+struct ScreenCursor {
+    x: usize,
+    y: usize,
+    pending_wrap: bool,
+    semantic: Semantic,
+}
+
+/// ghostty's shell_redraws_prompt (OSC 133;A redraw): which rows of the
+/// prompt the cursor is on a resize clears for the shell to redraw.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Redraw {
+    None,
+    All,
+    Last,
+}
+
+/// What of a screen follows its cells through a resize as ghostty's tracked pins.
+struct Tracked<'a> {
+    cursor: &'a mut ScreenCursor,
+    saved: &'a mut Option<Saved>,
+    selection: &'a mut Option<Selection>,
+    view_offset: &'a mut usize,
+}
+
+/// ghostty's Screen.resize. The cursor, the saved cursor, the selection's
+/// ends and the top row of a view scrolled into the history are pins. The
+/// cursor's row stays on the screen, and a saved cursor whose row left it
+/// is clamped to it.
+fn resize_screen(grid: &Grid, cols: usize, rows: usize, reflow: bool, redraw: Redraw, t: Tracked) -> Grid {
+    let (first, hist) = (grid.first_line(), grid.hist_len());
+    let cursor = t.cursor;
+    // The order of ghostty's tracked pins after the cursor's.
+    let mut pins = vec![(hist + cursor.y, cursor.x)];
+    let view = (*t.view_offset > 0).then(|| {
+        pins.push((hist - *t.view_offset, 0));
+        pins.len() - 1
+    });
+    let selection = t.selection.as_ref().map(|s| {
+        for p in [s.start, s.end] {
+            pins.push(p.line.checked_sub(first).map_or((0, 0), |line| (line as usize, p.col as usize)));
+        }
+        pins.len() - 2
+    });
+    let saved = t.saved.as_ref().map(|s| {
+        pins.push((hist + s.y, s.x));
+        pins.len() - 1
+    });
+    let mut grid = grid.resize(cols, rows, reflow, &mut pins);
+    let hist = grid.hist_len();
+    (cursor.x, cursor.y) = (pins[0].1, pins[0].0 - hist);
+    // A pending wrap off the last column becomes the next cell.
+    if cursor.pending_wrap && cursor.x != cols - 1 {
+        cursor.pending_wrap = false;
+        cursor.x += 1;
+    }
+    if cursor.semantic != Semantic::Output && redraw != Redraw::None {
+        grid.clear_prompt(hist + cursor.y, redraw == Redraw::All);
+    }
+    if let (Some(s), Some(i)) = (t.saved.as_mut(), saved) {
+        let (line, x) = pins[i];
+        (s.x, s.y) = (x, line.saturating_sub(hist).min(rows - 1));
+        if s.pending_wrap && x != cols - 1 {
+            s.pending_wrap = false;
+            s.x += 1;
+        }
+    }
+    if let (Some(s), Some(i)) = (t.selection.as_mut(), selection) {
+        let first = grid.first_line();
+        // An end on a row cut below the screen is discarded like one dropped from the history.
+        let point = |(line, col): (usize, usize)| {
+            let (line, col) = if line < hist + rows { (line, col) } else { (0, 0) };
+            Point { line: first + line as u64, col: col as u16 }
+        };
+        (s.start, s.end) = (point(pins[i]), point(pins[i + 1]));
+    }
+    if let Some(i) = view {
+        *t.view_offset = hist.saturating_sub(pins[i].0);
+    }
+    grid
+}
+
 fn default_tabs(cols: usize) -> Vec<bool> {
     (0..cols).map(|x| x != 0 && x % 8 == 0).collect()
 }
@@ -154,6 +238,8 @@ pub(crate) struct Term {
     tabs: Vec<bool>,
     /// DECSC slots of the primary and alternate screens.
     saved: [Option<Saved>; 2],
+    other_cursor: ScreenCursor,
+    redraw: Redraw,
     pub dirty: Dirty,
     /// Every row is marked in `dirty`.
     all_dirty: bool,
@@ -213,6 +299,8 @@ impl Term {
             bottom: rows - 1,
             tabs: default_tabs(cols),
             saved: [None, None],
+            other_cursor: ScreenCursor::default(),
+            redraw: Redraw::All,
             dirty: Dirty { rows: vec![0; rows.div_ceil(64)] },
             all_dirty: false,
             view_offset: 0,
@@ -736,6 +824,15 @@ impl Term {
                 if let Some(click) = events.or(cl) {
                     self.prompt_click = Some(click);
                 }
+                let redraw = option(b"redraw").and_then(|v| match v {
+                    b"0" => Some(Redraw::None),
+                    b"1" => Some(Redraw::All),
+                    b"last" => Some(Redraw::Last),
+                    _ => None,
+                });
+                if let Some(redraw) = redraw {
+                    self.redraw = redraw;
+                }
             }
             b'P' => prompt(self),
             b'B' => self.set_semantic(Semantic::Input, false),
@@ -1077,10 +1174,15 @@ impl Term {
         self.update_slow();
     }
 
+    fn screen_cursor(&self) -> ScreenCursor {
+        ScreenCursor { x: self.x, y: self.y, pending_wrap: self.pending_wrap, semantic: self.semantic }
+    }
+
     fn switch_screen(&mut self, alt: bool) {
         if alt == self.alt_active {
             return;
         }
+        self.other_cursor = self.screen_cursor();
         std::mem::swap(&mut self.grid, &mut self.other);
         self.alt_active = alt;
         self.selection = None;
@@ -1554,59 +1656,39 @@ impl Term {
 
     // ---- Resize --------------------------------------------------------
 
+    /// ghostty's Terminal.resize: the primary screen reflows while DECAWM is
+    /// set, the alternate screen never does.
     pub fn resize(&mut self, cols: usize, rows: usize) {
+        self.modes.sync_update = false;
         if cols == self.cols && rows == self.rows {
             self.mark_all_dirty();
             return;
         }
-        let pcur = if self.alt_active {
-            let s = self.saved[0].clone().unwrap_or_default();
-            ReflowCursor { x: s.x, y: s.y, pending: s.pending_wrap }
-        } else {
-            ReflowCursor { x: self.x, y: self.y, pending: self.pending_wrap }
-        };
-        // The selection's ends as (line from the oldest stored line, column).
-        let first = self.grid.first_line();
-        let to_grid = |p: Point| p.line.checked_sub(first).map_or((0, 0), |line| (line as usize, p.col as usize));
-        let mut ends: Vec<_> = self.selection.iter().flat_map(|s| [to_grid(s.start), to_grid(s.end)]).collect();
-        let primary_ends: &mut [(usize, usize)] = if self.alt_active { &mut [] } else { &mut ends };
-        let (primary, pcur) = self.primary().reflowed(cols, rows, pcur, primary_ends);
-        if self.alt_active {
-            let (alt, shift) = self.grid.resized(cols, rows, self.y, &mut ends);
-            self.grid = alt;
-            self.other = primary;
-            self.y -= shift;
-            if let Some(s) = &mut self.saved[0] {
-                (s.x, s.y, s.pending_wrap) = (pcur.x, pcur.y, pcur.pending);
-            }
-        } else {
-            self.other = self.other.resized(cols, rows, 0, &mut []).0;
-            self.grid = primary;
-            (self.x, self.y, self.pending_wrap) = (pcur.x, pcur.y, pcur.pending);
-        }
-        if let Some(s) = &mut self.selection {
-            let first = self.grid.first_line();
-            let point = |(line, col): (usize, usize)| Point { line: first + line as u64, col: col as u16 };
-            (s.start, s.end) = (point(ends[0]), point(ends[1]));
-        }
-        self.cols = cols;
-        self.rows = rows;
-        self.x = self.x.min(cols - 1);
-        self.y = self.y.min(rows - 1);
-        if self.pending_wrap && self.x != cols - 1 {
-            self.pending_wrap = false;
-        }
-        for s in self.saved.iter_mut().flatten() {
-            s.x = s.x.min(cols - 1);
-            s.y = s.y.min(rows - 1);
-        }
-        self.top = 0;
-        self.bottom = rows - 1;
-        let old = std::mem::take(&mut self.tabs);
-        self.tabs = default_tabs(cols);
+        let alt = self.alt_active;
+        let (mut active, mut inactive) = (self.screen_cursor(), self.other_cursor);
+        let (mut no_selection, mut no_view) = (None, 0);
+        let on = (&mut active, &mut self.selection, &mut self.view_offset);
+        let off = (&mut inactive, &mut no_selection, &mut no_view);
+        let ((cursor, selection, view_offset), (alt_cursor, alt_selection, alt_view_offset)) =
+            if alt { (off, on) } else { (on, off) };
+        let [saved, alt_saved] = &mut self.saved;
+        let tracked = Tracked { cursor, saved, selection, view_offset };
+        let alt_tracked =
+            Tracked { cursor: alt_cursor, saved: alt_saved, selection: alt_selection, view_offset: alt_view_offset };
+        let (grid, alt_grid) = if alt { (&self.other, &self.grid) } else { (&self.grid, &self.other) };
+        let primary = resize_screen(grid, cols, rows, self.autowrap, self.redraw, tracked);
+        let alternate = resize_screen(alt_grid, cols, rows, false, Redraw::None, alt_tracked);
+        (self.grid, self.other) = if alt { (alternate, primary) } else { (primary, alternate) };
+        (self.x, self.y, self.pending_wrap) = (active.x, active.y, active.pending_wrap);
+        self.other_cursor = inactive;
+        // Unlike ghostty, which resets them, the tab stops in the remaining columns stay.
+        let old = std::mem::replace(&mut self.tabs, default_tabs(cols));
         let keep = old.len().min(cols);
         self.tabs[..keep].copy_from_slice(&old[..keep]);
-        self.view_offset = 0;
+        self.cols = cols;
+        self.rows = rows;
+        self.top = 0;
+        self.bottom = rows - 1;
         self.dirty.rows = vec![0; rows.div_ceil(64)];
         self.set_all_dirty();
     }
