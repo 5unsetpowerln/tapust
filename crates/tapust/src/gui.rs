@@ -4,6 +4,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::Ordering;
@@ -57,7 +58,7 @@ struct State {
     tabs: HashMap<u32, Tab>,
     cwd: PathBuf,
     /// Program for the first pane (`-e`); later panes run the login shell.
-    command: Option<Vec<String>>,
+    command: Option<Vec<OsString>>,
     palette: term::Palette,
     term_bg: [u8; 4],
     /// The prompt or message on screen, as a dialog or a toast.
@@ -328,7 +329,7 @@ fn main_menu() -> gio::Menu {
 }
 
 impl App {
-    pub fn build(application: &adw::Application, command: Option<Vec<String>>) -> Rc<App> {
+    pub fn build(application: &adw::Application, command: Option<Vec<OsString>>) -> Rc<App> {
         let tab_view = adw::TabView::builder().shortcuts(adw::TabViewShortcuts::empty()).build();
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&tab_view));
@@ -821,15 +822,7 @@ impl App {
                 let _ = io.pty.resize(cols, rows, cell);
             }
             None => {
-                let pty = match st.command.take() {
-                    Some(argv) => {
-                        let mut command = std::process::Command::new(&argv[0]);
-                        command.args(&argv[1..]);
-                        Pty::spawn_command(command, cols, rows, cell, &p.cwd)
-                    }
-                    None => Pty::spawn(cols, rows, cell, &p.cwd),
-                };
-                let pty = match pty {
+                let pty = match Pty::spawn(st.command.take(), cols, rows, cell, &p.cwd) {
                     Ok(pty) => pty,
                     Err(err) => {
                         eprintln!("tapust: cannot start a shell: {err}");

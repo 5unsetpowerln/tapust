@@ -8,7 +8,7 @@
 //! is parsing.
 
 use std::collections::VecDeque;
-use std::ffi::{CStr, OsStr};
+use std::ffi::{CStr, OsStr, OsString};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -20,6 +20,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 use parking_lot::Mutex;
+
+use crate::shell;
 
 const READ_BUFFER: usize = 1 << 20;
 
@@ -70,12 +72,22 @@ pub struct Pty {
 }
 
 impl Pty {
-    /// Starts the login shell as a login shell (argv[0] prefixed with '-', like tmux).
-    pub fn spawn(cols: u16, rows: u16, cell: (u32, u32), cwd: &Path) -> io::Result<Pty> {
-        let shell = login_shell()?;
-        let mut command = Command::new(&shell);
-        let name = shell.file_name().map(|n| n.as_bytes()).unwrap_or(b"sh");
-        command.arg0(OsStr::from_bytes(&[b"-", name].concat()));
+    /// Starts `argv`, or without it the login shell as a login shell (argv[0]
+    /// prefixed with '-', like tmux), with ghostty's shell integration.
+    pub fn spawn(argv: Option<Vec<OsString>>, cols: u16, rows: u16, cell: (u32, u32), cwd: &Path) -> io::Result<Pty> {
+        let login = argv.is_none();
+        let argv = match argv {
+            Some(argv) => argv,
+            None => vec![login_shell()?.into_os_string()],
+        };
+        let mut env: shell::Env = std::env::vars_os().collect();
+        let argv = shell::prepare(argv, &mut env);
+        let mut command = Command::new(&argv[0]);
+        command.args(&argv[1..]).env_clear().envs(&env);
+        if login {
+            let name = Path::new(&argv[0]).file_name().map(|n| n.as_bytes()).unwrap_or(b"sh");
+            command.arg0(OsStr::from_bytes(&[b"-", name].concat()));
+        }
         Self::spawn_command(command, cols, rows, cell, cwd)
     }
 

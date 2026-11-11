@@ -10,16 +10,18 @@ mod pty;
 mod renderer;
 mod scroll;
 mod selection;
+mod shell;
 mod surface;
 mod theme;
 
 use std::error::Error;
+use std::ffi::OsString;
 
 use adw::prelude::*;
 use gtk::{gdk, gio};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     // `tapust -e PROGRAM [ARGS...]` runs PROGRAM in the first pane instead of the login shell.
     let command = match args.split_first() {
         None => None,
