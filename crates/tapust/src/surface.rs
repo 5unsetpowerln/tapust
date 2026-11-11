@@ -1,7 +1,8 @@
 //! A pane's widgets, as ghostty builds them (surface-scrolled-window.blp and
 //! surface.blp): an Adw.Bin with a GtkScrolledWindow around an Overlay whose
-//! child is the GLArea that draws the terminal, with ghostty's resize
-//! overlay, unfocused-split veil, drag handle and drop overlay on top.
+//! child is the GLArea that draws the terminal, with ghostty's child
+//! exited banner, resize overlay, unfocused-split veil, drag handle and drop
+//! overlay on top.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -51,6 +52,8 @@ pub enum Event {
     /// The cell size in device pixels is known or changed (ghostty's
     /// cell_size action).
     CellSize { cell: (u32, u32) },
+    /// The child exited banner's Close button: close without confirmation.
+    ChildExitedClose { pane: PaneId },
 }
 
 pub type Handler = Rc<dyn Fn(Event) -> bool>;
@@ -103,6 +106,9 @@ pub struct Surface {
     resize_bin: adw::Bin,
     url_left: gtk::Label,
     url_right: gtk::Label,
+    /// ghostty's SurfaceChildExited and its banner.
+    child_exited: adw::Bin,
+    banner: adw::Banner,
     resize_hide: RefCell<Option<glib::SourceId>>,
     resize_idle: Cell<bool>,
     blink_timer: RefCell<Option<glib::SourceId>>,
@@ -249,6 +255,20 @@ impl Surface {
         page.append(&area);
         let overlay = gtk::Overlay::builder().focusable(false).focus_on_click(false).child(&page).build();
 
+        // ghostty's SurfaceChildExited: a revealed banner at the bottom,
+        // shown once the child exited.
+        let banner = adw::Banner::builder()
+            .revealed(true)
+            .button_label("Close")
+            .halign(gtk::Align::Fill)
+            .valign(gtk::Align::End)
+            .build();
+        let child_exited = theme::styled(
+            adw::Bin::builder().visible(false).child(&adw::Bin::builder().child(&banner).build()).build(),
+            &["child-exited"],
+        );
+        overlay.add_overlay(&child_exited);
+
         // ghostty's ResizeOverlay: a centered `background` label shown 750 ms.
         let resize_label = theme::styled(
             gtk::Label::builder()
@@ -334,6 +354,8 @@ impl Surface {
             resize_bin,
             url_left,
             url_right,
+            child_exited,
+            banner,
             resize_hide: RefCell::new(None),
             resize_idle: Cell::new(false),
             blink_timer: RefCell::new(None),
@@ -452,6 +474,10 @@ impl Surface {
         let h = handler.clone();
         self.area.connect_map(move |_| {
             h(Event::Mapped);
+        });
+        let (pane, h) = (self.pane, handler.clone());
+        self.banner.connect_button_clicked(move |_| {
+            h(Event::ChildExitedClose { pane });
         });
 
         // ghostty's GestureClick for every button.
@@ -1429,6 +1455,20 @@ impl Surface {
 
     pub fn bell_ringing(&self) -> bool {
         self.bell.get()
+    }
+
+    /// ghostty's childExited on the GTK surface: the banner tells how the
+    /// child ended.
+    pub fn show_child_exited(&self, code: u32) {
+        let (title, class, other) = if code == 0 {
+            ("Command Succeeded", "normal", "abnormal")
+        } else {
+            ("Command Failed", "abnormal", "normal")
+        };
+        self.banner.set_title(title);
+        self.child_exited.add_css_class(class);
+        self.child_exited.remove_css_class(other);
+        self.child_exited.set_visible(true);
     }
 
     pub fn set_password_input(&self, on: bool) {

@@ -5,7 +5,8 @@
 //! reading into its buffer instead of waiting, so one lock acquisition parses
 //! as much as possible. The renderer can ask for the lock with
 //! [`Shared::want_lock`]; the I/O thread then releases it after the chunk it
-//! is parsing.
+//! is parsing. It also watches the child process, as ghostty does, and
+//! reports its exit once the output read so far is parsed.
 
 use std::collections::VecDeque;
 use std::ffi::{CStr, OsStr, OsString};
@@ -15,9 +16,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
@@ -69,6 +71,16 @@ fn login_shell() -> io::Result<PathBuf> {
 pub struct Pty {
     master: OwnedFd,
     child: Child,
+    started: Instant,
+}
+
+/// How the child process ended (ghostty's Message.ChildExited).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChildExit {
+    /// The exit status, or the number of the signal that killed it.
+    pub code: u32,
+    /// From the spawn to the exit.
+    pub runtime: Duration,
 }
 
 impl Pty {
@@ -125,11 +137,12 @@ impl Pty {
             });
         }
         let child = command.spawn()?;
+        let started = Instant::now();
         let fd = master.as_raw_fd();
         let flags = cvt(unsafe { libc::fcntl(fd, libc::F_GETFL) })?;
         cvt(unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) })?;
         cvt(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) })?;
-        Ok(Pty { master, child })
+        Ok(Pty { master, child, started })
     }
 
     pub fn resize(&self, cols: u16, rows: u16, cell: (u32, u32)) -> io::Result<()> {
@@ -200,7 +213,7 @@ pub struct Shared<T> {
     pub dirty: AtomicBool,
     /// Set by the renderer while it waits for the terminal lock.
     pub want_lock: AtomicBool,
-    pub exited: AtomicBool,
+    pub exited: OnceLock<ChildExit>,
     pending: Mutex<VecDeque<u8>>,
     master: RawFd,
     wake: OwnedFd,
@@ -257,11 +270,14 @@ impl<T: Feed> PaneIo<T> {
     /// terminal becomes dirty or the process exits.
     pub fn start(pty: Pty, term: T, notify: impl Fn() + Send + 'static) -> io::Result<PaneIo<T>> {
         let wake = cvt(unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) })?;
+        let pid = pty.child.id() as libc::pid_t;
+        let pidfd = cvt(unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as libc::c_int)?;
+        let child = (unsafe { OwnedFd::from_raw_fd(pidfd) }, pty.started);
         let shared = Arc::new(Shared {
             term: Mutex::new(term),
             dirty: AtomicBool::new(false),
             want_lock: AtomicBool::new(false),
-            exited: AtomicBool::new(false),
+            exited: OnceLock::new(),
             pending: Mutex::new(VecDeque::new()),
             master: pty.master.as_raw_fd(),
             wake: unsafe { OwnedFd::from_raw_fd(wake) },
@@ -269,7 +285,7 @@ impl<T: Feed> PaneIo<T> {
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let (shared, stop) = (shared.clone(), stop.clone());
-            std::thread::Builder::new().name("pane-io".into()).spawn(move || io_loop(&shared, &stop, notify))?
+            std::thread::Builder::new().name("pane-io".into()).spawn(move || io_loop(&shared, &stop, child, notify))?
         };
         Ok(PaneIo { pty, shared, thread: Some(thread), stop })
     }
@@ -285,22 +301,32 @@ impl<T> Drop for PaneIo<T> {
     }
 }
 
-fn io_loop<T: Feed>(shared: &Shared<T>, stop: &AtomicBool, notify: impl Fn()) {
+fn io_loop<T: Feed>(shared: &Shared<T>, stop: &AtomicBool, (pidfd, started): (OwnedFd, Instant), notify: impl Fn()) {
     let mut buf = vec![0u8; READ_BUFFER].into_boxed_slice();
     let mut filled = 0;
     let mut scratch: Vec<u8> = Vec::new();
     let master = shared.master;
     let wake = shared.wake.as_raw_fd();
+    // Every process closed the slave side.
+    let mut eof = false;
+    // The child exited, not yet reported.
+    let mut exit = None;
 
     while !stop.load(Ordering::Acquire) {
         let has_pending = !shared.pending.lock().is_empty();
+        let watching = exit.is_none() && shared.exited.get().is_none();
         let mut fds = [
-            libc::pollfd { fd: master, events: libc::POLLIN | if has_pending { libc::POLLOUT } else { 0 }, revents: 0 },
+            libc::pollfd {
+                fd: if eof { -1 } else { master },
+                events: libc::POLLIN | if has_pending { libc::POLLOUT } else { 0 },
+                revents: 0,
+            },
             libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: if watching { pidfd.as_raw_fd() } else { -1 }, events: libc::POLLIN, revents: 0 },
         ];
         // While output waits behind a busy lock, wake up soon to retry it.
         let timeout = if filled > 0 { 1 } else { -1 };
-        if unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) } < 0 {
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) } < 0 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
@@ -320,7 +346,6 @@ fn io_loop<T: Feed>(shared: &Shared<T>, stop: &AtomicBool, notify: impl Fn()) {
             }
         }
 
-        let mut eof = false;
         if fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 || filled > 0 {
             loop {
                 let mut got_data = false;
@@ -359,19 +384,47 @@ fn io_loop<T: Feed>(shared: &Shared<T>, stop: &AtomicBool, notify: impl Fn()) {
                 }
             }
         }
-        if eof && filled == 0 {
-            shared.exited.store(true, Ordering::Release);
+        // The child wrote its last output before it exited, so the read
+        // above got it when both were ready.
+        if fds[2].revents & libc::POLLIN != 0 {
+            match child_exit(&pidfd, started) {
+                Ok(e) => exit = Some(e),
+                Err(err) => {
+                    eprintln!("tapust: cannot wait for the child process: {err}");
+                    break;
+                }
+            }
+        }
+        if filled == 0
+            && let Some(exit) = exit.take()
+        {
+            let _ = shared.exited.set(exit);
             notify();
+        }
+        if eof && filled == 0 && shared.exited.get().is_some() {
             break;
         }
     }
+}
+
+/// How the child behind `pidfd` exited, as libxev's process watcher reports
+/// it (the siginfo status). WNOWAIT leaves the child for Pty's drop to reap.
+fn child_exit(pidfd: &OwnedFd, started: Instant) -> io::Result<ChildExit> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let options = libc::WEXITED | libc::WNOWAIT;
+    while unsafe { libc::waitid(libc::P_PIDFD, pidfd.as_raw_fd() as libc::id_t, &mut info, options) } == -1 {
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+    Ok(ChildExit { code: unsafe { info.si_status() } as u32, runtime: started.elapsed() })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
 
     #[derive(Default)]
     struct Recorder(Vec<u8>);
@@ -403,7 +456,7 @@ mod tests {
         loop {
             {
                 let term = io.shared.term.lock();
-                if done(&term.0, io.shared.exited.load(Ordering::Acquire)) {
+                if done(&term.0, io.shared.exited.get().is_some()) {
                     return String::from_utf8_lossy(&term.0).into_owned();
                 }
             }
@@ -419,6 +472,29 @@ mod tests {
         let (io, rx) = start("printf 'hello from pty'");
         let out = wait_for(&io, &rx, |_, exited| exited);
         assert!(out.contains("hello from pty"), "{out:?}");
+    }
+
+    #[test]
+    fn exit_reports_the_status_and_runtime() {
+        let (io, rx) = start("exit 3");
+        wait_for(&io, &rx, |_, exited| exited);
+        let exit = *io.shared.exited.get().unwrap();
+        assert_eq!(exit.code, 3);
+        assert!(exit.runtime < Duration::from_secs(5), "{exit:?}");
+        let (io, rx) = start("kill -9 $$");
+        wait_for(&io, &rx, |_, exited| exited);
+        assert_eq!(io.shared.exited.get().unwrap().code, 9);
+    }
+
+    #[test]
+    fn exit_does_not_wait_for_the_pty_to_close() {
+        // The background sleep keeps the slave side open.
+        let started = Instant::now();
+        let (io, rx) = start("trap '' HUP; sleep 3 & printf done");
+        let out = wait_for(&io, &rx, |_, exited| exited);
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert_eq!(out, "done");
+        assert_eq!(io.shared.exited.get().unwrap().code, 0);
     }
 
     #[test]

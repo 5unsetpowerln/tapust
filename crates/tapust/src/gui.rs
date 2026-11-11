@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
@@ -16,7 +15,7 @@ use mux::{Command, ConfirmTarget, Effect, KeyResult, Node, Overlay, PaneId, Rect
 
 use crate::compose;
 use crate::input;
-use crate::pty::{PaneIo, Pty};
+use crate::pty::{ChildExit, PaneIo, Pty};
 use crate::surface::{Event, Surface};
 use crate::theme;
 
@@ -39,6 +38,8 @@ struct Pane {
     title_override: Option<String>,
     /// The working directory the terminal reported (OSC 7), ghostty's pwd.
     pwd: Option<String>,
+    /// ghostty's child_exited: the exit was handled and the pane stayed.
+    child_exited: bool,
 }
 
 /// A tab: ghostty's Tab (a vertical box) holding a SplitTree whose tree_bin
@@ -751,6 +752,10 @@ impl App {
                 self.queue_reconcile();
                 true
             }
+            Event::ChildExitedClose { pane } => {
+                self.close_pane(pane);
+                true
+            }
         }
     }
 
@@ -785,16 +790,28 @@ impl App {
             KeyResult::Forward(id) => {
                 let target = if st.panes.contains_key(&id) { id } else { pane };
                 let mut typed = None;
-                if let Some(io) = st.panes.get(&target).and_then(|p| p.io.as_ref()) {
+                let mut close = false;
+                if let Some(p) = st.panes.get(&target)
+                    && let Some(io) = &p.io
+                {
                     let app_cursor = io.shared.term.lock().modes().app_cursor;
                     let mut bytes = Vec::new();
                     input::encode(key, text.as_deref(), app_cursor, &mut bytes);
-                    io.shared.write(&bytes);
-                    if !bytes.is_empty() {
-                        typed = Some(st.panes[&target].surface.clone());
+                    // ghostty's keyCallback: a key that encodes to something
+                    // closes a surface whose child exited.
+                    if p.child_exited && !bytes.is_empty() {
+                        close = true;
+                    } else {
+                        io.shared.write(&bytes);
+                        if !bytes.is_empty() {
+                            typed = Some(p.surface.clone());
+                        }
                     }
                 }
                 drop(st);
+                if close {
+                    self.close_pane(target);
+                }
                 // ghostty's selection-clear-on-typing and scroll-to-bottom =
                 // keystroke, once the state is no longer borrowed (clearing
                 // the selection updates the Copy action).
@@ -856,17 +873,12 @@ impl App {
         let mut st = self.state.borrow_mut();
         let Some(p) = st.panes.get_mut(&pane) else { return };
         let Some(io) = &p.io else { return };
-        if io.shared.exited.load(Ordering::Acquire) {
-            let effects = st.session.pane_exited(pane);
-            drop(st);
-            self.apply(effects);
-            self.queue_reconcile();
-            return;
-        }
+        let exit = io.shared.exited.get().copied().filter(|_| !p.child_exited);
         let (title, pwd, bell) = {
             let mut term = io.shared.term.lock();
             (term.title().to_owned(), term.reported_cwd().map(str::to_owned), term.take_bell())
         };
+        p.child_exited |= exit.is_some();
         p.surface.output();
         p.surface.area.queue_render();
         p.surface.sync_scrollbar();
@@ -886,6 +898,28 @@ impl App {
         if changed {
             self.queue_reconcile();
         }
+        if let Some(exit) = exit {
+            self.child_exited(pane, &surface, exit);
+        }
+    }
+
+    /// ghostty's Surface.childExited with wait-after-command = false: a
+    /// failing child that exited within abnormal-command-exit-runtime keeps
+    /// its surface with the banner; any other exit closes the surface.
+    fn child_exited(self: &Rc<Self>, pane: PaneId, surface: &Surface, exit: ChildExit) {
+        surface.show_child_exited(exit.code);
+        if exit.runtime.as_millis() <= theme::ABNORMAL_EXIT_RUNTIME.as_millis() && exit.code != 0 {
+            return;
+        }
+        self.close_pane(pane);
+    }
+
+    /// ghostty's close-request of a surface whose child exited: it closes
+    /// without confirmation.
+    fn close_pane(self: &Rc<Self>, pane: PaneId) {
+        let effects = self.state.borrow_mut().session.pane_exited(pane);
+        self.apply(effects);
+        self.queue_reconcile();
     }
 
     fn update_names(self: &Rc<Self>) {
@@ -940,7 +974,10 @@ impl App {
                     let handler: crate::surface::Handler =
                         Rc::new(move |event| weak.upgrade().is_some_and(|app| app.handle(event)));
                     let surface = Surface::new(pane, st.term_bg, handler);
-                    st.panes.insert(pane, Pane { surface, io: None, cwd, title: String::new(), title_override: None, pwd: None });
+                    st.panes.insert(
+                        pane,
+                        Pane { surface, io: None, cwd, title: String::new(), title_override: None, pwd: None, child_exited: false },
+                    );
                 }
                 Effect::Destroy { pane } => {
                     let removed = self.state.borrow_mut().panes.remove(&pane);
@@ -1301,7 +1338,7 @@ impl App {
     fn pane_needs_confirm(&self, pane: PaneId) -> bool {
         let st = self.state.borrow();
         st.panes.get(&pane).and_then(|p| p.io.as_ref()).is_some_and(|io| {
-            !io.shared.exited.load(Ordering::Acquire) && !io.shared.term.lock().cursor_at_prompt()
+            io.shared.exited.get().is_none() && !io.shared.term.lock().cursor_at_prompt()
         })
     }
 

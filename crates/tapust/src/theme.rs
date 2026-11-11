@@ -57,6 +57,10 @@ pub const ICON: &str = "utilities-terminal";
 /// closes.
 pub const OVERVIEW_FOCUS: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// `abnormal-command-exit-runtime`: a failing child that exits this soon
+/// keeps its surface open.
+pub const ABNORMAL_EXIT_RUNTIME: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// How often ghostty checks the PTY's termios for a password prompt.
 pub const TERMIOS_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
