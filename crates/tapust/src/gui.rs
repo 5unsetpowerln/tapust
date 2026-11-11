@@ -1645,8 +1645,8 @@ impl App {
     fn reset(&self) {
         // ghostty's reset action: a full reset, which also drops the selection.
         self.active_io(|io| io.shared.term.lock().full_reset());
+        self.sync_copy_action();
         if let Some(surface) = self.active_surface() {
-            surface.clear_selection();
             surface.area.queue_render();
         }
     }

@@ -1,8 +1,7 @@
 //! Copies terminal rows into pane grids, resolving styles to colors.
 
-use term::{Attrs, Cell, Color, CursorShape, Palette, Rgb, Style, Terminal, Underline, Width};
+use term::{Attrs, Cell, Color, CursorShape, Palette, Rgb, Selection, Style, Terminal, Underline, Width};
 
-use crate::selection::Selection;
 use crate::frame::{BOLD, CursorStyle, FrameCell, FrameCursor, Grid, ITALIC, STRIKE, UNDERLINE, WIDE};
 
 fn rgba(c: Rgb) -> [u8; 4] {

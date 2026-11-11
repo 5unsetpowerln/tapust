@@ -12,6 +12,7 @@ use std::time::Instant;
 use adw::prelude::*;
 use gtk::{gdk, gio, glib, graphene};
 use mux::{Direction, PaneId};
+use term::{Point, Selection};
 
 use crate::compose;
 use crate::font::Fonts;
@@ -22,7 +23,7 @@ use crate::scroll::SurfaceBin;
 use crate::links;
 use crate::mouse;
 use crate::notifications::DesktopNotifications;
-use crate::selection::{self, DragPoint, Point, Selection};
+use crate::selection::{self, DragPoint};
 use crate::theme;
 
 /// What a surface tells the application.
@@ -148,7 +149,6 @@ pub struct Surface {
     /// forgets it.
     pending_swipe: Cell<f64>,
     swipe_reset: RefCell<Option<glib::SourceId>>,
-    selection: RefCell<Option<Selection>>,
     gesture: RefCell<Gesture>,
     /// Mouse buttons held (bit per button number), for motion reports.
     buttons: Cell<u8>,
@@ -156,8 +156,6 @@ pub struct Surface {
     suppress_left_release: Cell<bool>,
     /// Scrolls while a selection is dragged above or below the surface.
     autoscroll: RefCell<Option<(glib::SourceId, bool)>>,
-    /// The terminal was on the alternate screen at the last frame.
-    was_alt: Cell<bool>,
     /// Modifiers held (from the key controller), for the pointer's shape.
     mods: Cell<mouse::Mods>,
     /// The CSS cursor name last given to the GLArea.
@@ -414,12 +412,10 @@ impl Surface {
             pending_scroll: Cell::new(0.0),
             pending_swipe: Cell::new(0.0),
             swipe_reset: RefCell::new(None),
-            selection: RefCell::new(None),
             gesture: RefCell::new(Gesture::default()),
             buttons: Cell::new(0),
             suppress_left_release: Cell::new(false),
             autoscroll: RefCell::new(None),
-            was_alt: Cell::new(false),
             mods: Cell::new(mouse::Mods::default()),
             cursor: Cell::new("text"),
             hover: RefCell::new(None),
@@ -881,16 +877,19 @@ impl Surface {
         }
     }
 
-    /// ghostty's setScrollbar from the terminal's scrollback.
+    /// Sets the terminal's selection for the user; SelectionChanged tells
+    /// the application when one appeared or went away.
     fn set_selection(&self, selection: Option<Selection>) {
-        if *self.selection.borrow() == selection {
+        let Some(shared) = self.draw.borrow().shared.clone() else { return };
+        let mut term = shared.term.lock();
+        let old = term.selection();
+        if old == selection {
             return;
         }
-        let changed = self.selection.borrow().is_some() != selection.is_some();
-        *self.selection.borrow_mut() = selection;
-        self.draw.borrow_mut().full = true;
+        term.set_selection(selection);
+        drop(term);
         self.area.queue_render();
-        if changed {
+        if old.is_some() != selection.is_some() {
             (self.handler)(Event::SelectionChanged);
         }
     }
@@ -900,14 +899,14 @@ impl Surface {
     }
 
     pub fn has_selection(&self) -> bool {
-        self.selection.borrow().is_some()
+        self.draw.borrow().shared.as_ref().is_some_and(|s| s.term.lock().selection().is_some())
     }
 
     /// The selected text as ghostty copies it.
     pub fn selection_text(&self) -> Option<String> {
-        let sel = (*self.selection.borrow())?;
         let shared = self.draw.borrow().shared.clone()?;
-        let text = selection::text(&shared.term.lock(), &sel);
+        let term = shared.term.lock();
+        let text = selection::text(&term, &term.selection()?);
         (!text.is_empty()).then_some(text)
     }
 
@@ -1021,7 +1020,7 @@ impl Surface {
                 // selection and copies it to the primary selection.
                 let term = shared.term.lock();
                 let Some(point) = self.drag_point(&term, x, y) else { return };
-                let inside = self.selection.borrow().is_some_and(|s| s.contains(point.cell, term.cols()));
+                let inside = term.selection().is_some_and(|s| s.contains(point.cell, term.cols()));
                 let hovered = self.hover.borrow().as_ref().map(|(sel, _)| *sel);
                 if !inside && let Some(word) = hovered.or_else(|| selection::word(&term, point.cell)) {
                     drop(term);
@@ -1309,6 +1308,7 @@ impl Surface {
         self.sync_scrollbar();
     }
 
+    /// ghostty's setScrollbar from the terminal's scrollback.
     pub fn sync_scrollbar(&self) {
         let (offset, total, len) = {
             let d = self.draw.borrow();
@@ -1603,13 +1603,8 @@ impl Surface {
             shared.want_lock.store(true, Ordering::Release);
             let mut term = shared.term.lock();
             shared.want_lock.store(false, Ordering::Release);
-            // ghostty drops the selection when the screen switches.
-            let alt = term.modes().alt_screen;
-            if alt != self.was_alt.replace(alt) && self.selection.borrow_mut().take().is_some() {
-                d.full = true;
-                (self.handler)(Event::SelectionChanged);
-            }
-            compose::copy_pane(grid, &mut term, d.full, self.selection.borrow().as_ref());
+            let selection = term.selection();
+            compose::copy_pane(grid, &mut term, d.full, selection.as_ref());
             if let Some((link, _)) = self.hover.borrow().as_ref() {
                 compose::underline(grid, &term, link);
             }

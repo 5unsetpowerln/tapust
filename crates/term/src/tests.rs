@@ -1,6 +1,6 @@
 use crate::{
-    Attrs, Cell, Color, CursorShape, Message, MouseEncoding, MouseMode, Palette, ProgressReport, Rgb, Style, Terminal,
-    Underline, Width,
+    Attrs, Cell, Color, CursorShape, Message, MouseEncoding, MouseMode, Palette, Point, ProgressReport, Rgb, Selection,
+    Style, Terminal, Underline, Width,
 };
 
 fn term(cols: u16, rows: u16) -> Terminal {
@@ -1294,6 +1294,185 @@ fn ris_removes_the_progress_report() {
     // The reset action resets without telling the surface.
     t.full_reset();
     assert_eq!(t.take_messages(), []);
+}
+
+// ---- Selection --------------------------------------------------------------
+
+fn select(t: &mut Terminal, start: (u64, u16), end: (u64, u16)) -> Selection {
+    let top = t.view_top();
+    let point = |(row, col)| Point { line: top + row, col };
+    let sel = Selection { start: point(start), end: point(end), rect: false };
+    t.set_selection(Some(sel));
+    sel
+}
+
+/// The cells under the selection's ends.
+fn ends(t: &Terminal) -> (Cell, Cell) {
+    let s = t.selection().unwrap();
+    let at = |p: Point| t.line(p.line).unwrap()[p.col as usize];
+    (at(s.start), at(s.end))
+}
+
+fn chars(cells: (Cell, Cell)) -> (Option<char>, Option<char>) {
+    (cells.0.char(), cells.1.char())
+}
+
+#[test]
+fn ris_clears_the_selection() {
+    let mut t = term(10, 3);
+    feed(&mut t, "hello");
+    let sel = select(&mut t, (0, 0), (0, 4));
+    assert_eq!(t.selection(), Some(sel));
+    feed(&mut t, "\x1bc");
+    assert_eq!(t.selection(), None);
+    select(&mut t, (0, 0), (0, 4));
+    t.full_reset();
+    assert_eq!(t.selection(), None);
+}
+
+#[test]
+fn screen_switches_clear_the_selection() {
+    let mut t = term(10, 3);
+    feed(&mut t, "primary");
+    let sel = select(&mut t, (0, 0), (0, 6));
+    // Leaving a screen that is not active switches nothing.
+    feed(&mut t, "\x1b[?1049l\x1b[?1047l\x1b[?47l");
+    assert_eq!(t.selection(), Some(sel));
+    feed(&mut t, "\x1b[?1049h");
+    assert_eq!(t.selection(), None);
+    let alt = select(&mut t, (1, 0), (1, 3));
+    feed(&mut t, "\x1b[?1049h\x1b[?1047h\x1b[?47h");
+    assert_eq!(t.selection(), Some(alt));
+    // The primary screen's selection does not come back either.
+    feed(&mut t, "\x1b[?1049l");
+    assert_eq!(t.selection(), None);
+    for mode in [47, 1047] {
+        select(&mut t, (0, 0), (0, 6));
+        feed(&mut t, &format!("\x1b[?{mode}h"));
+        assert_eq!(t.selection(), None, "entering with {mode}");
+        select(&mut t, (0, 0), (0, 6));
+        feed(&mut t, &format!("\x1b[?{mode}l"));
+        assert_eq!(t.selection(), None, "leaving with {mode}");
+    }
+}
+
+#[test]
+fn erasing_and_scrolling_keep_the_selection() {
+    let mut t = term(10, 3);
+    feed(&mut t, "abc\r\ndef");
+    let sel = select(&mut t, (0, 0), (0, 2));
+    // "abc" scrolls into the history and keeps its line.
+    feed(&mut t, "\r\n\r\n\r\n");
+    assert_eq!(t.selection(), Some(sel));
+    assert_eq!(chars(ends(&t)), (Some('a'), Some('c')));
+    let sel = select(&mut t, (0, 1), (2, 5));
+    feed(&mut t, "\x1b[2J\x1b[H\x1b[J\x1b[1J\x1b[Kxyz\x1b[2;1H\x1b[M\x1b[S");
+    assert_eq!(t.selection(), Some(sel));
+}
+
+#[test]
+fn reflow_keeps_the_selection_on_its_text() {
+    let mut t = term(10, 4);
+    feed(&mut t, "0123456789abcdefghij\r\nshort");
+    select(&mut t, (0, 5), (1, 3));
+    assert_eq!(chars(ends(&t)), (Some('5'), Some('d')));
+    t.resize(7, 4);
+    assert_eq!(screen(&t), ["0123456", "789abcd", "efghij", "short"]);
+    assert_eq!(chars(ends(&t)), (Some('5'), Some('d')));
+    assert_eq!(t.selection().unwrap().end, Point { line: t.view_top() + 1, col: 6 });
+    t.resize(20, 4);
+    assert_eq!(chars(ends(&t)), (Some('5'), Some('d')));
+    assert_eq!(t.selection().unwrap().end, Point { line: t.view_top(), col: 13 });
+    t.resize(10, 4);
+    assert_eq!(chars(ends(&t)), (Some('5'), Some('d')));
+    // The second half of a wide character moves with it.
+    let mut t = term(6, 3);
+    feed(&mut t, "ab\u{4e2d}\u{6587}\u{5b57}");
+    select(&mut t, (0, 3), (1, 1));
+    t.resize(5, 3);
+    assert_eq!(screen(&t), ["ab\u{4e2d}", "\u{6587}\u{5b57}"]);
+    let s = t.selection().unwrap();
+    assert_eq!((s.start.col, s.end.col), (3, 3));
+    assert_eq!((ends(&t).0.width(), ends(&t).1.width()), (Width::SpacerTail, Width::SpacerTail));
+    assert_eq!(t.line(s.end.line).unwrap()[2].char(), Some('\u{5b57}'));
+}
+
+#[test]
+fn reflow_clamps_a_point_in_trailing_blanks() {
+    // The row starts the line: the point stays on the row's first
+    // destination row instead of making it wrap.
+    let mut t = term(10, 3);
+    feed(&mut t, "abc\r\nxyz");
+    select(&mut t, (0, 1), (0, 8));
+    t.resize(5, 3);
+    assert_eq!(screen(&t), ["abc", "xyz"]);
+    assert_eq!(t.selection().unwrap().end, Point { line: t.view_top(), col: 4 });
+    // The row continues a wrapped line at destination column 6: 9 - 1 - 6.
+    let mut t = term(6, 3);
+    feed(&mut t, "abcdefgh\r\nz");
+    select(&mut t, (0, 0), (1, 5));
+    t.resize(9, 3);
+    assert_eq!(screen(&t), ["abcdefgh", "z"]);
+    assert_eq!(t.selection().unwrap().end, Point { line: t.view_top(), col: 8 });
+    // A blank row below the cursor that holds a point is kept.
+    let mut t = term(10, 5);
+    feed(&mut t, "top\x1b[2;1Hcur");
+    select(&mut t, (0, 0), (3, 2));
+    t.resize(8, 5);
+    assert_eq!(t.selection().unwrap().end, Point { line: t.view_top() + 3, col: 2 });
+}
+
+#[test]
+fn discarded_ends_move_to_the_oldest_line() {
+    let mut t = Terminal::new(10, 2, 2);
+    feed(&mut t, "a\r\nb\r\nc");
+    let first = t.first_line();
+    let sel = Selection { start: Point { line: first, col: 3 }, end: Point { line: first + 2, col: 0 }, rect: false };
+    t.set_selection(Some(sel));
+    assert_eq!(chars(ends(&t)), (None, Some('c')));
+    // "a" and "b" leave the two-line scrollback.
+    feed(&mut t, "\r\nd\r\ne\r\nf");
+    let s = t.selection().unwrap();
+    assert_eq!(s.start, Point { line: t.first_line(), col: 0 });
+    assert_eq!(s.end, sel.end);
+    assert_eq!(chars(ends(&t)), (Some('c'), Some('c')));
+    // ED 3 discards the history.
+    feed(&mut t, "\x1b[3J");
+    let s = t.selection().unwrap();
+    assert_eq!((s.start, s.end), (Point { line: t.first_line(), col: 0 }, Point { line: t.first_line(), col: 0 }));
+    // Lines the reflow drops from the history too.
+    let mut t = Terminal::new(8, 2, 2);
+    feed(&mut t, "11111111\r\n22\r\n33\r\n44");
+    let first = t.first_line();
+    t.set_selection(Some(Selection {
+        start: Point { line: first, col: 2 },
+        end: Point { line: first + 2, col: 1 },
+        rect: false,
+    }));
+    t.resize(4, 2);
+    assert_eq!(t.history_len(), 2);
+    let s = t.selection().unwrap();
+    assert_eq!(s.start, Point { line: t.first_line(), col: 0 });
+    assert_eq!(chars(ends(&t)), (Some('1'), Some('3')));
+}
+
+#[test]
+fn alternate_screen_resize_moves_the_selection_with_its_rows() {
+    let mut t = term(10, 4);
+    feed(&mut t, "\x1b[?1049h\x1b[Hrow0\r\nrow1\r\nrow2\r\nrow3");
+    select(&mut t, (0, 2), (2, 8));
+    // Two rows leave the top to keep the cursor on screen.
+    t.resize(5, 2);
+    assert_eq!(screen(&t), ["row2", "row3"]);
+    let s = t.selection().unwrap();
+    assert_eq!(s.start, Point { line: t.first_line(), col: 0 });
+    assert_eq!(s.end, Point { line: t.view_top(), col: 4 });
+    // Rows cut at the bottom leave their ends on the last cell.
+    feed(&mut t, "\x1b[H");
+    select(&mut t, (0, 1), (1, 2));
+    t.resize(5, 1);
+    let s = t.selection().unwrap();
+    assert_eq!((s.start, s.end), (Point { line: t.view_top(), col: 1 }, Point { line: t.view_top(), col: 4 }));
 }
 
 #[test]

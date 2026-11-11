@@ -506,8 +506,18 @@ impl Grid {
     /// Resizes without reflow (alternate screen): rows are truncated or padded
     /// at the right and the bottom; rows are dropped from the top if needed to
     /// keep row `keep_y` on screen. Returns the grid and the shift applied to y.
-    pub fn resized(&self, cols: usize, rows: usize, keep_y: usize) -> (Grid, usize) {
+    /// `points` (line from the oldest stored line, column) stay on their
+    /// cells as ghostty's tracked pins do, clamped to the last column; those
+    /// on dropped rows go to the nearest remaining cell (see `reflowed`).
+    pub fn resized(&self, cols: usize, rows: usize, keep_y: usize, points: &mut [(usize, usize)]) -> (Grid, usize) {
         let shift = (keep_y + 1).saturating_sub(rows);
+        for p in points {
+            *p = match p.0.checked_sub(self.hist.len() + shift) {
+                None => (0, 0),
+                Some(y) if y >= rows => (rows - 1, cols - 1),
+                Some(y) => (y, p.1.min(cols - 1)),
+            };
+        }
         let mut screen = Vec::with_capacity(rows);
         for y in 0..rows {
             let mut r = NewRow::blank(cols);
@@ -533,11 +543,20 @@ impl Grid {
 
     /// Resizes with reflow: logical lines joined by soft-wrap marks are
     /// rewrapped at the new width and the cursor stays on its content.
-    pub fn reflowed(&self, cols: usize, rows: usize, cur: ReflowCursor) -> (Grid, ReflowCursor) {
-        let lines = self.logical_lines(cur);
-        let (out, pos) = rewrap(&lines.lines, cols, lines.cursor);
-        let (mut cr, mut cc) = pos;
-        let mut out = out;
+    /// `points` (line from the oldest history line, column) move with their
+    /// cells as ghostty's tracked pins do in PageList.reflowRow. Those whose
+    /// rows are dropped go to the nearest remaining cell: the first cell of
+    /// the oldest line, or the last cell of the screen.
+    pub fn reflowed(
+        &self,
+        cols: usize,
+        rows: usize,
+        cur: ReflowCursor,
+        points: &mut [(usize, usize)],
+    ) -> (Grid, ReflowCursor) {
+        let lines = self.logical_lines(cur, points);
+        let (mut out, pos) = rewrap(&lines.lines, cols, &lines.marks);
+        let (mut cr, mut cc) = pos[0];
         let mut pending = false;
         if cur.pending {
             if cc + 1 < cols {
@@ -553,32 +572,53 @@ impl Grid {
         screen.resize_with(rows, || NewRow::blank(cols));
         let hist_drop = start.saturating_sub(self.hist_cap);
         let hist: Vec<NewRow> = out.into_iter().skip(hist_drop).collect();
+        for (p, &(r, c)) in points.iter_mut().zip(&pos[1..]) {
+            *p = if r < hist_drop {
+                (0, 0)
+            } else if r >= start + rows {
+                (hist.len() + rows - 1, cols - 1)
+            } else {
+                (r - hist_drop, c)
+            };
+        }
         cr -= start;
         let pushed = self.first_line() + start as u64;
         let grid = Grid::from_rows(cols, rows, self.hist_cap, hist, screen).with_pushed(pushed);
         (grid, ReflowCursor { x: cc.min(cols - 1), y: cr, pending })
     }
 
-    fn logical_lines(&self, cur: ReflowCursor) -> Lines {
+    /// The logical lines and the marks of the cursor followed by `points`.
+    fn logical_lines(&self, cur: ReflowCursor, points: &[(usize, usize)]) -> Lines {
         let total = self.hist.len() + self.rows;
         let cursor_abs = self.hist.len() + cur.y;
         let mut lines = Vec::new();
         let mut line = Line::default();
-        let mut cursor = (0, 0);
+        let mut marks = vec![(0, Mark::At(0)); points.len() + 1];
         for abs in 0..total {
             let slot = self.line_slot(abs);
             let row = self.slot_cells(slot);
             let meta = &self.meta[slot];
-            let mut len = if meta.wrapped {
+            let content = if meta.wrapped {
                 if row[self.cols - 1].width() == Width::SpacerHead { self.cols - 1 } else { self.cols }
             } else {
                 row[..meta.occ as usize].iter().rposition(|c| *c != Cell::EMPTY).map_or(0, |p| p + 1)
             };
+            let mut len = content;
+            let base = line.cells.len();
             if abs == cursor_abs {
-                cursor = (lines.len(), line.cells.len() + cur.x);
+                marks[0] = (lines.len(), Mark::At(base + cur.x));
                 len = len.max(cur.x + 1);
             }
-            let base = line.cells.len();
+            for (m, &(_, x)) in marks[1..].iter_mut().zip(points).filter(|(_, p)| p.0 == abs) {
+                // A point on a wrapped row's spacer head goes with the wide
+                // character that follows.
+                let at = if meta.wrapped || x < content {
+                    Mark::At(base + x.min(len))
+                } else {
+                    Mark::Blank { row: base, x }
+                };
+                *m = (lines.len(), at);
+            }
             line.cells.extend_from_slice(&row[..len]);
             for (col, s) in meta.graphemes() {
                 if col < len && row[col].has_grapheme() {
@@ -594,11 +634,12 @@ impl Grid {
             line.graphemes.sort_unstable_by_key(|g| g.0);
             lines.push(line);
         }
-        // Blank lines below the cursor are not content.
-        while lines.len() > cursor.0 + 1 && lines.last().is_some_and(|l| l.cells.is_empty()) {
+        // Blank lines below the cursor and the points are not content.
+        let keep = marks.iter().map(|m| m.0).max().unwrap_or(0);
+        while lines.len() > keep + 1 && lines.last().is_some_and(|l| l.cells.is_empty()) {
             lines.pop();
         }
-        Lines { lines, cursor }
+        Lines { lines, marks }
     }
 }
 
@@ -615,10 +656,20 @@ struct Line {
     graphemes: Vec<(usize, String)>,
 }
 
+/// Where a tracked cell is on its logical line.
+#[derive(Clone, Copy)]
+enum Mark {
+    /// The cell at this offset.
+    At(usize),
+    /// Column `x` in the trailing blanks of the line's last row, which
+    /// starts at offset `row`.
+    Blank { row: usize, x: usize },
+}
+
 struct Lines {
     lines: Vec<Line>,
-    /// (line index, cell offset) of the cursor.
-    cursor: (usize, usize),
+    /// (line index, mark) of the cursor followed by the tracked points.
+    marks: Vec<(usize, Mark)>,
 }
 
 struct NewRow {
@@ -633,17 +684,52 @@ impl NewRow {
 }
 
 /// Splits logical lines into rows of `cols` cells; returns the rows and the
-/// (row, column) of the cell at the cursor offset.
-fn rewrap(lines: &[Line], cols: usize, cursor: (usize, usize)) -> (Vec<NewRow>, (usize, usize)) {
+/// (row, column) each mark lands on. A line is extended with blank cells to
+/// hold its marks.
+fn rewrap(lines: &[Line], cols: usize, marks: &[(usize, Mark)]) -> (Vec<NewRow>, Vec<(usize, usize)>) {
     let mut out: Vec<NewRow> = Vec::new();
-    let mut pos = (0, 0);
+    let mut pos = vec![(0, 0); marks.len()];
+    // The offsets of the marks on the current line, once known.
+    let mut offsets = vec![None; marks.len()];
     for (li, line) in lines.iter().enumerate() {
         let mut graphemes = line.graphemes.iter().peekable();
+        let marked = marks.iter().any(|m| m.0 == li);
+        let mut len = line.cells.len();
+        if marked {
+            for (o, &(ml, m)) in offsets.iter_mut().zip(marks) {
+                *o = match m {
+                    Mark::At(off) if ml == li => {
+                        len = len.max(off + 1);
+                        Some(off)
+                    }
+                    _ => None,
+                };
+            }
+        }
         out.push(NewRow::blank(cols));
         let mut col = 0;
         let mut i = 0;
-        while i < line.cells.len() {
-            let mut c = line.cells[i];
+        loop {
+            if marked {
+                for (o, &(ml, m)) in offsets.iter_mut().zip(marks) {
+                    // ghostty first clamps a point in the trailing blanks to
+                    // the destination row where its source row starts.
+                    if let Mark::Blank { row, x } = m
+                        && ml == li
+                        && o.is_none()
+                        && i >= row
+                    {
+                        let dst_x = if col == cols { 0 } else { col };
+                        let off = row + x.min(cols - 1 - dst_x);
+                        len = len.max(off + 1);
+                        *o = Some(off);
+                    }
+                }
+            }
+            if i >= len {
+                break;
+            }
+            let mut c = line.cells.get(i).copied().unwrap_or(Cell::EMPTY);
             let mut w = 1;
             match c.width() {
                 Width::Wide if cols >= 2 => w = 2,
@@ -672,11 +758,13 @@ fn rewrap(lines: &[Line], cols: usize, cursor: (usize, usize)) -> (Vec<NewRow>, 
                     r.meta.push_grapheme(col, s);
                 }
             }
-            if li == cursor.0 {
-                if cursor.1 == i {
-                    pos = (ri, col);
-                } else if w == 2 && cursor.1 == i + 1 {
-                    pos = (ri, col + 1);
+            if marked {
+                for (p, &o) in pos.iter_mut().zip(&offsets) {
+                    if o == Some(i) {
+                        *p = (ri, col);
+                    } else if w == 2 && o == Some(i + 1) {
+                        *p = (ri, col + 1);
+                    }
                 }
             }
             col += w;

@@ -10,6 +10,7 @@ pub mod cell;
 mod grid;
 mod palette;
 mod parser;
+mod selection;
 mod style;
 mod term;
 #[cfg(test)]
@@ -17,6 +18,7 @@ mod tests;
 
 pub use cell::{Attrs, Cell, Color, Semantic, Style, StyleId, Underline, Width};
 pub use grid::PromptMark;
+pub use selection::{Point, Selection};
 pub use term::PromptClick;
 
 /// Columns `c` takes on the grid: 1 or 2, 0 for controls and combining marks.
@@ -195,7 +197,7 @@ impl Terminal {
 
     /// Resizes the viewport, reflowing the primary screen and its scrollback
     /// with the soft-wrap marks (the alternate screen is truncated or padded).
-    /// Marks every row dirty.
+    /// The selection's ends move with their cells. Marks every row dirty.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.term.resize(cols.max(1) as usize, rows.max(1) as usize);
     }
@@ -390,6 +392,25 @@ impl Terminal {
             return None;
         }
         self.term.grid.slot_meta(slot).grapheme(x)
+    }
+
+    /// ghostty's Screen.selection of the active screen. An end whose line is
+    /// no longer stored reads as the first cell of the oldest stored line,
+    /// where ghostty moves the pins of discarded rows.
+    pub fn selection(&self) -> Option<Selection> {
+        let first = self.first_line();
+        let stored = |p: Point| if p.line < first { Point { line: first, col: 0 } } else { p };
+        self.term.selection.map(|s| Selection { start: stored(s.start), end: stored(s.end), ..s })
+    }
+
+    /// ghostty's Screen.select: replaces the active screen's selection, which
+    /// then follows its cells until RIS or a screen switch clears it. Marks
+    /// every row dirty if it changed.
+    pub fn set_selection(&mut self, selection: Option<Selection>) {
+        if self.term.selection != selection {
+            self.term.selection = selection;
+            self.term.mark_all_dirty();
+        }
     }
 
     /// Lines currently stored in the primary screen's scrollback.

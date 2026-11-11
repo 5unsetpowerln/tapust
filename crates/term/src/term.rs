@@ -10,7 +10,8 @@ use crate::palette::{default_palette, parse_color};
 use crate::parser::Params;
 use crate::style::{Pen, StyleTable, apply_sgr};
 use crate::{
-    CursorShape, Dirty, Message, Modes, MouseEncoding, MouseMode, Palette, ProgressReport, ProgressState, Rgb,
+    CursorShape, Dirty, Message, Modes, MouseEncoding, MouseMode, Palette, Point, ProgressReport, ProgressState, Rgb,
+    Selection,
 };
 
 const WIDTH_SHIFT: u32 = 21;
@@ -107,6 +108,9 @@ pub(crate) struct Term {
     /// alternate screen is active.
     pub other: Grid,
     pub alt_active: bool,
+    /// The active screen's selection. ghostty keeps one per screen but
+    /// clears it on every switch, so the inactive one is never seen again.
+    pub selection: Option<Selection>,
     pub cols: usize,
     pub rows: usize,
     pub x: usize,
@@ -173,6 +177,7 @@ impl Term {
             grid: Grid::new(cols, rows, hist),
             other: Grid::new(cols, rows, 0),
             alt_active: false,
+            selection: None,
             cols,
             rows,
             x: 0,
@@ -1035,6 +1040,7 @@ impl Term {
         }
         std::mem::swap(&mut self.grid, &mut self.other);
         self.alt_active = alt;
+        self.selection = None;
         self.view_offset = 0;
         self.mark_all_dirty();
     }
@@ -1516,9 +1522,14 @@ impl Term {
         } else {
             ReflowCursor { x: self.x, y: self.y, pending: self.pending_wrap }
         };
-        let (primary, pcur) = self.primary().reflowed(cols, rows, pcur);
+        // The selection's ends as (line from the oldest stored line, column).
+        let first = self.grid.first_line();
+        let to_grid = |p: Point| p.line.checked_sub(first).map_or((0, 0), |line| (line as usize, p.col as usize));
+        let mut ends: Vec<_> = self.selection.iter().flat_map(|s| [to_grid(s.start), to_grid(s.end)]).collect();
+        let primary_ends: &mut [(usize, usize)] = if self.alt_active { &mut [] } else { &mut ends };
+        let (primary, pcur) = self.primary().reflowed(cols, rows, pcur, primary_ends);
         if self.alt_active {
-            let (alt, shift) = self.grid.resized(cols, rows, self.y);
+            let (alt, shift) = self.grid.resized(cols, rows, self.y, &mut ends);
             self.grid = alt;
             self.other = primary;
             self.y -= shift;
@@ -1526,9 +1537,14 @@ impl Term {
                 (s.x, s.y, s.pending_wrap) = (pcur.x, pcur.y, pcur.pending);
             }
         } else {
-            self.other = self.other.resized(cols, rows, 0).0;
+            self.other = self.other.resized(cols, rows, 0, &mut []).0;
             self.grid = primary;
             (self.x, self.y, self.pending_wrap) = (pcur.x, pcur.y, pcur.pending);
+        }
+        if let Some(s) = &mut self.selection {
+            let first = self.grid.first_line();
+            let point = |(line, col): (usize, usize)| Point { line: first + line as u64, col: col as u16 };
+            (s.start, s.end) = (point(ends[0]), point(ends[1]));
         }
         self.cols = cols;
         self.rows = rows;

@@ -5,9 +5,9 @@
 use std::sync::OnceLock;
 
 use onig::Regex;
-use term::{Terminal, Width};
+use term::{Point, Selection, Terminal, Width};
 
-use crate::selection::{self, Point, Selection};
+use crate::selection;
 
 const URL_SCHEMES: &str =
     r"https?://|mailto:|ftp://|file:|ssh:|git://|ssh://|tel:|magnet:|ipfs://|ipns://|gemini://|gopher://|news:";
