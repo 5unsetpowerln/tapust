@@ -1,239 +1,195 @@
-//! ghostty's automatic shell integration (termio/shell_integration.zig) with
-//! its default configuration: `shell-integration = detect` and the default
-//! `shell-integration-features`, plus the variables from Exec.zig that the
-//! integration scripts read.
+//! Shell integration. bash and zsh learn to report their prompts, commands,
+//! exit statuses, working directory and title to the terminal (OSC 133, 7 and
+//! 2), which fish and nushell already do; all four get a bar cursor at the
+//! prompt.
 //!
-//! ghostty turns a rewritten command into a string for `/bin/sh -c`; tapust
-//! runs programs directly, so commands here stay argument vectors.
+//! The scripts are embedded and written to `$XDG_RUNTIME_DIR` when a shell
+//! starts, and each shell is pointed at its script without changing which of
+//! the user's startup files run:
+//! - bash: an interactive shell reads the script as its `--rcfile`, which reads
+//!   the user's rc file. A login shell reads no rc file, so it starts in POSIX
+//!   mode, where the only startup file is `$ENV`, and the script leaves POSIX
+//!   mode and reads the login files.
+//! - zsh: `ZDOTDIR` points at the script as `.zshenv`, which restores `ZDOTDIR`
+//!   and reads the user's `.zshenv`; zsh reads the rest from there.
+//! - fish and nushell: an `XDG_DATA_DIRS` entry with a vendor configuration file,
+//!   which restores `XDG_DATA_DIRS`.
+//! - elvish runs unmodified: its only hook is `-rc`, and an rc file that loads
+//!   the user's rc can only give the REPL copies of its variables
+//!   (`edit:add-vars`) and resolves its relative imports elsewhere.
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
+use std::fs;
+use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 
-/// The integration scripts, ghostty's `<resources>/shell-integration`.
-const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shell-integration");
-
-/// The environment of a process, ghostty's `EnvMap`.
 pub type Env = HashMap<OsString, OsString>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Shell {
-    Bash,
-    Elvish,
+/// The scripts by their path in the integration directory.
+const SCRIPTS: [(&str, &str); 4] = [
+    (BASH_SCRIPT, include_str!("../shell/bash/tapust.bash")),
+    ("zsh/.zshenv", include_str!("../shell/zsh/.zshenv")),
+    ("fish/vendor_conf.d/tapust.fish", include_str!("../shell/fish/vendor_conf.d/tapust.fish")),
+    ("nushell/vendor/autoload/tapust.nu", include_str!("../shell/nushell/vendor/autoload/tapust.nu")),
+];
+const BASH_SCRIPT: &str = "bash/tapust.bash";
+
+/// How a supported shell is started with the integration.
+#[derive(Debug, PartialEq)]
+enum Plan {
+    /// `args` are the arguments without a `--rcfile`, which goes to `rcfile`.
+    Bash { login: bool, noprofile: bool, rcfile: Option<OsString>, args: Vec<OsString> },
+    Zsh,
     Fish,
     Nushell,
-    Zsh,
 }
 
-/// ghostty's `shell-integration-features`.
-struct Features {
-    cursor: bool,
-    sudo: bool,
-    title: bool,
-    ssh_env: bool,
-    ssh_terminfo: bool,
-    path: bool,
+/// Returns the command line for `argv` and sets `env` up for tapust's shell
+/// integration; `login` tells that argv[0] will start with '-'.
+pub fn prepare(argv: Vec<OsString>, login: bool, env: &mut Env) -> Vec<OsString> {
+    env.insert("TAPUST_CURSOR_BLINK".into(), "1".into());
+    let Some(plan) = plan(&argv, login, env) else { return argv };
+    let dir = match env.get(OsStr::new("XDG_RUNTIME_DIR")) {
+        Some(runtime) if !runtime.is_empty() => Path::new(runtime).join("tapust/shell-integration"),
+        _ => {
+            eprintln!("tapust: XDG_RUNTIME_DIR is not set, so the shell runs without shell integration");
+            return argv;
+        }
+    };
+    if let Err(e) = write_scripts(&dir) {
+        eprintln!("tapust: cannot write the shell integration to {}: {e}", dir.display());
+        return argv;
+    }
+    apply(plan, argv, &dir, env)
 }
 
-impl Default for Features {
-    fn default() -> Self {
-        Features { cursor: true, sudo: false, title: true, ssh_env: false, ssh_terminfo: false, path: true }
+/// The integration for `argv`, if its shell and arguments are supported.
+fn plan(argv: &[OsString], login: bool, env: &Env) -> Option<Plan> {
+    let (program, args) = argv.split_first()?;
+    match Path::new(program).file_name()?.as_bytes() {
+        b"bash" => plan_bash(args, login, env),
+        b"zsh" => interactive_only(args).then_some(Plan::Zsh),
+        b"fish" => interactive_only(args).then_some(Plan::Fish),
+        b"nu" => interactive_only(args).then_some(Plan::Nushell),
+        _ => None,
     }
 }
 
-/// Exec.zig's setup of a pane's process: the variables the scripts read, then
-/// the integration when `argv` runs a supported shell. Returns the command to run.
-pub fn prepare(argv: Vec<OsString>, env: &mut Env) -> Vec<OsString> {
-    // Lets the scripts find the binary even if the shell's startup files reset PATH.
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        env.insert("TAPUST_BIN_DIR".into(), dir.into());
+/// Whether `args` only ask for an interactive or a login shell.
+fn interactive_only(args: &[OsString]) -> bool {
+    args.iter().all(|arg| matches!(arg.as_bytes(), b"--login" | b"--interactive") || login_or_interactive_flags(arg))
+}
+
+/// `-i`, `-l` or both in one argument.
+fn login_or_interactive_flags(arg: &OsStr) -> bool {
+    matches!(arg.as_bytes(), [b'-', flags @ ..] if !flags.is_empty() && flags.iter().all(|f| matches!(f, b'i' | b'l')))
+}
+
+fn plan_bash(args: &[OsString], login: bool, env: &Env) -> Option<Plan> {
+    // A shell that starts in POSIX mode reads only $ENV, which it needs for itself.
+    let shellopts = env.get(OsStr::new("SHELLOPTS")).map_or(&b""[..], |o| o.as_bytes());
+    if env.contains_key(OsStr::new("POSIXLY_CORRECT")) || shellopts.split(|&b| b == b':').any(|o| o == b"posix") {
+        return None;
     }
-    // ghostty's `cursor-style-blink` is unset by default, which means blinking.
-    setup_features(env, &Features::default(), true);
-    setup(Path::new(DIR), &argv, env).unwrap_or(argv)
-}
-
-/// Sets up `env` for the integration of `argv`'s shell and returns the command
-/// that starts it, or None if the shell is not supported or cannot be integrated.
-fn setup(dir: &Path, argv: &[OsString], env: &mut Env) -> Option<Vec<OsString>> {
-    match detect_shell(argv)? {
-        Shell::Bash => setup_bash(argv, dir, env),
-        Shell::Nushell => setup_nushell(argv, dir, env),
-        Shell::Zsh => setup_zsh(argv, dir, env),
-        Shell::Elvish | Shell::Fish => setup_xdg_data_dirs(dir, env).then(|| argv.to_vec()),
-    }
-}
-
-fn detect_shell(argv: &[OsString]) -> Option<Shell> {
-    Some(match Path::new(argv.first()?).file_name()?.to_str()? {
-        "bash" => Shell::Bash,
-        "elvish" => Shell::Elvish,
-        "fish" => Shell::Fish,
-        "nu" => Shell::Nushell,
-        "zsh" => Shell::Zsh,
-        _ => return None,
-    })
-}
-
-/// Sets `TAPUST_SHELL_FEATURES` to the enabled features sorted by name.
-fn setup_features(env: &mut Env, features: &Features, cursor_blink: bool) {
-    let enabled: Vec<&str> = [
-        (features.cursor, if cursor_blink { "cursor:blink" } else { "cursor:steady" }),
-        (features.path, "path"),
-        (features.ssh_env, "ssh-env"),
-        (features.ssh_terminfo, "ssh-terminfo"),
-        (features.sudo, "sudo"),
-        (features.title, "title"),
-    ]
-    .into_iter()
-    .filter_map(|(on, name)| on.then_some(name))
-    .collect();
-    if !enabled.is_empty() {
-        env.insert("TAPUST_SHELL_FEATURES".into(), enabled.join(",").into());
-    }
-}
-
-/// Starts bash in POSIX mode, where it reads only the file named by `ENV`: our
-/// script, which leaves POSIX mode and sources the startup files itself.
-/// Options that would need complex or unsupported handling disable the integration.
-fn setup_bash(argv: &[OsString], dir: &Path, env: &mut Env) -> Option<Vec<OsString>> {
-    let mut args = argv.iter();
-    let mut command = vec![args.next()?.clone(), "--posix".into()];
-    // The flags the script must honor; "1" tells it that it was injected, not sourced.
-    let mut inject = String::from("1");
-    let mut rcfile = None;
+    let (mut login, mut noprofile, mut rcfile, mut rest) = (login, false, None, Vec::new());
+    let mut args = args.iter();
     while let Some(arg) = args.next() {
-        let bytes = arg.as_bytes();
-        if arg == "--posix" {
-            return None;
-        } else if arg == "--norc" {
-            inject.push_str(" --norc");
-        } else if arg == "--noprofile" {
-            inject.push_str(" --noprofile");
-        } else if arg == "--rcfile" || arg == "--init-file" {
-            rcfile = args.next();
-        } else if bytes.len() > 1 && bytes[0] == b'-' && bytes[1] != b'-' {
-            // -c is never interactive.
-            if bytes.contains(&b'c') {
-                return None;
+        match arg.as_bytes() {
+            b"--login" => login = true,
+            b"--noprofile" => noprofile = true,
+            b"--rcfile" | b"--init-file" => {
+                rcfile = Some(args.next()?.clone());
+                continue;
             }
-            command.push(arg.clone());
-        } else if arg == "-" || arg == "--" {
-            // The rest are arguments, not options.
-            command.push(arg.clone());
-            command.extend(args.cloned());
-            break;
-        } else {
-            command.push(arg.clone());
+            _ if login_or_interactive_flags(arg) => login |= arg.as_bytes().contains(&b'l'),
+            _ => return None,
+        }
+        rest.push(arg.clone());
+    }
+    Some(Plan::Bash { login, noprofile, rcfile, args: rest })
+}
+
+/// The command line for `plan` with the scripts in `dir`, setting `env` up.
+fn apply(plan: Plan, mut argv: Vec<OsString>, dir: &Path, env: &mut Env) -> Vec<OsString> {
+    match plan {
+        Plan::Bash { login: true, noprofile, args, .. } => {
+            save(env, "ENV", "TAPUST_BASH_ENV");
+            env.insert("ENV".into(), dir.join(BASH_SCRIPT).into());
+            set(env, "TAPUST_BASH_NOPROFILE", noprofile.then(|| "1".into()));
+            argv.truncate(1);
+            argv.push("--posix".into());
+            argv.extend(args);
+        }
+        Plan::Bash { login: false, rcfile, args, .. } => {
+            set(env, "TAPUST_BASH_RCFILE", rcfile);
+            argv.truncate(1);
+            argv.extend(["--rcfile".into(), dir.join(BASH_SCRIPT).into()]);
+            argv.extend(args);
+        }
+        Plan::Zsh => {
+            save(env, "ZDOTDIR", "TAPUST_ZSH_ZDOTDIR");
+            env.insert("ZDOTDIR".into(), dir.join("zsh").into());
+        }
+        Plan::Fish | Plan::Nushell => {
+            let mut dirs = dir.as_os_str().to_owned();
+            match save(env, "XDG_DATA_DIRS", "TAPUST_XDG_DATA_DIRS") {
+                Some(user_dirs) => {
+                    dirs.push(":");
+                    dirs.push(user_dirs);
+                }
+                // fish always reads its own data directory, but nushell reads
+                // the XDG default only when the variable is unset.
+                None if plan == Plan::Nushell => dirs.push(":/usr/local/share:/usr/share"),
+                None => {}
+            }
+            env.insert("XDG_DATA_DIRS".into(), dirs);
         }
     }
-
-    if let Some(user_env) = env.get(OsStr::new("ENV")).cloned() {
-        env.insert("TAPUST_BASH_ENV".into(), user_env);
-    }
-    let script = dir.join("bash/tapust.bash");
-    if let Err(err) = File::open(&script) {
-        eprintln!("tapust: unable to open {}: {err}", script.display());
-        env.remove(OsStr::new("TAPUST_BASH_ENV"));
-        return None;
-    }
-    env.insert("ENV".into(), script.into());
-    env.insert("TAPUST_BASH_INJECT".into(), inject.into());
-    if let Some(rcfile) = rcfile {
-        env.insert("TAPUST_BASH_RCFILE".into(), rcfile.clone());
-    }
-
-    // POSIX mode defaults HISTFILE to ~/.sh_history; the script unexports this one.
-    if !env.contains_key(OsStr::new("HISTFILE"))
-        && let Some(home) = std::env::home_dir()
-    {
-        let mut histfile = home.into_os_string();
-        histfile.push("/.bash_history");
-        env.insert("HISTFILE".into(), histfile);
-        env.insert("TAPUST_BASH_UNEXPORT_HISTFILE".into(), "1".into());
-    }
-    Some(command)
+    argv
 }
 
-/// Puts `dir` first in `XDG_DATA_DIRS`, where elvish, fish and nushell find
-/// their scripts. The scripts remove it again using
-/// `TAPUST_SHELL_INTEGRATION_XDG_DIR` so that it does not reach other programs.
-fn setup_xdg_data_dirs(dir: &Path, env: &mut Env) -> bool {
-    if let Err(err) = std::fs::read_dir(dir) {
-        eprintln!("tapust: unable to open {}: {err}", dir.display());
-        return false;
-    }
-    env.insert("TAPUST_SHELL_INTEGRATION_XDG_DIR".into(), dir.into());
-
-    // Unset means the XDG Base Directory default, which must not be lost (ghostty #2711).
-    let current = env.get(OsStr::new("XDG_DATA_DIRS")).map_or(OsStr::new("/usr/local/share:/usr/share"), OsString::as_os_str);
-    let mut value = OsString::from(dir);
-    if !current.is_empty() {
-        value.push(":");
-        value.push(current);
-    }
-    env.insert("XDG_DATA_DIRS".into(), value);
-    true
+fn set(env: &mut Env, key: &str, value: Option<OsString>) {
+    match value {
+        Some(value) => env.insert(key.into(), value),
+        None => env.remove(OsStr::new(key)),
+    };
 }
 
-/// Makes the `tapust` module available to nushell through `XDG_DATA_DIRS` and
-/// has nu `use` it. Options that would need complex or unsupported handling
-/// disable the latter.
-fn setup_nushell(argv: &[OsString], dir: &Path, env: &mut Env) -> Option<Vec<OsString>> {
-    if !setup_xdg_data_dirs(dir, env) {
-        return None;
-    }
-    let mut args = argv.iter();
-    // The features are checked at run time by the module itself.
-    let mut command = vec![args.next()?.clone(), "--execute".into(), "use tapust *".into()];
-    while let Some(arg) = args.next() {
-        let bytes = arg.as_bytes();
-        if arg == "--command" || arg == "--lsp" {
-            return None;
-        } else if bytes.len() > 1 && bytes[0] == b'-' && bytes[1] != b'-' {
-            // -c is never interactive.
-            if bytes.contains(&b'c') {
-                return None;
-            }
-            command.push(arg.clone());
-        } else if arg == "-" || arg == "--" {
-            // The rest are arguments, not options.
-            command.push(arg.clone());
-            command.extend(args.cloned());
-            break;
-        } else {
-            command.push(arg.clone());
+/// Copies `key` to `saved`, removing `saved` if `key` is unset, for the script
+/// to restore it.
+fn save(env: &mut Env, key: &str, saved: &str) -> Option<OsString> {
+    let value = env.get(OsStr::new(key)).cloned();
+    set(env, saved, value.clone());
+    value
+}
+
+/// Writes the scripts that differ from those in `dir`, creating it private.
+fn write_scripts(dir: &Path) -> io::Result<()> {
+    for (name, script) in SCRIPTS {
+        let path = dir.join(name);
+        if fs::read(&path).is_ok_and(|old| old == script.as_bytes()) {
+            continue;
         }
+        let parent = path.parent().expect("a script path has a directory");
+        fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+        // Another tapust may be starting a shell that reads the script now.
+        let tmp = parent.join(format!(".tmp{}", std::process::id()));
+        fs::write(&tmp, script)?;
+        fs::rename(&tmp, &path)?;
     }
-    Some(command)
-}
-
-/// Points `ZDOTDIR` at our zsh directory, whose .zshenv restores the user's
-/// `ZDOTDIR` and loads the integration.
-fn setup_zsh(argv: &[OsString], dir: &Path, env: &mut Env) -> Option<Vec<OsString>> {
-    if let Some(zdotdir) = env.get(OsStr::new("ZDOTDIR")).cloned() {
-        env.insert("TAPUST_ZSH_ZDOTDIR".into(), zdotdir);
-    }
-    let zsh = dir.join("zsh");
-    if let Err(err) = std::fs::read_dir(&zsh) {
-        eprintln!("tapust: unable to open {}: {err}", zsh.display());
-        return None;
-    }
-    env.insert("ZDOTDIR".into(), zsh.into());
-    Some(argv.to_vec())
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const MISSING: &str = "/nonexistent";
+    const DIR: &str = "/run/user/1000/tapust/shell-integration";
 
-    fn argv(args: &[&str]) -> Vec<OsString> {
+    fn os(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
     }
 
@@ -241,198 +197,150 @@ mod tests {
         env.get(OsStr::new(key)).map(|v| v.to_str().unwrap())
     }
 
-    fn dir() -> &'static Path {
-        Path::new(DIR)
+    /// The command line and environment for `argv` started from `env`, or
+    /// None if the shell runs unmodified.
+    fn run(argv: &[&str], login: bool, mut env: Env) -> Option<(Vec<OsString>, Env)> {
+        let plan = plan(&os(argv), login, &env)?;
+        let argv = apply(plan, os(argv), Path::new(DIR), &mut env);
+        Some((argv, env))
+    }
+
+    fn vars(vars: &[(&str, &str)]) -> Env {
+        vars.iter().map(|(k, v)| (k.into(), v.into())).collect()
     }
 
     #[test]
-    fn default_features() {
-        let mut env = Env::new();
-        assert_eq!(prepare(argv(&["sh"]), &mut env), argv(&["sh"]));
-        assert_eq!(get(&env, "TAPUST_SHELL_FEATURES"), Some("cursor:blink,path,title"));
-        assert!(get(&env, "TAPUST_BIN_DIR").is_some());
+    fn bash_interactive_reads_the_script_as_its_rc_file() {
+        let rc = format!("{DIR}/bash/tapust.bash");
+        for argv in [&["/bin/bash"][..], &["bash", "-i"], &["bash", "--noprofile", "-i"]] {
+            let (args, env) = run(argv, false, Env::new()).unwrap();
+            assert_eq!(args, os(&[&[argv[0], "--rcfile", &rc], &argv[1..]].concat()));
+            assert_eq!(get(&env, "TAPUST_BASH_RCFILE"), None);
+            assert_eq!(get(&env, "ENV"), None);
+        }
     }
 
     #[test]
-    fn shell_integration_failure() {
-        let mut env = Env::new();
-        assert_eq!(setup(Path::new(MISSING), &argv(&["sh"]), &mut env), None);
-        assert!(env.is_empty());
+    fn bash_keeps_the_users_rc_file_for_the_script() {
+        let rc = format!("{DIR}/bash/tapust.bash");
+        let (args, env) = run(&["bash", "--rcfile", "my.rc", "-i"], false, Env::new()).unwrap();
+        assert_eq!(args, os(&["bash", "--rcfile", &rc, "-i"]));
+        assert_eq!(get(&env, "TAPUST_BASH_RCFILE"), Some("my.rc"));
+        let (args, env) = run(&["bash", "--init-file", "my.rc"], false, Env::new()).unwrap();
+        assert_eq!(args, os(&["bash", "--rcfile", &rc]));
+        assert_eq!(get(&env, "TAPUST_BASH_RCFILE"), Some("my.rc"));
+        assert_eq!(run(&["bash", "--rcfile"], false, Env::new()), None);
     }
 
     #[test]
-    fn detects_shells() {
-        assert_eq!(detect_shell(&argv(&["sh"])), None);
-        assert_eq!(detect_shell(&argv(&["bash"])), Some(Shell::Bash));
-        assert_eq!(detect_shell(&argv(&["elvish"])), Some(Shell::Elvish));
-        assert_eq!(detect_shell(&argv(&["fish"])), Some(Shell::Fish));
-        assert_eq!(detect_shell(&argv(&["nu"])), Some(Shell::Nushell));
-        assert_eq!(detect_shell(&argv(&["zsh"])), Some(Shell::Zsh));
-        assert_eq!(detect_shell(&argv(&["bash", "-c", "command"])), Some(Shell::Bash));
-        assert_eq!(detect_shell(&argv(&["/a b/bash"])), Some(Shell::Bash));
+    fn bash_login_starts_in_posix_mode_with_the_script_as_env() {
+        let rc = format!("{DIR}/bash/tapust.bash");
+        for (argv, login) in [(&["bash"][..], true), (&["bash", "-l"], false), (&["bash", "--login"], false), (&["bash", "-il"], false)] {
+            let (args, env) = run(argv, login, Env::new()).unwrap();
+            assert_eq!(args[..2], os(&["bash", "--posix"])[..]);
+            assert_eq!(args[2..], os(&argv[1..])[..]);
+            assert_eq!(get(&env, "ENV"), Some(&rc[..]));
+            assert_eq!(get(&env, "TAPUST_BASH_ENV"), None);
+            assert_eq!(get(&env, "TAPUST_BASH_NOPROFILE"), None);
+        }
     }
 
     #[test]
-    fn setup_features_lists_enabled_features() {
-        let features = |cursor, sudo, title, ssh_env, ssh_terminfo, path| Features { cursor, sudo, title, ssh_env, ssh_terminfo, path };
-        let run = |features: Features, cursor_blink| {
-            let mut env = Env::new();
-            setup_features(&mut env, &features, cursor_blink);
-            get(&env, "TAPUST_SHELL_FEATURES").map(str::to_owned)
-        };
-        assert_eq!(run(features(true, true, true, true, true, true), true).as_deref(), Some("cursor:blink,path,ssh-env,ssh-terminfo,sudo,title"));
-        assert_eq!(run(features(false, false, false, false, false, false), true), None);
-        assert_eq!(run(features(false, true, false, true, false, false), true).as_deref(), Some("ssh-env,sudo"));
-        assert_eq!(run(features(true, false, false, false, false, false), true).as_deref(), Some("cursor:blink"));
-        assert_eq!(run(features(true, false, false, false, false, false), false).as_deref(), Some("cursor:steady"));
+    fn bash_login_keeps_env_and_noprofile_for_the_script() {
+        let (args, env) = run(&["bash", "--noprofile"], true, vars(&[("ENV", "my.sh")])).unwrap();
+        assert_eq!(args, os(&["bash", "--posix", "--noprofile"]));
+        assert_eq!(get(&env, "TAPUST_BASH_ENV"), Some("my.sh"));
+        assert_eq!(get(&env, "TAPUST_BASH_NOPROFILE"), Some("1"));
+        // An empty ENV is kept as empty, not as unset.
+        let (_, env) = run(&["bash"], true, vars(&[("ENV", "")])).unwrap();
+        assert_eq!(get(&env, "TAPUST_BASH_ENV"), Some(""));
     }
 
     #[test]
-    fn bash() {
-        let mut env = Env::new();
-        assert_eq!(setup_bash(&argv(&["bash"]), dir(), &mut env), Some(argv(&["bash", "--posix"])));
-        assert_eq!(get(&env, "TAPUST_BASH_INJECT"), Some("1"));
-        assert_eq!(get(&env, "ENV"), Some(concat!(env!("CARGO_MANIFEST_DIR"), "/shell-integration/bash/tapust.bash")));
-    }
-
-    #[test]
-    fn bash_unsupported_options() {
-        for cmdline in [
-            &["bash", "--posix"][..],
-            &["bash", "--rcfile", "script.sh", "--posix"],
-            &["bash", "--init-file", "script.sh", "--posix"],
-            &["bash", "-c", "script.sh"],
-            &["bash", "-ic", "script.sh"],
+    fn bash_runs_unmodified_with_other_arguments_or_in_posix_mode() {
+        for argv in [
+            &["bash", "-c", "true"][..],
+            &["bash", "script.sh"],
+            &["bash", "--norc"],
+            &["bash", "--posix"],
+            &["bash", "-o", "vi"],
+            &["bash", "-ix"],
+            &["bash", "-"],
+            &["sh"],
+            &["/usr/bin/bash5"],
         ] {
-            let mut env = Env::new();
-            assert_eq!(setup_bash(&argv(cmdline), dir(), &mut env), None, "{cmdline:?}");
-            assert!(env.is_empty());
+            assert_eq!(run(argv, false, Env::new()), None, "{argv:?}");
+        }
+        for v in [&[("POSIXLY_CORRECT", "")][..], &[("SHELLOPTS", "braceexpand:posix")]] {
+            assert_eq!(run(&["bash"], true, vars(v)), None, "{v:?}");
+        }
+        assert!(run(&["bash"], true, vars(&[("SHELLOPTS", "braceexpand:posixx")])).is_some());
+    }
+
+    #[test]
+    fn zsh_reads_the_script_through_zdotdir() {
+        for (argv, login) in [(&["/usr/bin/zsh"][..], true), (&["zsh"], false), (&["zsh", "-l"], false), (&["zsh", "--login", "-i"], false)] {
+            let (args, env) = run(argv, login, Env::new()).unwrap();
+            assert_eq!(args, os(argv));
+            assert_eq!(get(&env, "ZDOTDIR"), Some(&format!("{DIR}/zsh")[..]));
+            assert_eq!(get(&env, "TAPUST_ZSH_ZDOTDIR"), None);
+        }
+        let (_, env) = run(&["zsh"], true, vars(&[("ZDOTDIR", "/home/u/.config/zsh")])).unwrap();
+        assert_eq!(get(&env, "TAPUST_ZSH_ZDOTDIR"), Some("/home/u/.config/zsh"));
+        for argv in [&["zsh", "-f"][..], &["zsh", "-c", "true"], &["zsh", "--no-rcs"], &["zsh", "script.zsh"]] {
+            assert_eq!(run(argv, false, Env::new()), None, "{argv:?}");
         }
     }
 
     #[test]
-    fn bash_inject_flags() {
-        for (flag, inject) in [("--norc", "1 --norc"), ("--noprofile", "1 --noprofile")] {
-            let mut env = Env::new();
-            assert_eq!(setup_bash(&argv(&["bash", flag]), dir(), &mut env), Some(argv(&["bash", "--posix"])));
-            assert_eq!(get(&env, "TAPUST_BASH_INJECT"), Some(inject));
+    fn fish_and_nushell_find_the_script_through_xdg_data_dirs() {
+        let (args, env) = run(&["fish", "-l"], false, vars(&[("XDG_DATA_DIRS", "/usr/share")])).unwrap();
+        assert_eq!(args, os(&["fish", "-l"]));
+        assert_eq!(get(&env, "XDG_DATA_DIRS"), Some(&format!("{DIR}:/usr/share")[..]));
+        assert_eq!(get(&env, "TAPUST_XDG_DATA_DIRS"), Some("/usr/share"));
+        let (_, env) = run(&["fish"], true, Env::new()).unwrap();
+        assert_eq!(get(&env, "XDG_DATA_DIRS"), Some(DIR));
+        assert_eq!(get(&env, "TAPUST_XDG_DATA_DIRS"), None);
+        let (_, env) = run(&["nu"], true, Env::new()).unwrap();
+        assert_eq!(get(&env, "XDG_DATA_DIRS"), Some(&format!("{DIR}:/usr/local/share:/usr/share")[..]));
+        assert_eq!(get(&env, "TAPUST_XDG_DATA_DIRS"), None);
+        let (_, env) = run(&["nu", "-i"], false, vars(&[("XDG_DATA_DIRS", "")])).unwrap();
+        assert_eq!(get(&env, "XDG_DATA_DIRS"), Some(&format!("{DIR}:")[..]));
+        assert_eq!(get(&env, "TAPUST_XDG_DATA_DIRS"), Some(""));
+        for argv in [&["fish", "-c", "true"][..], &["fish", "--no-config"], &["nu", "-c", "1"], &["nu", "script.nu"]] {
+            assert_eq!(run(argv, false, Env::new()), None, "{argv:?}");
         }
     }
 
     #[test]
-    fn bash_rcfile() {
-        let mut env = Env::new();
-        for flag in ["--rcfile", "--init-file"] {
-            assert_eq!(setup_bash(&argv(&["bash", flag, "profile.sh"]), dir(), &mut env), Some(argv(&["bash", "--posix"])));
-            assert_eq!(get(&env, "TAPUST_BASH_RCFILE"), Some("profile.sh"));
+    fn other_shells_run_unmodified() {
+        for argv in [&["elvish"][..], &["dash"], &["tcsh"], &["vim"]] {
+            assert_eq!(run(argv, true, Env::new()), None, "{argv:?}");
         }
     }
 
     #[test]
-    fn bash_histfile() {
-        let mut env = Env::new();
-        setup_bash(&argv(&["bash"]), dir(), &mut env);
-        assert!(get(&env, "HISTFILE").unwrap().ends_with(".bash_history"));
-        assert_eq!(get(&env, "TAPUST_BASH_UNEXPORT_HISTFILE"), Some("1"));
-
-        let mut env = Env::from([("HISTFILE".into(), "my_history".into())]);
-        setup_bash(&argv(&["bash"]), dir(), &mut env);
-        assert_eq!(get(&env, "HISTFILE"), Some("my_history"));
-        assert_eq!(get(&env, "TAPUST_BASH_UNEXPORT_HISTFILE"), None);
+    fn without_a_runtime_directory_the_shell_runs_unmodified() {
+        let mut env = vars(&[("ZDOTDIR", "/z")]);
+        assert_eq!(prepare(os(&["zsh"]), true, &mut env), os(&["zsh"]));
+        assert_eq!(env, vars(&[("ZDOTDIR", "/z"), ("TAPUST_CURSOR_BLINK", "1")]));
     }
 
     #[test]
-    fn bash_env() {
-        let mut env = Env::from([("ENV".into(), "env.sh".into())]);
-        setup_bash(&argv(&["bash"]), dir(), &mut env);
-        assert_eq!(get(&env, "TAPUST_BASH_ENV"), Some("env.sh"));
-        assert_eq!(get(&env, "ENV"), Some(concat!(env!("CARGO_MANIFEST_DIR"), "/shell-integration/bash/tapust.bash")));
-    }
-
-    #[test]
-    fn bash_additional_arguments() {
-        let mut env = Env::new();
-        for separator in ["-", "--"] {
-            let command = setup_bash(&argv(&["bash", separator, "--arg", "file1", "file2"]), dir(), &mut env);
-            assert_eq!(command, Some(argv(&["bash", "--posix", separator, "--arg", "file1", "file2"])));
+    fn scripts_are_written_private_and_rewritten_only_when_they_differ() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-shell-integration");
+        let _ = fs::remove_dir_all(&dir);
+        write_scripts(&dir).unwrap();
+        for sub in ["", "bash", "nushell/vendor/autoload"] {
+            assert_eq!(fs::metadata(dir.join(sub)).unwrap().mode() & 0o777, 0o700, "{sub}");
         }
-    }
-
-    #[test]
-    fn bash_missing_resources() {
-        let mut env = Env::new();
-        assert_eq!(setup_bash(&argv(&["bash"]), Path::new(MISSING), &mut env), None);
-        assert!(env.is_empty());
-    }
-
-    #[test]
-    fn xdg_empty_xdg_data_dirs() {
-        let mut env = Env::new();
-        assert!(setup_xdg_data_dirs(dir(), &mut env));
-        assert_eq!(get(&env, "TAPUST_SHELL_INTEGRATION_XDG_DIR"), Some(DIR));
-        assert_eq!(get(&env, "XDG_DATA_DIRS"), Some(format!("{DIR}:/usr/local/share:/usr/share").as_str()));
-    }
-
-    #[test]
-    fn xdg_existing_xdg_data_dirs() {
-        let mut env = Env::from([("XDG_DATA_DIRS".into(), "/opt/share".into())]);
-        assert!(setup_xdg_data_dirs(dir(), &mut env));
-        assert_eq!(get(&env, "TAPUST_SHELL_INTEGRATION_XDG_DIR"), Some(DIR));
-        assert_eq!(get(&env, "XDG_DATA_DIRS"), Some(format!("{DIR}:/opt/share").as_str()));
-    }
-
-    #[test]
-    fn xdg_missing_resources() {
-        let mut env = Env::new();
-        assert!(!setup_xdg_data_dirs(Path::new(MISSING), &mut env));
-        assert!(env.is_empty());
-    }
-
-    #[test]
-    fn nushell() {
-        let mut env = Env::new();
-        assert_eq!(setup_nushell(&argv(&["nu"]), dir(), &mut env), Some(argv(&["nu", "--execute", "use tapust *"])));
-        assert_eq!(get(&env, "TAPUST_SHELL_INTEGRATION_XDG_DIR"), Some(DIR));
-        assert!(get(&env, "XDG_DATA_DIRS").unwrap().starts_with(DIR));
-    }
-
-    #[test]
-    fn nushell_unsupported_options() {
-        for cmdline in [&["nu", "--command", "exit"][..], &["nu", "--lsp"], &["nu", "-c", "script.sh"], &["nu", "-ic", "script.sh"]] {
-            let mut env = Env::new();
-            assert_eq!(setup_nushell(&argv(cmdline), dir(), &mut env), None, "{cmdline:?}");
-            assert!(get(&env, "XDG_DATA_DIRS").is_some());
-            assert!(get(&env, "TAPUST_SHELL_INTEGRATION_XDG_DIR").is_some());
-        }
-    }
-
-    #[test]
-    fn nushell_missing_resources() {
-        let mut env = Env::new();
-        assert_eq!(setup_nushell(&argv(&["nu"]), Path::new(MISSING), &mut env), None);
-        assert!(env.is_empty());
-    }
-
-    #[test]
-    fn zsh() {
-        let mut env = Env::new();
-        assert_eq!(setup_zsh(&argv(&["zsh"]), dir(), &mut env), Some(argv(&["zsh"])));
-        assert_eq!(get(&env, "ZDOTDIR"), Some(concat!(env!("CARGO_MANIFEST_DIR"), "/shell-integration/zsh")));
-        assert_eq!(get(&env, "TAPUST_ZSH_ZDOTDIR"), None);
-    }
-
-    #[test]
-    fn zsh_zdotdir() {
-        let mut env = Env::from([("ZDOTDIR".into(), "$HOME/.config/zsh".into())]);
-        assert_eq!(setup_zsh(&argv(&["zsh"]), dir(), &mut env), Some(argv(&["zsh"])));
-        assert_eq!(get(&env, "ZDOTDIR"), Some(concat!(env!("CARGO_MANIFEST_DIR"), "/shell-integration/zsh")));
-        assert_eq!(get(&env, "TAPUST_ZSH_ZDOTDIR"), Some("$HOME/.config/zsh"));
-    }
-
-    #[test]
-    fn zsh_missing_resources() {
-        let mut env = Env::new();
-        assert_eq!(setup_zsh(&argv(&["zsh"]), Path::new(MISSING), &mut env), None);
-        assert!(env.is_empty());
+        let (bash, zsh) = (dir.join(BASH_SCRIPT), dir.join("zsh/.zshenv"));
+        let zsh_inode = fs::metadata(&zsh).unwrap().ino();
+        fs::write(&bash, "stale").unwrap();
+        write_scripts(&dir).unwrap();
+        assert_eq!(fs::read_to_string(&bash).unwrap(), SCRIPTS[0].1);
+        assert_eq!(fs::metadata(&zsh).unwrap().ino(), zsh_inode);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

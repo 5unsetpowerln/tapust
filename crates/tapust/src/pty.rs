@@ -85,7 +85,7 @@ pub struct ChildExit {
 
 impl Pty {
     /// Starts `argv`, or without it the login shell as a login shell (argv[0]
-    /// prefixed with '-', like tmux), with ghostty's shell integration.
+    /// prefixed with '-', like tmux), with tapust's shell integration.
     pub fn spawn(argv: Option<Vec<OsString>>, cols: u16, rows: u16, cell: (u32, u32), cwd: &Path) -> io::Result<Pty> {
         let login = argv.is_none();
         let argv = match argv {
@@ -93,7 +93,7 @@ impl Pty {
             None => vec![login_shell()?.into_os_string()],
         };
         let mut env: shell::Env = std::env::vars_os().collect();
-        let argv = shell::prepare(argv, &mut env);
+        let argv = shell::prepare(argv, login, &mut env);
         let mut command = Command::new(&argv[0]);
         command.args(&argv[1..]).env_clear().envs(&env);
         if login {
