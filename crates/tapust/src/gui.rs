@@ -422,10 +422,14 @@ impl App {
         let weak = Rc::downgrade(self);
         self.tab_view.connect_selected_page_notify(move |view| {
             let Some(app) = weak.upgrade() else { return };
+            let Some(page) = view.selected_page() else { return };
+            // ghostty unmarks a tab that needed attention once selected,
+            // however it got selected.
+            page.set_needs_attention(false);
             if app.syncing.get() {
                 return;
             }
-            if let Some(index) = view.selected_page().and_then(|p| app.window_of_page(&p)) {
+            if let Some(index) = app.window_of_page(&page) {
                 app.command(Command::SelectWindow(index));
             }
         });
@@ -588,6 +592,23 @@ impl App {
         self.state.borrow().session.windows().into_iter().find(|w| w.active).expect("the current window").id
     }
 
+    /// ghostty's ringBell with the default bell-features (attention, title):
+    /// the tab of an unselected window needs attention, and the surface
+    /// rings unless it has focus.
+    fn ring_bell(self: &Rc<Self>, pane: PaneId, surface: &Surface) {
+        let page = {
+            let st = self.state.borrow();
+            let window = st.session.windows().into_iter().find(|w| w.panes.iter().any(|p| p.pane == pane));
+            window.and_then(|w| st.tabs.get(&w.id).map(|t| t.page.clone()))
+        };
+        if let Some(page) = page
+            && !page.is_selected()
+        {
+            page.set_needs_attention(true);
+        }
+        surface.set_bell_ringing(true);
+    }
+
     fn window_of_page(&self, page: &adw::TabPage) -> Option<u32> {
         let st = self.state.borrow();
         let id = st.tabs.iter().find(|(_, t)| &t.page == page).map(|(&id, _)| id)?;
@@ -599,6 +620,10 @@ impl App {
             Event::Key { pane, keyval, state } => self.key(pane, keyval, state),
             Event::Resized { pane, cols, rows, cell } => {
                 self.resized(pane, cols, rows, cell);
+                true
+            }
+            Event::BellChanged => {
+                self.queue_reconcile();
                 true
             }
             Event::CellSize { cell: (cw, ch) } => {
@@ -647,6 +672,11 @@ impl App {
 
     fn key(self: &Rc<Self>, pane: PaneId, keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> bool {
         let Some((key, text)) = input::from_gdk(keyval, state) else { return false };
+        // Any key the terminal uses stops the bell (ghostty's keyEvent).
+        let surface = self.state.borrow().panes.get(&pane).map(|p| p.surface.clone());
+        if let Some(surface) = surface {
+            surface.set_bell_ringing(false);
+        }
         let mut st = self.state.borrow_mut();
         match st.session.key(key, Instant::now()) {
             KeyResult::Forward(id) => {
@@ -728,12 +758,13 @@ impl App {
             self.queue_reconcile();
             return;
         }
-        let (title, pwd) = {
-            let term = io.shared.term.lock();
-            (term.title().to_owned(), term.reported_cwd().map(str::to_owned))
+        let (title, pwd, bell) = {
+            let mut term = io.shared.term.lock();
+            (term.title().to_owned(), term.reported_cwd().map(str::to_owned), term.take_bell())
         };
         p.surface.output();
         p.surface.area.queue_render();
+        let surface = p.surface.clone();
         let mut changed = pwd != p.pwd;
         p.pwd = pwd;
         if title != p.title {
@@ -742,6 +773,9 @@ impl App {
             changed = true;
         }
         drop(st);
+        if bell {
+            self.ring_bell(pane, &surface);
+        }
         if changed {
             self.queue_reconcile();
         }
@@ -1059,7 +1093,16 @@ impl App {
             .or_else(|| active.and_then(|p| p.title_override.as_deref()))
             .or_else(|| active.map(|p| p.title.as_str()).filter(|t| !t.is_empty()))
             .unwrap_or("tapust");
-        if info.zoomed { format!("\u{1F50D} {title}") } else { title.to_owned() }
+        let bell = active.is_some_and(|p| p.surface.bell_ringing());
+        let mut shown = String::new();
+        if bell {
+            shown.push_str("\u{1F514} ");
+        }
+        if info.zoomed {
+            shown.push_str("\u{1F50D} ");
+        }
+        shown.push_str(title);
+        shown
     }
 
     fn toast(&self, text: &str) {

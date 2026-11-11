@@ -30,6 +30,8 @@ pub enum Event {
     Dropped { source: PaneId, target: PaneId, dir: Direction },
     /// The GLArea was mapped (ghostty restores focus after this).
     Mapped,
+    /// The bell-ringing state changed (the tab title shows it).
+    BellChanged,
     /// The cell size in device pixels is known or changed (ghostty's
     /// cell_size action).
     CellSize { cell: (u32, u32) },
@@ -65,6 +67,9 @@ pub struct Surface {
     blink_timer: RefCell<Option<glib::SourceId>>,
     /// The PTY looks like a password prompt (ghostty's password_input).
     password: Cell<bool>,
+    /// ghostty's bell-ringing: set by BEL while unfocused, cleared by focus,
+    /// a key or a click.
+    bell: Cell<bool>,
     last_blink_reset: Cell<Option<Instant>>,
     font_scale: Cell<f64>,
     cell_idle: Cell<bool>,
@@ -185,6 +190,7 @@ impl Surface {
             resize_idle: Cell::new(false),
             blink_timer: RefCell::new(None),
             password: Cell::new(false),
+            bell: Cell::new(false),
             last_blink_reset: Cell::new(None),
             font_scale: Cell::new(0.0),
             cell_idle: Cell::new(false),
@@ -279,7 +285,11 @@ impl Surface {
 
         let click = gtk::GestureClick::new();
         let area = self.area.clone();
+        let weak = Rc::downgrade(self);
         click.connect_pressed(move |_, _, _, _| {
+            if let Some(s) = weak.upgrade() {
+                s.set_bell_ringing(false);
+            }
             area.grab_focus();
         });
         self.area.add_controller(click);
@@ -435,6 +445,7 @@ impl Surface {
         self.focused.set(focused);
         self.veil.set_reveal_child(self.split.get() && !focused);
         if focused {
+            self.set_bell_ringing(false);
             // Focus shows the cursor and starts blinking unless it already does.
             if self.blink_timer.borrow().is_none() {
                 self.start_blink();
@@ -495,6 +506,20 @@ impl Surface {
         } else {
             self.draw.borrow_mut().blink_on = true;
         }
+    }
+
+    /// ghostty's setBellRinging: a focused surface never starts ringing.
+    pub fn set_bell_ringing(&self, ringing: bool) {
+        if ringing && self.focused.get() {
+            return;
+        }
+        if self.bell.replace(ringing) != ringing {
+            (self.handler)(Event::BellChanged);
+        }
+    }
+
+    pub fn bell_ringing(&self) -> bool {
+        self.bell.get()
     }
 
     pub fn set_password_input(&self, on: bool) {
