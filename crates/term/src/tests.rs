@@ -1072,3 +1072,13 @@ fn configured_palette_survives_resets() {
     t.feed(b"\x1b]4;1;rgb:ff/ff/ff\x07\x1bc");
     assert_eq!(*t.palette(), configured);
 }
+
+#[test]
+fn alternate_scroll_starts_on() {
+    let mut t = term(10, 2);
+    assert!(t.modes().alternate_scroll);
+    feed(&mut t, "\x1b[?1007l");
+    assert!(!t.modes().alternate_scroll);
+    feed(&mut t, "\x1bc");
+    assert!(t.modes().alternate_scroll);
+}

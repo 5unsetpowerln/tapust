@@ -178,7 +178,8 @@ impl Term {
             autowrap: true,
             origin: false,
             lnm: false,
-            modes: Modes::default(),
+            // ghostty starts with DEC 1007 (mouse_alternate_scroll) set.
+            modes: Modes { alternate_scroll: true, ..Modes::default() },
             cursor_visible: true,
             cursor_shape: CursorShape::Block,
             // ghostty's default for DEC mode 12 (cursor-style-blink unset).
