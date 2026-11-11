@@ -304,6 +304,102 @@ pub fn drag_lines(term: &Terminal, click: Point, drag: Point) -> Option<Selectio
     Some(sel)
 }
 
+/// PromptIterator(.left_up): the first line of the prompt at or above
+/// `line`, walking a run of continuation lines up to its prompt line.
+fn prompt_above(term: &Terminal, line: u64) -> Option<u64> {
+    let first = term.first_line();
+    let mut l = line;
+    loop {
+        match term.line_prompt(l) {
+            PromptMark::Prompt => return Some(l),
+            PromptMark::Continuation => {
+                let mut top = l;
+                while top > first {
+                    match term.line_prompt(top - 1) {
+                        PromptMark::None => return Some(top),
+                        PromptMark::Continuation => top -= 1,
+                        PromptMark::Prompt => return Some(top - 1),
+                    }
+                }
+                // The scrollback was cut inside the prompt.
+                return Some(l);
+            }
+            PromptMark::None if l > first => l -= 1,
+            PromptMark::None => return None,
+        }
+    }
+}
+
+/// PromptIterator(.right_down): the first line of the first prompt at or
+/// below `line`, and the line after its run of continuation lines.
+fn prompt_below(term: &Terminal, line: u64) -> Option<(u64, u64)> {
+    let start = (line..term.end_line()).find(|&l| term.line_prompt(l) != PromptMark::None)?;
+    let after = (start + 1..term.end_line()).find(|&l| term.line_prompt(l) != PromptMark::Continuation);
+    Some((start, after.unwrap_or(term.end_line())))
+}
+
+/// Screen.selectOutput: the output of the command whose prompt is at or
+/// above `p`, from its first to its last cell with text; nothing unless
+/// `p` is on output.
+pub fn output(term: &Terminal, p: Point) -> Option<Selection> {
+    let cell = |q: Point| term.line(q.line).map(|r| r[q.col as usize]);
+    let has_text = |c: Cell| char_at(c).is_some();
+    if cell(p)?.semantic() != Semantic::Output {
+        return None;
+    }
+    let last_col = term.cols() - 1;
+    let Some(prompt) = prompt_above(term, p.line) else {
+        // Without a prompt above, the output runs from the top of the
+        // scrollback to the last text before the next prompt.
+        let (next, _) = prompt_below(term, p.line)?;
+        let start = Point { line: term.first_line(), col: 0 };
+        if next <= start.line {
+            return None;
+        }
+        let mut end = Point { line: next - 1, col: last_col };
+        while end != start && !has_text(cell(end)?) {
+            end = left_wrap(term, end)?;
+        }
+        return Some(Selection { start, end, rect: false });
+    };
+    // PageList.highlightSemanticContent(.output) up to the next prompt.
+    let (_, after) = prompt_below(term, prompt)?;
+    let zone_end = match prompt_below(term, after) {
+        Some((next, _)) => Point { line: next - 1, col: last_col },
+        None => Point { line: term.end_line() - 1, col: last_col },
+    };
+    let mut found: Option<(Point, Point)> = None;
+    let mut q = Point { line: prompt, col: 0 };
+    loop {
+        let c = cell(q)?;
+        match (c.semantic(), &mut found) {
+            (Semantic::Output, None) if has_text(c) => found = Some((q, q)),
+            (Semantic::Output, Some(range)) if has_text(c) => range.1 = q,
+            (Semantic::Prompt | Semantic::Input, Some(_)) => break,
+            _ => {}
+        }
+        if q == zone_end {
+            break;
+        }
+        q = right_wrap(term, q)?;
+    }
+    let (start, end) = found?;
+    Some(Selection { start, end, rect: false })
+}
+
+/// SelectionGesture.dragSelectionOutput: from the output under the click
+/// to the output under the pointer, or the clicked output alone.
+pub fn drag_output(term: &Terminal, click: Point, drag: Point) -> Option<Selection> {
+    let mut sel = output(term, click)?;
+    let Some(current) = output(term, drag) else { return Some(sel) };
+    if drag < click {
+        sel.start = current.start;
+    } else {
+        sel.end = current.end;
+    }
+    Some(sel)
+}
+
 /// The selected text as ghostty copies it (plain, unwrapped, trimmed):
 /// soft-wrapped lines join, blank and space cells become spaces only when
 /// text follows on the line, and trailing blank lines are dropped.
@@ -388,6 +484,29 @@ mod tests {
         assert_eq!(prompt_click_move(&t, cursor, at(&t, 0, 2)), (7, 0));
         // Past the end of the input there is nothing to the right to reach.
         assert_eq!(prompt_click_move(&t, at(&t, 0, 3), at(&t, 0, 5)), (0, 2));
+    }
+
+    /// ghostty's "Screen: selectOutput" test.
+    #[test]
+    fn output_selects_the_command_output_around_the_click() {
+        let t = term(
+            10,
+            15,
+            "output1\r\noutput1\r\n\x1b]133;A\x07prompt2\r\n\x1b]133;B\x07input2\r\n\x1b]133;C\x07\
+             output2output2output2output2\r\noutput2\r\n\x1b]133;A\x07$ \x1b]133;B\x07input3\r\n\x1b]133;C\x07\
+             output3\r\noutput3\r\noutput3",
+        );
+        let s = output(&t, at(&t, 1, 1)).unwrap();
+        assert_eq!(text(&t, &s), "output1\noutput1");
+        let s = output(&t, at(&t, 7, 3)).unwrap();
+        assert_eq!(text(&t, &s), "output2output2output2output2\noutput2");
+        let s = output(&t, at(&t, 10, 2)).unwrap();
+        assert_eq!((s.start, s.end), (at(&t, 9, 0), at(&t, 11, 6)));
+        assert!(output(&t, at(&t, 8, 1)).is_none());
+        assert!(output(&t, at(&t, 8, 5)).is_none());
+        // A drag extends by whole outputs.
+        let s = drag_output(&t, at(&t, 10, 2), at(&t, 4, 0)).unwrap();
+        assert_eq!((s.start, s.end), (at(&t, 4, 0), at(&t, 11, 6)));
     }
 
     #[test]

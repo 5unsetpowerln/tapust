@@ -72,8 +72,11 @@ enum InKeyEvent {
 /// ghostty's SelectionGesture for the left button.
 #[derive(Default)]
 struct Gesture {
-    /// Clicks in the current series (1 cell, 2 word, 3 line).
+    /// Clicks in the current series (1 cell, 2 word, 3 line or output).
     count: u8,
+    /// The third click held ctrl: it and its drag select whole outputs
+    /// (ghostty's left_click_behavior .output).
+    output: bool,
     last_press: Option<Instant>,
     /// Where the series started, in device pixels.
     first_px: (f64, f64),
@@ -1002,10 +1005,12 @@ impl Surface {
                 g.click = Some(point);
                 g.left_down = true;
                 g.dragged = false;
+                g.output = g.count == 3 && mods.ctrl;
                 let selection = match g.count {
                     1 => None,
                     // A double click on a link selects all of it.
                     2 => links::link_at(&term, point.cell).map(|(sel, _)| sel).or_else(|| selection::word(&term, point.cell)),
+                    _ if g.output => selection::output(&term, point.cell),
                     _ => selection::line(&term, point.cell, true),
                 };
                 drop(g);
@@ -1152,6 +1157,7 @@ impl Surface {
                 selection::drag_cells(&term, click, drag, mods.ctrl && mods.alt, cw)
             }
             2 => selection::drag_words(&term, click.cell, drag.cell),
+            _ if g.output => selection::drag_output(&term, click.cell, drag.cell),
             _ => selection::drag_lines(&term, click.cell, drag.cell),
         };
         drop(g);
