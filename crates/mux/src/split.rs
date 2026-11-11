@@ -15,7 +15,8 @@ pub(crate) enum Node {
 pub(crate) struct Split {
     /// Children side by side (ghostty's `horizontal` layout) or stacked.
     pub horizontal: bool,
-    /// The first child's share of the space between the children.
+    /// The first child's share of the space between the children; always a
+    /// binary16 value, since ghostty keeps ratios as `f16`.
     pub ratio: f64,
     pub first: Node,
     pub second: Node,
@@ -39,6 +40,23 @@ enum Resize {
 
 fn extent(rect: Rect, horizontal: bool) -> u32 {
     if horizontal { rect.w } else { rect.h }
+}
+
+/// Rounds to the nearest IEEE binary16 value, ties to even. ghostty computes
+/// ratios in `f16`, where every operation rounds its result this way; an
+/// operation done in `f64` and then rounded gives the same value.
+pub(crate) fn f16(x: f64) -> f64 {
+    const MAX: f64 = 65504.0;
+    if x == 0.0 || !x.is_finite() {
+        return x;
+    }
+    let a = x.abs();
+    let exponent = ((a.to_bits() >> 52) & 0x7ff) as i32 - 1023;
+    // Ten fraction bits; below the normal range the spacing stays 2^-24.
+    let ulp = 2f64.powi(exponent.max(-14) - 10);
+    let rounded = (a / ulp).round_ties_even() * ulp;
+    let rounded = if rounded > MAX { f64::INFINITY } else { rounded };
+    rounded.copysign(x)
 }
 
 impl Split {
@@ -160,9 +178,21 @@ impl Node {
         if let Node::Split(s) = self {
             let first = s.first.weight(s.horizontal);
             let second = s.second.weight(s.horizontal);
-            s.ratio = f64::from(first) / f64::from(first + second);
+            s.ratio = f16(f64::from(first) / f64::from(first + second));
             s.first.equalize();
             s.second.equalize();
+        }
+    }
+
+    /// The extent along an axis counting every leaf as one unit, from which
+    /// ghostty's spatial representation starts.
+    fn units(&self, horizontal: bool) -> u32 {
+        match self {
+            Node::Leaf(_) => 1,
+            Node::Split(s) => {
+                let (a, b) = (s.first.units(horizontal), s.second.units(horizontal));
+                if s.horizontal == horizontal { a + b } else { a.max(b) }
+            }
         }
     }
 
@@ -205,22 +235,37 @@ impl Node {
     pub(crate) fn resize(&mut self, wp: PaneId, horizontal: bool, amount: i32, rect: Rect, m: &Metrics) {
         let total = f64::from(extent(rect, horizontal));
         if total > 0.0 {
-            let delta = (f64::from(amount) / total).clamp(-1.0, 1.0);
-            self.resize_in(wp, horizontal, delta, rect, 1.0, m);
+            // GTK computes the delta in f64; the tree takes it as f16.
+            let delta = f16((f64::from(amount) / total).clamp(-1.0, 1.0));
+            let root = f16(f64::from(self.units(horizontal)));
+            self.resize_in(wp, horizontal, delta, rect, root, root, m);
         }
     }
 
-    /// `share` is this node's extent as a fraction of the tree's, from the ratios alone.
-    fn resize_in(&mut self, wp: PaneId, horizontal: bool, delta: f64, rect: Rect, share: f64, m: &Metrics) -> Resize {
+    /// `size` is this node's extent in ghostty's spatial representation: the
+    /// root spans `root` leaf units and every split hands its children
+    /// `size * ratio` and `size * (1 - ratio)`, each rounded to f16.
+    #[allow(clippy::too_many_arguments)]
+    fn resize_in(
+        &mut self,
+        wp: PaneId,
+        horizontal: bool,
+        delta: f64,
+        rect: Rect,
+        size: f64,
+        root: f64,
+        m: &Metrics,
+    ) -> Resize {
         let s = match self {
             Node::Leaf(p) => return if *p == wp { Resize::Pending } else { Resize::NotHere },
             Node::Split(s) => s,
         };
         let (first, _, second) = s.children(rect, m);
         let along = s.horizontal == horizontal;
-        let (first_share, second_share) = if along { (share * s.ratio, share * (1.0 - s.ratio)) } else { (share, share) };
-        let found = match s.first.resize_in(wp, horizontal, delta, first, first_share, m) {
-            Resize::NotHere => s.second.resize_in(wp, horizontal, delta, second, second_share, m),
+        let (first_size, second_size) =
+            if along { (f16(size * s.ratio), f16(size * f16(1.0 - s.ratio))) } else { (size, size) };
+        let found = match s.first.resize_in(wp, horizontal, delta, first, first_size, root, m) {
+            Resize::NotHere => s.second.resize_in(wp, horizontal, delta, second, second_size, root, m),
             found => found,
         };
         if !matches!(found, Resize::Pending) || !along {
@@ -231,10 +276,12 @@ impl Node {
         let (shown, desired) = s.position(rect, m);
         let avail = extent(rect, horizontal).saturating_sub(m.divider);
         if shown != desired && avail > 0 {
-            s.ratio = f64::from(shown) / f64::from(avail);
+            s.ratio = f16(f64::from(shown) / f64::from(avail));
         }
-        if share > 0.0 {
-            s.ratio = (s.ratio + delta / share).clamp(0.0, 1.0);
+        // The split's width relative to the tree's, as spatial normalizes it.
+        let scale = f16(size / root);
+        if scale > 0.0 {
+            s.ratio = f16(s.ratio + f16(delta / scale)).clamp(0.0, 1.0);
         }
         Resize::Done
     }
@@ -258,6 +305,34 @@ mod tests {
 
     fn rect(x: u32, y: u32, w: u32, h: u32) -> Rect {
         Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn rounds_like_ieee_binary16() {
+        // Expected values from Python's struct format 'e' (IEEE binary16).
+        let table = [
+            (0.5, 0.5),
+            (1.0 / 3.0, 0.333251953125),
+            (2.0 / 3.0, 0.66650390625),
+            (0.1, 0.0999755859375),
+            (50.0 / 1276.0, 0.0391845703125),
+            (0.9999, 1.0),
+            (1.00048828125, 1.0),
+            (1.00146484375, 1.001953125),
+            (2.9802322387695312e-08, 0.0),
+            (4.470348358154297e-08, 5.960464477539063e-08),
+            (1e-07, 1.1920928955078125e-07),
+            (6.1e-05, 6.097555160522461e-05),
+            (65519.0, 65504.0),
+            (65520.0, f64::INFINITY),
+            (-0.35233447033367526, -0.352294921875),
+            (0.3018689460797075, 0.3017578125),
+            (-0.8551274266649145, -0.85498046875),
+            (0.0717640086133784, 0.07177734375),
+        ];
+        for (x, expected) in table {
+            assert_eq!(f16(x), expected, "{x}");
+        }
     }
 
     #[test]

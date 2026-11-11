@@ -121,6 +121,19 @@ fn resize_right_by_five_cells() {
 }
 
 #[test]
+fn repeated_resizes_round_the_ratio_like_ghostty() {
+    // ghostty keeps the ratio in f16: after six 50-pixel moves the divider
+    // sits at 936, where an f64 ratio would put it at 937.
+    let mut s = new_session();
+    ok(&mut s, split(true));
+    select_index(&mut s, 0);
+    for _ in 0..6 {
+        ok(&mut s, Command::ResizePane(Direction::Right, 5));
+    }
+    assert_eq!(rects(&s)[0].2, 936);
+}
+
+#[test]
 fn resize_moves_the_divider_of_the_panes_own_split() {
     // Splitting the first of two panes gives [[0 | 2] | 1]. resize-pane -R on
     // pane 2 moves the divider of its own split, on its left (ghostty);
