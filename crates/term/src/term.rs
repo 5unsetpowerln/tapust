@@ -154,6 +154,8 @@ pub(crate) struct Term {
     pub view_offset: usize,
     pub replies: Vec<u8>,
     pub title: String,
+    /// A program set the title; until then ghostty shows the pwd as title.
+    seen_title: bool,
     pub cwd: Option<String>,
     pub bell: bool,
     pub palette: Palette,
@@ -208,6 +210,7 @@ impl Term {
             view_offset: 0,
             replies: Vec::new(),
             title: String::new(),
+            seen_title: false,
             cwd: None,
             bell: false,
             palette: default_palette(),
@@ -669,6 +672,25 @@ impl Term {
             self.carriage_return();
             self.index();
         }
+    }
+
+    /// OSC 7 (ghostty's reportPwd): an empty URL forgets the directory; a
+    /// file or kitty-shell-cwd URL of this host sets it; while no program
+    /// set a title, the directory is the title.
+    fn report_pwd(&mut self, url: &[u8]) {
+        let path = if url.is_empty() {
+            None
+        } else {
+            match parse_cwd(url, local_hostname()) {
+                Some(path) => Some(path),
+                None => return,
+            }
+        };
+        if !self.seen_title {
+            self.title.clear();
+            self.title.push_str(path.as_deref().unwrap_or(""));
+        }
+        self.cwd = path;
     }
 
     /// OSC 133 (ghostty's Terminal.semanticPrompt).
@@ -1351,6 +1373,7 @@ impl Term {
             0 | 2 => {
                 self.title.clear();
                 self.title.push_str(&String::from_utf8_lossy(rest));
+                self.seen_title = true;
             }
             4 => {
                 let mut it = rest.split(|&b| b == b';');
@@ -1380,7 +1403,7 @@ impl Term {
                 }
                 self.mark_all_dirty();
             }
-            7 => self.cwd = parse_cwd(rest),
+            7 => self.report_pwd(rest),
             133 => self.semantic_prompt(rest),
             22 => {
                 if rest.is_empty() {
@@ -1525,27 +1548,46 @@ fn mouse_shape(name: &str) -> Option<&'static str> {
     })
 }
 
-/// The path of an OSC 7 `file://host/path` URL, percent-decoded.
-fn parse_cwd(s: &[u8]) -> Option<String> {
-    let path = match s.strip_prefix(b"file://") {
-        Some(rest) => &rest[rest.iter().position(|&b| b == b'/')?..],
-        None if s.first() == Some(&b'/') => s,
-        None => return None,
+/// The path of an OSC 7 URL: `file://host/path` (percent-decoded) or
+/// `kitty-shell-cwd://host/path` (raw), only for this host or localhost.
+fn parse_cwd(s: &[u8], hostname: &str) -> Option<String> {
+    let (rest, raw) = match (s.strip_prefix(b"file://"), s.strip_prefix(b"kitty-shell-cwd://")) {
+        (Some(rest), _) => (rest, false),
+        (_, Some(rest)) => (rest, true),
+        _ => return None,
     };
-    let mut out = Vec::with_capacity(path.len());
+    let slash = rest.iter().position(|&b| b == b'/')?;
+    let host = String::from_utf8(percent_decode(&rest[..slash])).ok()?;
+    if host != "localhost" && host != hostname {
+        return None;
+    }
+    let path = &rest[slash..];
+    let path = if raw { path.to_vec() } else { percent_decode(path) };
+    Some(String::from_utf8_lossy(&path).into_owned())
+}
+
+fn percent_decode(s: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
     let mut i = 0;
-    while i < path.len() {
-        let b = path[i];
+    while i < s.len() {
         let hex = |c: u8| (c as char).to_digit(16);
-        if b == b'%'
-            && let (Some(h), Some(l)) = (path.get(i + 1).and_then(|&c| hex(c)), path.get(i + 2).and_then(|&c| hex(c)))
+        if s[i] == b'%'
+            && let (Some(h), Some(l)) = (s.get(i + 1).and_then(|&c| hex(c)), s.get(i + 2).and_then(|&c| hex(c)))
         {
             out.push((h * 16 + l) as u8);
             i += 3;
             continue;
         }
-        out.push(b);
+        out.push(s[i]);
         i += 1;
     }
-    Some(String::from_utf8_lossy(&out).into_owned())
+    out
+}
+
+/// gethostname(2), as ghostty's isLocal compares OSC 7 hosts with it.
+fn local_hostname() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        std::fs::read_to_string("/proc/sys/kernel/hostname").map(|s| s.trim_end().to_owned()).unwrap_or_default()
+    })
 }

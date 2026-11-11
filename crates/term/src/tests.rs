@@ -959,7 +959,7 @@ fn title_cwd_bell() {
     feed(&mut t, "\x1b]1;icon\x07\x1b]8;;http://x\x07link\x1b]8;;\x07\x1b]52;c;aGk=\x07");
     assert_eq!(t.title(), "two; with semicolon");
     assert_eq!(line(&t, 0), "link");
-    feed(&mut t, "\x1b]7;file://host/home/me/a%20b\x07");
+    feed(&mut t, "\x1b]7;file://localhost/home/me/a%20b\x07");
     assert_eq!(t.reported_cwd(), Some("/home/me/a b"));
     assert!(!t.take_bell());
     feed(&mut t, "\x07\x07");
@@ -1148,4 +1148,22 @@ fn osc_133_marks_prompts_input_and_output() {
     // The alternate screen is never at a prompt.
     feed(&mut t, "\x1b[?1049h");
     assert!(!t.cursor_at_prompt());
+}
+
+#[test]
+fn osc_7_follows_ghostty() {
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap().trim_end().to_owned();
+    let mut t = term(10, 2);
+    // Until a program sets a title, the directory is the title.
+    feed(&mut t, &format!("\x1b]7;kitty-shell-cwd://{host}/tmp/a b\x07"));
+    assert_eq!((t.reported_cwd(), t.title()), (Some("/tmp/a b"), "/tmp/a b"));
+    feed(&mut t, "\x1b]7;file://localhost/x%20y\x07");
+    assert_eq!(t.reported_cwd(), Some("/x y"));
+    // Other hosts, an empty host and bare paths are ignored.
+    for url in ["file://elsewhere.invalid/z", "file:///z", "/z"] {
+        feed(&mut t, &format!("\x1b]7;{url}\x07"));
+        assert_eq!(t.reported_cwd(), Some("/x y"), "{url}");
+    }
+    feed(&mut t, "\x1b]2;title\x07\x1b]7;\x07");
+    assert_eq!((t.reported_cwd(), t.title()), (None, "title"));
 }
