@@ -326,6 +326,8 @@ impl App {
             .build();
         window.set_property("handle-menubar-accel", false);
         window.add_css_class("window");
+        // ghostty's headerbar-visible: never shown while fullscreen.
+        window.connect_fullscreened_notify(move |w| header.set_visible(!w.is_fullscreen()));
 
         let palette = theme::palette();
         let term_bg = compose::resolve(term::Color::Default, &palette, palette.background);
@@ -869,9 +871,11 @@ impl App {
             page.set_title(&title);
             if info.active {
                 self.tab_view.set_selected_page(&page);
-                let window_title = self.state.borrow().window_title_override.clone().unwrap_or(title);
-                self.title.set_title(&window_title);
-                self.window.set_title(Some(&window_title));
+                // The override only replaces the header bar's title; the
+                // window keeps the tab's title (ghostty's closureTitle).
+                let shown = self.state.borrow().window_title_override.clone().unwrap_or_else(|| title.clone());
+                self.title.set_title(&shown);
+                self.window.set_title(Some(&title));
             }
         }
         // Replacing split widgets makes GTK move the focus to a focusable
