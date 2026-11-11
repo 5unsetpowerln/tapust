@@ -146,7 +146,9 @@ pub enum Command {
         cwd_of_active: bool,
     },
     /// `new-window`, with `-c "#{pane_current_path}"` when `cwd_of_active`.
-    NewWindow { cwd_of_active: bool },
+    /// new-window, with `-a` (`after`) to insert it after the current
+    /// window instead of at the first free index.
+    NewWindow { cwd_of_active: bool, after: bool },
     /// `select-pane -L/-R/-U/-D`.
     SelectPane(Direction),
     /// `select-pane -l` (`last-pane`).

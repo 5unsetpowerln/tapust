@@ -102,7 +102,7 @@ pub(crate) fn prefix_binding(key: Key) -> Option<Binding> {
             'J' => bind(true, Action::Run(Command::ResizePane(Down, 5))),
             'K' => bind(true, Action::Run(Command::ResizePane(Up, 5))),
             'L' => bind(true, Action::Run(Command::ResizePane(Right, 5))),
-            'c' => run(Command::NewWindow { cwd_of_active: true }),
+            'c' => run(Command::NewWindow { cwd_of_active: true, after: false }),
             'h' => run(Command::SelectPane(Left)),
             'j' => run(Command::SelectPane(Down)),
             'k' => run(Command::SelectPane(Up)),

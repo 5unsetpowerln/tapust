@@ -275,7 +275,7 @@ fn click_focuses_and_drop_moves_a_pane() {
 fn swap_window_wraps_and_follows() {
     let mut s = new_session();
     for name in ["b", "c"] {
-        ok(&mut s, Command::NewWindow { cwd_of_active: false });
+        ok(&mut s, Command::NewWindow { cwd_of_active: false, after: false });
         ok(&mut s, Command::RenameWindow(name.to_owned()));
     }
     ok(&mut s, Command::SelectWindow(0));
@@ -290,11 +290,11 @@ fn swap_window_wraps_and_follows() {
 #[test]
 fn new_window_fills_gap() {
     let mut s = new_session();
-    ok(&mut s, Command::NewWindow { cwd_of_active: false });
-    ok(&mut s, Command::NewWindow { cwd_of_active: false });
+    ok(&mut s, Command::NewWindow { cwd_of_active: false, after: false });
+    ok(&mut s, Command::NewWindow { cwd_of_active: false, after: false });
     ok(&mut s, Command::SelectWindow(1));
     ok(&mut s, Command::KillWindow);
-    ok(&mut s, Command::NewWindow { cwd_of_active: false });
+    ok(&mut s, Command::NewWindow { cwd_of_active: false, after: false });
     let indices: Vec<u32> = s.windows().iter().map(|w| w.index).collect();
     assert_eq!(indices, [0, 1, 2]);
     assert!(s.windows()[1].active);
@@ -320,7 +320,7 @@ fn split_effects() {
 #[test]
 fn last_pane_exit_exits() {
     let mut s = new_session();
-    ok(&mut s, Command::NewWindow { cwd_of_active: false });
+    ok(&mut s, Command::NewWindow { cwd_of_active: false, after: false });
     assert_eq!(s.pane_exited(1), [Effect::Destroy { pane: 1 }]);
     assert_eq!(s.active_pane(), 0);
     assert_eq!(s.pane_exited(0), [Effect::Destroy { pane: 0 }, Effect::Exit]);
@@ -478,7 +478,7 @@ fn confirm_kill_pane() {
 fn confirm_kill_window() {
     let t = Instant::now();
     let mut s = new_session();
-    ok(&mut s, Command::NewWindow { cwd_of_active: false });
+    ok(&mut s, Command::NewWindow { cwd_of_active: false, after: false });
     s.set_auto_name(1, "vim");
     s.key(ctrl('b'), t);
     s.key(ch('&'), t);
@@ -604,8 +604,8 @@ fn arrow_resize_bindings() {
 fn swap_window_bindings_repeat() {
     let t = Instant::now();
     let mut s = new_session();
-    ok(&mut s, Command::NewWindow { cwd_of_active: false });
-    ok(&mut s, Command::NewWindow { cwd_of_active: false });
+    ok(&mut s, Command::NewWindow { cwd_of_active: false, after: false });
+    ok(&mut s, Command::NewWindow { cwd_of_active: false, after: false });
     let panes = |s: &Session| -> Vec<PaneId> { s.windows().iter().map(|w| w.panes[0].pane).collect() };
     s.key(ctrl('b'), t);
     s.key(ch('<'), t);
@@ -637,7 +637,7 @@ fn swap_and_rotate_bindings() {
 fn exit_of_pane_in_other_window() {
     let mut s = new_session();
     ok(&mut s, split(true));
-    ok(&mut s, Command::NewWindow { cwd_of_active: false });
+    ok(&mut s, Command::NewWindow { cwd_of_active: false, after: false });
     assert_eq!(s.pane_exited(1), [Effect::Destroy { pane: 1 }]);
     assert_eq!(s.active_pane(), 2);
     assert_eq!(s.pane_exited(2), [Effect::Destroy { pane: 2 }]);
@@ -665,4 +665,21 @@ fn rename_expands_formats() {
     let mut s = new_session();
     ok(&mut s, Command::RenameWindow("#S-#I-##-#{pane_index}-#Q".to_owned()));
     assert_eq!(s.windows()[0].name, "0-0-#-0-#Q");
+}
+
+#[test]
+fn new_window_after_shuffles_up() {
+    let mut s = new_session();
+    ok(&mut s, Command::NewWindow { cwd_of_active: false, after: false });
+    ok(&mut s, Command::NewWindow { cwd_of_active: false, after: false });
+    ok(&mut s, Command::SelectWindow(0));
+    let ids = |s: &Session| s.windows().iter().map(|w| (w.index, w.id)).collect::<Vec<_>>();
+    assert_eq!(ids(&s), vec![(0, 0), (1, 1), (2, 2)]);
+    ok(&mut s, Command::NewWindow { cwd_of_active: false, after: true });
+    assert_eq!(ids(&s), vec![(0, 0), (1, 3), (2, 1), (3, 2)]);
+    assert_eq!(s.current(), 1);
+    // The last window (-) followed its window to the new index.
+    ok(&mut s, Command::SelectWindow(3));
+    ok(&mut s, Command::LastWindow);
+    assert_eq!(s.current(), 1);
 }

@@ -372,7 +372,7 @@ impl App {
         let weak = Rc::downgrade(&app);
         new_tab.connect_clicked(move |_| {
             if let Some(app) = weak.upgrade() {
-                app.command(Command::NewWindow { cwd_of_active: true });
+                app.command(Command::NewWindow { cwd_of_active: true, after: true });
             }
         });
         app.connect_tabs(&overview);
@@ -437,7 +437,7 @@ impl App {
         let weak = Rc::downgrade(self);
         overview.connect_create_tab(move |_| {
             let app = weak.upgrade().expect("app");
-            app.command(Command::NewWindow { cwd_of_active: true });
+            app.command(Command::NewWindow { cwd_of_active: true, after: true });
             app.reconcile();
             app.tab_view.selected_page().expect("new tab")
         });
@@ -459,7 +459,7 @@ impl App {
         {
             add(name, Box::new(move |app| app.command(Command::SplitWindow { horizontal, before, full: false, cwd_of_active: true })));
         }
-        add("new-tab", Box::new(|app| app.command(Command::NewWindow { cwd_of_active: true })));
+        add("new-tab", Box::new(|app| app.command(Command::NewWindow { cwd_of_active: true, after: true })));
         add("new-window", Box::new(|_| {
             if let Ok(exe) = std::env::current_exe() {
                 let _ = std::process::Command::new(exe).spawn();

@@ -28,7 +28,8 @@ pub(crate) fn new_session() -> (Session, Vec<Effect>) {
         writes: Vec::new(),
     };
     let effects = s.op(|s| {
-        let idx = s.spawn_window(None);
+        let idx = s.free_index();
+        s.spawn_window(idx, None);
         s.curw = idx;
     });
     (s, effects)
@@ -109,10 +110,9 @@ impl Session {
         (0..).find(|i| !self.winlinks.contains_key(i)).expect("free index")
     }
 
-    /// spawn_window for a new window at the lowest free index, sized for the
-    /// client. Returns the index; the caller selects it.
-    fn spawn_window(&mut self, cwd_of: Option<PaneId>) -> u32 {
-        let idx = self.free_index();
+    /// spawn_window for a new window at `idx`, sized for the client; the
+    /// caller selects it.
+    fn spawn_window(&mut self, idx: u32, cwd_of: Option<PaneId>) {
         let pane = self.new_pane();
         let id = pane.id;
         let mut w = Window::new(self.next_window_id, pane);
@@ -122,6 +122,25 @@ impl Session {
         self.next_active_point = self.next_active_point.wrapping_add(1);
         self.winlinks.insert(idx, w);
         self.spawned.push((id, cwd_of));
+    }
+
+    /// winlink_shuffle_up without `before`: frees the index after the
+    /// current window by moving the windows from there up by one.
+    fn shuffle_up(&mut self) -> u32 {
+        let idx = self.curw + 1;
+        let mut last = idx;
+        while self.winlinks.contains_key(&last) {
+            last += 1;
+        }
+        for from in (idx..last).rev() {
+            let w = self.winlinks.remove(&from).expect("window");
+            self.winlinks.insert(from + 1, w);
+            for i in &mut self.lastw {
+                if *i == from {
+                    *i = from + 1;
+                }
+            }
+        }
         idx
     }
 
@@ -226,9 +245,10 @@ impl Session {
             Command::SplitWindow { horizontal, before, full, cwd_of_active } => {
                 self.split_window(Side { horizontal, before }, full, cwd_of_active)
             }
-            Command::NewWindow { cwd_of_active } => {
+            Command::NewWindow { cwd_of_active, after } => {
                 let cwd_of = cwd_of_active.then(|| self.cur().active);
-                let idx = self.spawn_window(cwd_of);
+                let idx = if after { self.shuffle_up() } else { self.free_index() };
+                self.spawn_window(idx, cwd_of);
                 self.set_current(idx);
                 Ok(())
             }
