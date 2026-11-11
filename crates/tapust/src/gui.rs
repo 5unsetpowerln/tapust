@@ -432,6 +432,8 @@ impl App {
         });
         app.connect_tabs(&overview);
         app.connect_overview();
+        let weak = Rc::downgrade(&app);
+        app.window.connect_close_request(move |_| weak.upgrade().map_or(glib::Propagation::Proceed, |app| app.window_close_request()));
         app.add_actions(application);
         app.apply(effects);
         app.reconcile();
@@ -456,11 +458,11 @@ impl App {
             if app.syncing.get() {
                 return glib::Propagation::Proceed;
             }
-            // Closing a tab goes through tmux's kill-window confirmation.
+            // The tab goes away when its window does (reconcile).
             view.close_page_finish(page, false);
-            if let Some(index) = app.window_of_page(page) {
-                app.command(Command::SelectWindow(index));
-                app.confirm_close_tab();
+            let id = app.state.borrow().tabs.iter().find(|(_, t)| &t.page == page).map(|(&id, _)| id);
+            if let Some(id) = id {
+                app.close_tab(id);
             }
             glib::Propagation::Stop
         });
@@ -557,7 +559,7 @@ impl App {
                 let _ = std::process::Command::new(exe).spawn();
             }
         }));
-        add("close", Box::new(|app| app.confirm_close_window()));
+        add("close", Box::new(|app| app.window.close()));
         add("close-split", Box::new(|app| app.confirm_close_split()));
         add("copy", Box::new(|app| app.copy()));
         add("paste", Box::new(|app| app.paste()));
@@ -589,17 +591,16 @@ impl App {
         let weak = Rc::downgrade(self);
         close_tab.connect_activate(move |_, _| {
             if let Some(app) = weak.upgrade() {
-                app.confirm_close_tab();
+                let id = app.current_window_id();
+                app.close_tab(id);
             }
         });
         self.window.add_action(&close_tab);
         let quit = gio::SimpleAction::new("quit", None);
         let weak = Rc::downgrade(self);
         quit.connect_activate(move |_, _| {
-            if let Some(app) = weak.upgrade()
-                && let Some(application) = app.window.application()
-            {
-                application.quit();
+            if let Some(app) = weak.upgrade() {
+                app.quit();
             }
         });
         application.add_action(&quit);
@@ -1267,21 +1268,58 @@ impl App {
         self.queue_reconcile();
     }
 
-    fn confirm_close_tab(self: &Rc<Self>) {
+    /// ghostty's tabViewClosePage: closes the tab of window `id` at once
+    /// unless one of its panes needs confirmation.
+    fn close_tab(self: &Rc<Self>, id: u32) {
+        if !self.window_needs_confirm(id) {
+            self.kill_window(id);
+            return;
+        }
         let dialog = close_dialog("Close Tab?", "All terminal sessions in this tab will be terminated.");
         let weak = Rc::downgrade(self);
         dialog.connect_response(None, move |_, response| {
             if let Some(app) = weak.upgrade()
                 && response == "close"
             {
-                app.command(Command::KillWindow);
+                app.kill_window(id);
             }
         });
         dialog.present(Some(&self.window));
     }
 
-    /// ghostty's close-split confirmation.
+    fn kill_window(self: &Rc<Self>, id: u32) {
+        let effects = self.state.borrow_mut().session.kill_window_id(id);
+        self.apply(effects);
+        self.queue_reconcile();
+    }
+
+    /// ghostty's needsConfirmQuit with confirm-close-surface = true: a live
+    /// process that is not sitting at its shell prompt.
+    fn pane_needs_confirm(&self, pane: PaneId) -> bool {
+        let st = self.state.borrow();
+        st.panes.get(&pane).and_then(|p| p.io.as_ref()).is_some_and(|io| {
+            !io.shared.exited.load(Ordering::Acquire) && !io.shared.term.lock().cursor_at_prompt()
+        })
+    }
+
+    fn window_needs_confirm(&self, id: u32) -> bool {
+        let windows = self.state.borrow().session.windows();
+        let panes: Vec<PaneId> = windows.iter().filter(|w| w.id == id).flat_map(|w| w.panes.iter().map(|p| p.pane)).collect();
+        panes.into_iter().any(|p| self.pane_needs_confirm(p))
+    }
+
+    fn app_needs_confirm(&self) -> bool {
+        let panes: Vec<PaneId> = self.state.borrow().panes.keys().copied().collect();
+        panes.into_iter().any(|p| self.pane_needs_confirm(p))
+    }
+
+    /// ghostty's close-split: asks only when the pane needs it.
     fn confirm_close_split(self: &Rc<Self>) {
+        let pane = self.state.borrow().session.active_pane();
+        if !self.pane_needs_confirm(pane) {
+            self.command(Command::KillPane);
+            return;
+        }
         let dialog = close_dialog("Close Split?", "The currently running process in this split will be terminated.");
         let weak = Rc::downgrade(self);
         dialog.connect_response(None, move |_, response| {
@@ -1294,14 +1332,35 @@ impl App {
         dialog.present(Some(&self.window));
     }
 
-    fn confirm_close_window(self: &Rc<Self>) {
+    /// ghostty's windowCloseRequest: asks before closing a window with a
+    /// pane that needs it.
+    fn window_close_request(self: &Rc<Self>) -> glib::Propagation {
+        if !self.app_needs_confirm() {
+            return glib::Propagation::Proceed;
+        }
         let dialog = close_dialog("Close Window?", "All terminal sessions in this window will be terminated.");
         let weak = Rc::downgrade(self);
         dialog.connect_response(None, move |_, response| {
             if let Some(app) = weak.upgrade()
                 && response == "close"
-                && let Some(application) = app.window.application()
             {
+                app.window.destroy();
+            }
+        });
+        dialog.present(Some(&self.window));
+        glib::Propagation::Stop
+    }
+
+    /// ghostty's Application.quit: asks when a pane needs it.
+    fn quit(self: &Rc<Self>) {
+        let Some(application) = self.window.application() else { return };
+        if !self.app_needs_confirm() {
+            application.quit();
+            return;
+        }
+        let dialog = close_dialog("Quit tapust?", "All terminal sessions will be terminated.");
+        dialog.connect_response(None, move |_, response| {
+            if response == "close" {
                 application.quit();
             }
         });
