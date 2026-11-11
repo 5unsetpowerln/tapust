@@ -135,6 +135,8 @@ pub(crate) struct Term {
     pub cursor_blink: bool,
     /// Whether the terminal's surface has focus (for DEC 1004 reports).
     pub focused: bool,
+    /// The pointer's CSS cursor name (OSC 22, mouse reporting).
+    pub mouse_shape: &'static str,
     top: usize,
     bottom: usize,
     tabs: Vec<bool>,
@@ -187,6 +189,7 @@ impl Term {
             // ghostty's default for DEC mode 12 (cursor-style-blink unset).
             cursor_blink: true,
             focused: true,
+            mouse_shape: "text",
             top: 0,
             bottom: rows - 1,
             tabs: default_tabs(cols),
@@ -994,7 +997,9 @@ impl Term {
                     (true, 1000) => MouseMode::Normal,
                     (true, 1002) => MouseMode::ButtonMotion,
                     _ => MouseMode::AnyMotion,
-                }
+                };
+                // ghostty points with an arrow while reporting the mouse.
+                self.mouse_shape = if on { "default" } else { "text" };
             }
             1005 | 1006 | 1015 | 1016 => {
                 let enc = match mode {
@@ -1293,6 +1298,13 @@ impl Term {
                 self.mark_all_dirty();
             }
             7 => self.cwd = parse_cwd(rest),
+            22 => {
+                if rest.is_empty() {
+                    self.mouse_shape = if self.modes.mouse_mode == MouseMode::None { "text" } else { "default" };
+                } else if let Some(shape) = std::str::from_utf8(rest).ok().and_then(mouse_shape) {
+                    self.mouse_shape = shape;
+                }
+            }
             10..=12 => {
                 for (k, spec) in rest.split(|&b| b == b';').enumerate() {
                     let target = cmd as usize + k;
@@ -1380,6 +1392,44 @@ impl Term {
         self.dirty.rows = vec![0; rows.div_ceil(64)];
         self.set_all_dirty();
     }
+}
+
+/// ghostty's OSC 22 names: CSS cursor names and their X11 aliases, as CSS.
+fn mouse_shape(name: &str) -> Option<&'static str> {
+    const CSS: [&str; 34] = [
+        "default", "context-menu", "help", "pointer", "progress", "wait", "cell", "crosshair", "text",
+        "vertical-text", "alias", "copy", "move", "no-drop", "not-allowed", "grab", "grabbing", "all-scroll",
+        "col-resize", "row-resize", "n-resize", "e-resize", "s-resize", "w-resize", "ne-resize", "nw-resize",
+        "se-resize", "sw-resize", "ew-resize", "ns-resize", "nesw-resize", "nwse-resize", "zoom-in", "zoom-out",
+    ];
+    if let Some(css) = CSS.iter().find(|&&c| c == name) {
+        return Some(css);
+    }
+    Some(match name {
+        "left_ptr" => "default",
+        "question_arrow" => "help",
+        "hand" => "pointer",
+        "left_ptr_watch" => "progress",
+        "watch" => "wait",
+        "cross" => "crosshair",
+        "xterm" => "text",
+        "dnd-link" => "alias",
+        "dnd-copy" => "copy",
+        "dnd-move" => "move",
+        "dnd-no-drop" => "no-drop",
+        "crossed_circle" => "not-allowed",
+        "hand1" => "grab",
+        "right_side" => "e-resize",
+        "top_side" => "n-resize",
+        "top_right_corner" => "ne-resize",
+        "top_left_corner" => "nw-resize",
+        "bottom_side" => "s-resize",
+        "bottom_right_corner" => "se-resize",
+        "bottom_left_corner" => "sw-resize",
+        "left_side" => "w-resize",
+        "fleur" => "all-scroll",
+        _ => return None,
+    })
 }
 
 /// The path of an OSC 7 `file://host/path` URL, percent-decoded.

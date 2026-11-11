@@ -1109,3 +1109,19 @@ fn absolute_lines_follow_their_content() {
     feed(&mut t, "\x1b[2J\x1b[Hwxyzq");
     assert!(t.line_wrapped(t.view_top()));
 }
+
+#[test]
+fn mouse_shape_follows_osc_22_and_reporting() {
+    let mut t = term(10, 2);
+    assert_eq!(t.mouse_shape(), "text");
+    feed(&mut t, "\x1b[?1000h");
+    assert_eq!(t.mouse_shape(), "default");
+    feed(&mut t, "\x1b]22;hand\x07");
+    assert_eq!(t.mouse_shape(), "pointer");
+    feed(&mut t, "\x1b]22;nonsense\x07");
+    assert_eq!(t.mouse_shape(), "pointer");
+    feed(&mut t, "\x1b]22;\x07");
+    assert_eq!(t.mouse_shape(), "default");
+    feed(&mut t, "\x1b[?1000l");
+    assert_eq!(t.mouse_shape(), "text");
+}

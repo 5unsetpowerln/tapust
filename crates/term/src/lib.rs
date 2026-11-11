@@ -252,6 +252,12 @@ impl Terminal {
         self.term.cwd.as_deref()
     }
 
+    /// The pointer's CSS cursor name: `text`, `default` while reporting the
+    /// mouse, or what OSC 22 set.
+    pub fn mouse_shape(&self) -> &'static str {
+        self.term.mouse_shape
+    }
+
     /// Tells the terminal whether its surface has focus; a DEC 1004 report
     /// enabled later starts from it.
     pub fn set_focused(&mut self, focused: bool) {
