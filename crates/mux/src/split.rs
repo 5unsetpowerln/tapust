@@ -1,7 +1,9 @@
 //! The panes of a window as ghostty's split tree (`src/datastruct/split_tree.zig`):
-//! a binary tree whose splits keep only an orientation and a ratio. Pixel
-//! sizes come from laying the tree out like ghostty's nested GtkPaned
-//! widgets, so resizing the window keeps every ratio.
+//! a binary tree whose splits keep an orientation and a ratio. Pixel sizes
+//! come from laying the tree out like ghostty's nested GtkPaned widgets: each
+//! split also keeps the state of its GtkPaned (`gtk/gtkpaned.c` in GTK 4.22),
+//! which places the divider from its previous size, and ghostty moves the
+//! divider back to the ratio only when it strays more than 0.001.
 
 use crate::{Metrics, PaneId, Rect};
 
@@ -20,6 +22,26 @@ pub(crate) struct Split {
     pub ratio: f64,
     pub first: Node,
     pub second: Node,
+    paned: Paned,
+}
+
+/// What a GtkPaned keeps between allocations. ghostty creates new ones
+/// whenever the tree changes, so [`Node::rebuild`] starts them over.
+#[derive(Clone, Copy, Debug)]
+struct Paned {
+    /// Set by `gtk_paned_set_position`; until then the position follows the
+    /// children's minimum sizes.
+    position_set: bool,
+    /// `start_child_size`: the first child's size.
+    position: i32,
+    last_allocation: i32,
+    min: i32,
+    max: i32,
+}
+
+impl Paned {
+    /// `gtk_paned_init`.
+    const NEW: Paned = Paned { position_set: false, position: 0, last_allocation: -1, min: 0, max: i32::MAX };
 }
 
 /// Where a new pane goes relative to the one it splits.
@@ -60,42 +82,92 @@ pub(crate) fn f16(x: f64) -> f64 {
 }
 
 impl Split {
-    /// The first child's size along the split: GtkPaned's position for the
-    /// ratio, kept between the children's minimum sizes (`shrink-*-child: false`).
-    /// Also returns the position the ratio asks for.
-    fn position(&self, rect: Rect, m: &Metrics) -> (u32, u32) {
-        let avail = extent(rect, self.horizontal).saturating_sub(m.divider);
-        let desired = (f64::from(avail) * self.ratio).round() as u32;
-        let min = self.first.min_size(self.horizontal, m);
-        let max = avail.saturating_sub(self.second.min_size(self.horizontal, m));
-        (desired.clamp(min, min.max(max)).min(avail), desired)
-    }
-
-    /// The children's rectangles and the divider between them.
-    fn children(&self, rect: Rect, m: &Metrics) -> (Rect, Rect, Rect) {
-        let (pos, _) = self.position(rect, m);
-        let total = extent(rect, self.horizontal);
-        let divider = m.divider.min(total - pos);
-        let rest = total - pos - divider;
-        if self.horizontal {
+    /// `gtk_paned_size_allocate`: places the divider for `rect` and returns
+    /// the children's rectangles and the divider's.
+    fn allocate(&mut self, rect: Rect, m: &Metrics) -> (Rect, Rect, Rect) {
+        let h = self.horizontal;
+        let (start_min, end_min) = (self.first.min_size(h, m) as i32, self.second.min_size(h, m) as i32);
+        let (total, handle) = (extent(rect, h) as i32, m.divider as i32);
+        self.calc_position((total - handle).max(1), start_min, end_min);
+        let pos = self.paned.position;
+        // The position never drops below the first child's minimum (it is
+        // the minimum position), so only the second child can overflow; GTK
+        // then gives it its minimum anyway and lets it stick out.
+        let first = pos.max(1) as u32;
+        let second = (total - pos - handle).max(1).max(end_min) as u32;
+        let (pos, handle) = (pos as u32, m.divider);
+        if h {
             (
-                Rect { w: pos, ..rect },
-                Rect { x: rect.x + pos, w: divider, ..rect },
-                Rect { x: rect.x + pos + divider, w: rest, ..rect },
+                Rect { w: first, ..rect },
+                Rect { x: rect.x + pos, w: handle, ..rect },
+                Rect { x: rect.x + pos + handle, w: second, ..rect },
             )
         } else {
             (
-                Rect { h: pos, ..rect },
-                Rect { y: rect.y + pos, h: divider, ..rect },
-                Rect { y: rect.y + pos + divider, h: rest, ..rect },
+                Rect { h: first, ..rect },
+                Rect { y: rect.y + pos, h: handle, ..rect },
+                Rect { y: rect.y + pos + handle, h: second, ..rect },
             )
         }
+    }
+
+    /// `gtk_paned_calc_position` with `shrink-*-child` false and both
+    /// `resize-*-child` true, followed by ghostty's tree-to-widget sync when
+    /// the minimum or maximum position changed.
+    fn calc_position(&mut self, allocation: i32, start_min: i32, end_min: i32) {
+        let p = &mut self.paned;
+        let min = start_min;
+        let max = (allocation - end_min).max(1).max(min);
+        // C converts the double to int by truncation, as `as` does.
+        let pos = if !p.position_set {
+            let share = if start_min + end_min != 0 { f64::from(start_min) / f64::from(start_min + end_min) } else { 0.5 };
+            (f64::from(allocation) * share + 0.5) as i32
+        } else if p.last_allocation > 0 {
+            (f64::from(allocation) * (f64::from(p.position) / f64::from(p.last_allocation)) + 0.5) as i32
+        } else {
+            p.position
+        };
+        let limits_changed = (min, max) != (p.min, p.max);
+        (p.position, p.min, p.max) = (pos.clamp(min, max), min, max);
+        if limits_changed && let Some((_, clamped, _)) = self.sync(end_min) {
+            // gtk_paned_set_position
+            self.paned.position = clamped;
+            self.paned.position_set = true;
+        }
+        self.paned.last_allocation = allocation;
+    }
+
+    /// ghostty's syncSplitRatio: when the shown position strays from the
+    /// ratio by more than 0.001, the position the ratio asks for, that
+    /// position clamped to the GtkPaned's limits, and the size the ratio
+    /// applies to.
+    fn sync(&self, end_min: i32) -> Option<(i32, i32, i32)> {
+        let p = &self.paned;
+        if p.max == i32::MAX {
+            return None;
+        }
+        let size = p.max + end_min;
+        if size == 0 || (f64::from(p.position) / f64::from(size) - self.ratio).abs() <= 0.001 {
+            return None;
+        }
+        let desired = (f64::from(size) * self.ratio).round() as i32;
+        Some((desired, desired.clamp(p.min, p.min.max(p.max)), size))
     }
 }
 
 impl Node {
     fn split_node(horizontal: bool, first: Node, second: Node) -> Node {
-        Node::Split(Box::new(Split { horizontal, ratio: 0.5, first, second }))
+        Node::Split(Box::new(Split { horizontal, ratio: 0.5, first, second, paned: Paned::NEW }))
+    }
+
+    /// Starts every GtkPaned over, as ghostty's rebuild of the widget tree
+    /// after each change of the tree does.
+    pub(crate) fn rebuild(&mut self) {
+        if let Node::Split(s) = self {
+            s.paned = Paned::NEW;
+            s.first.rebuild();
+            s.second.rebuild();
+        }
     }
 
     /// The panes in order: left to right and top to bottom within every split.
@@ -216,12 +288,12 @@ impl Node {
         }
     }
 
-    /// Lays the tree out in `rect`, appending each pane's rectangle and each divider.
-    pub(crate) fn layout(&self, rect: Rect, m: &Metrics, panes: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<Rect>) {
+    /// Allocates `rect` to the tree, appending each pane's rectangle and each divider.
+    pub(crate) fn layout(&mut self, rect: Rect, m: &Metrics, panes: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<Rect>) {
         match self {
             Node::Leaf(wp) => panes.push((*wp, rect)),
             Node::Split(s) => {
-                let (first, divider, second) = s.children(rect, m);
+                let (first, divider, second) = s.allocate(rect, m);
                 s.first.layout(first, m, panes, dividers);
                 dividers.push(divider);
                 s.second.layout(second, m, panes, dividers);
@@ -238,45 +310,35 @@ impl Node {
             // GTK computes the delta in f64; the tree takes it as f16.
             let delta = f16((f64::from(amount) / total).clamp(-1.0, 1.0));
             let root = f16(f64::from(self.units(horizontal)));
-            self.resize_in(wp, horizontal, delta, rect, root, root, m);
+            self.resize_in(wp, horizontal, delta, root, root, m);
         }
     }
 
     /// `size` is this node's extent in ghostty's spatial representation: the
     /// root spans `root` leaf units and every split hands its children
     /// `size * ratio` and `size * (1 - ratio)`, each rounded to f16.
-    #[allow(clippy::too_many_arguments)]
-    fn resize_in(
-        &mut self,
-        wp: PaneId,
-        horizontal: bool,
-        delta: f64,
-        rect: Rect,
-        size: f64,
-        root: f64,
-        m: &Metrics,
-    ) -> Resize {
+    fn resize_in(&mut self, wp: PaneId, horizontal: bool, delta: f64, size: f64, root: f64, m: &Metrics) -> Resize {
         let s = match self {
             Node::Leaf(p) => return if *p == wp { Resize::Pending } else { Resize::NotHere },
             Node::Split(s) => s,
         };
-        let (first, _, second) = s.children(rect, m);
         let along = s.horizontal == horizontal;
         let (first_size, second_size) =
             if along { (f16(size * s.ratio), f16(size * f16(1.0 - s.ratio))) } else { (size, size) };
-        let found = match s.first.resize_in(wp, horizontal, delta, first, first_size, root, m) {
-            Resize::NotHere => s.second.resize_in(wp, horizontal, delta, second, second_size, root, m),
+        let found = match s.first.resize_in(wp, horizontal, delta, first_size, root, m) {
+            Resize::NotHere => s.second.resize_in(wp, horizontal, delta, second_size, root, m),
             found => found,
         };
         if !matches!(found, Resize::Pending) || !along {
             return found;
         }
         // A split held at a child's minimum size resizes from the ratio it
-        // shows, not the one it keeps for when it grows again.
-        let (shown, desired) = s.position(rect, m);
-        let avail = extent(rect, horizontal).saturating_sub(m.divider);
-        if shown != desired && avail > 0 {
-            s.ratio = f16(f64::from(shown) / f64::from(avail));
+        // shows, not the one it keeps for when it grows again (ghostty's
+        // clamped_to_tree sync).
+        if let Some((desired, clamped, size)) = s.sync(s.second.min_size(horizontal, m) as i32)
+            && clamped != desired
+        {
+            s.ratio = f16(f64::from(clamped) / f64::from(size));
         }
         // The split's width relative to the tree's, as spatial normalizes it.
         let scale = f16(size / root);
@@ -297,7 +359,9 @@ mod tests {
     const RIGHT: Side = Side { horizontal: true, before: false };
     const DOWN: Side = Side { horizontal: false, before: false };
 
-    fn layout(tree: &Node) -> (Vec<(PaneId, Rect)>, Vec<Rect>) {
+    /// A layout by new GtkPaned widgets, as after each change of the tree.
+    fn layout(tree: &mut Node) -> (Vec<(PaneId, Rect)>, Vec<Rect>) {
+        tree.rebuild();
         let (mut panes, mut dividers) = (Vec::new(), Vec::new());
         tree.layout(AREA, &M, &mut panes, &mut dividers);
         (panes, dividers)
@@ -339,7 +403,7 @@ mod tests {
     fn halves_around_a_one_pixel_divider() {
         let mut tree = Node::Leaf(0);
         tree.split(1, RIGHT);
-        let (panes, dividers) = layout(&tree);
+        let (panes, dividers) = layout(&mut tree);
         // GtkPaned: round((1276 - 1) * 0.5) = 638 for the first child.
         assert_eq!(panes, vec![(0, rect(0, 0, 638, 796)), (1, rect(639, 0, 637, 796))]);
         assert_eq!(dividers, vec![rect(638, 0, 1, 796)]);
@@ -352,7 +416,7 @@ mod tests {
         tree.find_mut(1).unwrap().split(2, DOWN);
         assert!(tree.remove(0));
         // The stacked pair now fills the window.
-        let (panes, _) = layout(&tree);
+        let (panes, _) = layout(&mut tree);
         assert_eq!(panes, vec![(1, rect(0, 0, 1276, 398)), (2, rect(0, 399, 1276, 397))]);
         assert!(!Node::Leaf(3).remove(3));
     }
@@ -364,11 +428,11 @@ mod tests {
         tree.find_mut(1).unwrap().split(2, DOWN);
         // Pane 2 sits under the vertical split; its nearest horizontal split is the root.
         tree.resize(2, true, -50, AREA, &M);
-        let (panes, _) = layout(&tree);
+        let (panes, _) = layout(&mut tree);
         assert_eq!(panes[0].1.w, 588);
         // The vertical split moves by 30 pixels of the whole height.
         tree.resize(2, false, 30, AREA, &M);
-        let (panes, _) = layout(&tree);
+        let (panes, _) = layout(&mut tree);
         assert_eq!(panes[1].1.h, 427);
     }
 
@@ -377,11 +441,11 @@ mod tests {
         let mut tree = Node::Leaf(0);
         tree.split(1, RIGHT);
         tree.resize(0, true, -2000, AREA, &M);
-        let (panes, _) = layout(&tree);
+        let (panes, _) = layout(&mut tree);
         // One cell plus the padding on both sides.
         assert_eq!(panes[0].1.w, 14);
         tree.resize(0, true, 10, AREA, &M);
-        let (panes, _) = layout(&tree);
+        let (panes, _) = layout(&mut tree);
         assert_eq!(panes[0].1.w, 24);
     }
 
@@ -391,7 +455,7 @@ mod tests {
         tree.split(1, RIGHT);
         tree.find_mut(1).unwrap().split(2, RIGHT);
         tree.equalize();
-        let (panes, _) = layout(&tree);
+        let (panes, _) = layout(&mut tree);
         let widths: Vec<u32> = panes.iter().map(|p| p.1.w).collect();
         assert_eq!(widths, vec![425, 425, 424]);
     }

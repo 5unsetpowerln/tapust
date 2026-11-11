@@ -111,7 +111,8 @@ impl Window {
     }
 
     /// Lays the panes out for the window's metrics: the whole area for the
-    /// zoomed pane, else the split tree.
+    /// zoomed pane, else the split tree. Only the current window is laid out,
+    /// as libadwaita allocates only the selected tab.
     pub(crate) fn relayout(&mut self) {
         let m = self.metrics;
         let area = m.area();
@@ -131,8 +132,10 @@ impl Window {
         }
     }
 
-    /// Puts `panes` back in the tree's order after the tree changed.
-    fn reorder(&mut self) {
+    /// After every change of the tree: ghostty builds new GtkPaned widgets,
+    /// and `panes` goes back to the tree's order.
+    fn tree_changed(&mut self) {
+        self.tree.rebuild();
         let mut order = Vec::with_capacity(self.panes.len());
         self.tree.leaves(&mut order);
         self.panes.sort_by_key(|p| order.iter().position(|&wp| wp == p.id));
@@ -158,19 +161,34 @@ impl Window {
         self.panes.push(pane);
         let node = if full { &mut self.tree } else { self.tree.find_mut(at).expect("pane in tree") };
         node.split(new, side);
-        self.reorder();
+        self.tree_changed();
     }
 
     /// Exchanges the places of two panes, in the tree and in the order.
     pub(crate) fn swap_panes(&mut self, a: PaneId, b: PaneId) {
         self.tree.swap(a, b);
-        self.reorder();
+        self.tree_changed();
     }
 
     /// Gives the tree's places to the panes in their current order (rotate-window).
     pub(crate) fn place_in_order(&mut self) {
         let order: Vec<PaneId> = self.panes.iter().map(|p| p.id).collect();
         self.tree.assign(&mut order.into_iter());
+        self.tree_changed();
+    }
+
+    /// ghostty's equalize_splits.
+    pub(crate) fn equalize(&mut self) {
+        self.tree.equalize();
+        self.tree_changed();
+    }
+
+    /// ghostty's resize_split for the active pane, by `amount` pixels.
+    pub(crate) fn resize_split(&mut self, horizontal: bool, amount: i32) {
+        let m = self.metrics;
+        let wp = self.active;
+        self.tree.resize(wp, horizontal, amount, m.area(), &m);
+        self.tree_changed();
     }
 
     /// window_pane_stack_remove
@@ -217,7 +235,9 @@ impl Window {
         self.lost_pane(wp, prev, next);
         self.tree.remove(wp);
         let pos = self.pos(wp).expect("pane in window");
-        self.panes.remove(pos)
+        let pane = self.panes.remove(pos);
+        self.tree_changed();
+        pane
     }
 
     /// window_zoom
@@ -229,6 +249,7 @@ impl Window {
             self.set_active(wp, next_point);
         }
         self.zoomed = true;
+        self.tree_changed();
         self.relayout();
         true
     }
@@ -239,6 +260,7 @@ impl Window {
             return false;
         }
         self.zoomed = false;
+        self.tree_changed();
         self.relayout();
         true
     }

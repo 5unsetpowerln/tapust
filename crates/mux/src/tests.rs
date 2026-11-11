@@ -161,6 +161,20 @@ fn window_resize_keeps_the_ratios() {
 }
 
 #[test]
+fn window_resize_moves_the_divider_like_gtk() {
+    // GtkPaned scales its last position to the new size and ghostty keeps
+    // that while it is within 0.001 of the ratio: 1268 * 687 / 1275 + 0.5
+    // truncates to 683, where round(1268 * 0.5390625) would give 684.
+    let mut s = new_session();
+    ok(&mut s, split(true));
+    select_index(&mut s, 0);
+    ok(&mut s, Command::ResizePane(Direction::Right, 5));
+    assert_eq!(rects(&s)[0].2, 687);
+    s.resize(Metrics { width: 1269, ..M });
+    assert_eq!(rects(&s), [(0, 0, 683, 796), (684, 0, 585, 796)]);
+}
+
+#[test]
 fn kill_gives_the_space_to_the_sibling() {
     let mut s = new_session();
     ok(&mut s, split(true));
@@ -298,8 +312,9 @@ fn small_window_keeps_the_minimum_sizes_in_order() {
     ok(&mut s, split(false));
     assert_eq!(rects(&s), [(0, 0, 1276, 50), (0, 51, 1276, 24), (0, 76, 1276, 24)]);
     s.resize(Metrics { height: 60, ..M });
-    // The first panes keep their minimum; the last one gets what is left.
-    assert_eq!(rects(&s), [(0, 0, 1276, 24), (0, 25, 1276, 24), (0, 50, 1276, 10)]);
+    // Every pane keeps its minimum: GtkPaned lets the last one stick out
+    // past the bottom of the window.
+    assert_eq!(rects(&s), [(0, 0, 1276, 24), (0, 25, 1276, 24), (0, 50, 1276, 24)]);
     assert!(s.windows()[0].panes.iter().all(|p| M.grid(p.rect).1 == 1));
 }
 
@@ -327,18 +342,16 @@ fn split_effects() {
 }
 
 #[test]
-fn resize_resizes_every_window() {
+fn hidden_windows_are_laid_out_when_selected() {
+    // libadwaita allocates only the selected tab.
     let mut s = new_session();
     ok(&mut s, split(true));
     ok(&mut s, Command::NewWindow { cwd_of_active: false });
     let effects = s.resize(Metrics { width: 1576, height: 896, ..M });
+    assert_eq!(effects, [Effect::Resize { pane: 2, cols: 157, rows: 44 }]);
     assert_eq!(
-        effects,
-        [
-            Effect::Resize { pane: 0, cols: 78, rows: 44 },
-            Effect::Resize { pane: 1, cols: 78, rows: 44 },
-            Effect::Resize { pane: 2, cols: 157, rows: 44 },
-        ]
+        ok(&mut s, Command::SelectWindow(0)),
+        [Effect::Resize { pane: 0, cols: 78, rows: 44 }, Effect::Resize { pane: 1, cols: 78, rows: 44 }]
     );
 }
 
@@ -357,12 +370,11 @@ fn break_pane_does_not_spawn() {
     let mut s = new_session();
     ok(&mut s, split(true));
     let effects = ok(&mut s, Command::BreakPane);
-    assert_eq!(
-        effects,
-        [Effect::Resize { pane: 0, cols: 127, rows: 39 }, Effect::Resize { pane: 1, cols: 127, rows: 39 }]
-    );
+    // The pane left behind grows when its window is selected again.
+    assert_eq!(effects, [Effect::Resize { pane: 1, cols: 127, rows: 39 }]);
     assert_eq!(s.windows().len(), 2);
     assert!(s.windows()[1].active);
+    assert_eq!(ok(&mut s, Command::SelectWindow(0)), [Effect::Resize { pane: 0, cols: 127, rows: 39 }]);
 }
 
 // --- Keys ------------------------------------------------------------------
@@ -672,9 +684,10 @@ fn exit_of_pane_in_other_window() {
     let mut s = new_session();
     ok(&mut s, split(true));
     ok(&mut s, Command::NewWindow { cwd_of_active: false });
-    assert_eq!(s.pane_exited(1), [Effect::Destroy { pane: 1 }, Effect::Resize { pane: 0, cols: 127, rows: 39 }]);
+    assert_eq!(s.pane_exited(1), [Effect::Destroy { pane: 1 }]);
     assert_eq!(s.active_pane(), 2);
-    assert_eq!(s.pane_exited(2), [Effect::Destroy { pane: 2 }]);
+    // Window 0 is selected again and only now takes the space of pane 1.
+    assert_eq!(s.pane_exited(2), [Effect::Destroy { pane: 2 }, Effect::Resize { pane: 0, cols: 127, rows: 39 }]);
     assert_eq!(s.active_pane(), 0);
 }
 

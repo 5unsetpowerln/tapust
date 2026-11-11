@@ -44,8 +44,9 @@ impl Session {
         }
         let before = self.size_map();
         f(self);
-        for w in self.winlinks.values_mut() {
-            w.relayout();
+        if !self.dead {
+            // Other windows keep their layout until they are selected.
+            self.cur_mut().relayout();
         }
         self.generation += 1;
         self.collect_effects(&before)
@@ -235,7 +236,8 @@ impl Session {
         }
     }
 
-    /// The client's pixel geometry changed: every window takes the new area.
+    /// The client's pixel geometry changed: every window takes the new area
+    /// (the others are laid out for it when they are selected).
     pub(crate) fn set_metrics(&mut self, metrics: Metrics) {
         self.metrics = metrics;
         for w in self.winlinks.values_mut() {
@@ -312,7 +314,7 @@ impl Session {
                 Ok(())
             }
             Command::Equalize => {
-                self.cur_mut().tree.equalize();
+                self.cur_mut().equalize();
                 Ok(())
             }
             Command::RenameWindow(ref name) => {
@@ -396,8 +398,7 @@ impl Session {
         };
         let amount = adjust.saturating_mul(cell);
         let amount = if matches!(dir, Direction::Left | Direction::Up) { -amount } else { amount };
-        let wp = w.active;
-        w.tree.resize(wp, horizontal, amount, m.area(), &m);
+        w.resize_split(horizontal, amount);
         Ok(())
     }
 
