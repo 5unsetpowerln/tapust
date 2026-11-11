@@ -30,6 +30,9 @@ pub enum Event {
     Dropped { source: PaneId, target: PaneId, dir: Direction },
     /// The GLArea was mapped (ghostty restores focus after this).
     Mapped,
+    /// The cell size in device pixels is known or changed (ghostty's
+    /// cell_size action).
+    CellSize { cell: (u32, u32) },
 }
 
 pub type Handler = Rc<dyn Fn(Event) -> bool>;
@@ -59,11 +62,20 @@ pub struct Surface {
     resize_bin: adw::Bin,
     resize_hide: RefCell<Option<glib::SourceId>>,
     resize_idle: Cell<bool>,
+    font_scale: Cell<f64>,
+    cell_idle: Cell<bool>,
+    handler: Handler,
     draw: RefCell<Draw>,
     created: Instant,
     pub focused: Cell<bool>,
     split: Cell<bool>,
     size: Cell<(u16, u16)>,
+}
+
+fn load_fonts(scale: f64) -> Option<Fonts> {
+    Fonts::new(theme::FONT_FAMILY, theme::FONT_POINTS, scale)
+        .inspect_err(|err| eprintln!("tapust: cannot load fonts: {err}"))
+        .ok()
 }
 
 fn padding(scale: f64) -> u32 {
@@ -165,6 +177,9 @@ impl Surface {
             resize_bin,
             resize_hide: RefCell::new(None),
             resize_idle: Cell::new(false),
+            font_scale: Cell::new(0.0),
+            cell_idle: Cell::new(false),
+            handler: handler.clone(),
             draw: RefCell::new(Draw {
                 renderer: None,
                 frame: Frame::new(term_bg),
@@ -192,14 +207,10 @@ impl Surface {
                 return;
             }
             let scale = area.native().and_then(|n| n.surface()).map_or(1.0, |s| s.scale());
-            let fonts = match Fonts::new(theme::FONT_FAMILY, theme::FONT_POINTS, scale) {
-                Ok(fonts) => fonts,
-                Err(err) => {
-                    eprintln!("tapust: cannot load fonts: {err}");
-                    return;
-                }
-            };
+            let Some(fonts) = load_fonts(scale) else { return };
             s.draw.borrow_mut().renderer = Some(Renderer::new(crate::gl::context(), fonts));
+            s.font_scale.set(scale);
+            s.schedule_cell_size();
         });
         let weak = Rc::downgrade(self);
         self.area.connect_unrealize(move |area| {
@@ -215,6 +226,15 @@ impl Surface {
             let (cols, rows, cell) = {
                 let mut d = s.draw.borrow_mut();
                 let Some(renderer) = d.renderer.as_mut() else { return };
+                // ghostty's content scale callback: a new scale needs fonts
+                // rasterized for it.
+                if scale != s.font_scale.get()
+                    && let Some(fonts) = load_fonts(scale)
+                {
+                    renderer.set_fonts(fonts);
+                    s.font_scale.set(scale);
+                    s.schedule_cell_size();
+                }
                 renderer.resize(width as u32, height as u32);
                 let (cw, ch) = renderer.cell_size();
                 let pad = padding(scale);
@@ -348,6 +368,26 @@ impl Surface {
                 Direction::Down => "drop-bottom",
             });
         }
+    }
+
+    /// ghostty's Surface.syncSplitMinSize: the leaf never gets smaller than
+    /// one cell (in logical pixels, rounded up) and the padding. Runs on idle
+    /// since the scale is noticed while GTK draws.
+    fn schedule_cell_size(self: &Rc<Self>) {
+        if self.cell_idle.replace(true) {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            let Some(s) = weak.upgrade() else { return };
+            s.cell_idle.set(false);
+            let Some((cw, ch)) = s.cell_size() else { return };
+            let scale = s.font_scale.get();
+            let pad = 2 * padding(1.0) as i32;
+            let logical = |px: u32| (f64::from(px) / scale).ceil() as i32;
+            s.outer.set_size_request(logical(cw) + pad, logical(ch) + pad);
+            (s.handler)(Event::CellSize { cell: (cw, ch) });
+        });
     }
 
     /// ghostty's ResizeOverlay.schedule: GtkGLArea emits `resize` while the

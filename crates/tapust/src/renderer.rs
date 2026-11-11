@@ -317,6 +317,18 @@ impl Renderer {
         }
     }
 
+    /// Switches to fonts of another scale: every cached glyph and grid is
+    /// drawn again.
+    pub fn set_fonts(&mut self, fonts: Fonts) {
+        self.fonts = fonts;
+        *self.ascii = [[None; 128]; 4];
+        self.glyphs.clear();
+        self.grids.clear();
+        self.atlas.x = 0;
+        self.atlas.y = 0;
+        self.atlas.shelf_height = 0;
+    }
+
     pub fn cell_size(&self) -> (u32, u32) {
         (self.fonts.cell_width, self.fonts.cell_height)
     }

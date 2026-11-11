@@ -75,6 +75,8 @@ pub struct App {
     syncing: Cell<bool>,
     reconcile_pending: Cell<bool>,
     restore_focus_pending: Cell<bool>,
+    /// The window's minimum size was set from the first surface.
+    min_size_set: Cell<bool>,
 }
 
 /// ghostty's SplitTreeSplit: Adw.Bin > Adw.Bin > GtkPaned, keeping the
@@ -357,6 +359,7 @@ impl App {
             syncing: Cell::new(false),
             reconcile_pending: Cell::new(false),
             restore_focus_pending: Cell::new(false),
+            min_size_set: Cell::new(false),
         });
         APP.with(|a| *a.borrow_mut() = Some(app.clone()));
 
@@ -518,6 +521,14 @@ impl App {
             Event::Key { pane, keyval, state } => self.key(pane, keyval, state),
             Event::Resized { pane, cols, rows, cell } => {
                 self.resized(pane, cols, rows, cell);
+                true
+            }
+            Event::CellSize { cell: (cw, ch) } => {
+                // ghostty's size_limit at the first surface's init: ten
+                // columns and four rows of device pixels, used as logical.
+                if !self.min_size_set.replace(true) {
+                    self.window.set_size_request((cw * 10) as i32, (ch * 4) as i32);
+                }
                 true
             }
             Event::Mapped => {
