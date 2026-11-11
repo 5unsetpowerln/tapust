@@ -77,6 +77,8 @@ pub struct App {
     restore_focus_pending: Cell<bool>,
     /// The window's minimum size was set from the first surface.
     min_size_set: Cell<bool>,
+    /// The tab whose context menu is open (ghostty's context_menu_page).
+    context_page: RefCell<Option<adw::TabPage>>,
 }
 
 /// ghostty's SplitTreeSplit: Adw.Bin > Adw.Bin > GtkPaned, keeping the
@@ -326,6 +328,7 @@ impl App {
             .build();
         window.set_property("handle-menubar-accel", false);
         window.add_css_class("window");
+        window.set_icon_name(Some(theme::ICON));
         // ghostty's headerbar-visible: never shown while fullscreen.
         window.connect_fullscreened_notify(move |w| header.set_visible(!w.is_fullscreen()));
 
@@ -362,6 +365,7 @@ impl App {
             reconcile_pending: Cell::new(false),
             restore_focus_pending: Cell::new(false),
             min_size_set: Cell::new(false),
+            context_page: RefCell::new(None),
         });
         APP.with(|a| *a.borrow_mut() = Some(app.clone()));
 
@@ -381,6 +385,15 @@ impl App {
     }
 
     fn connect_tabs(self: &Rc<Self>, overview: &adw::TabOverview) {
+        let menu = gio::Menu::new();
+        menu.append(Some("Change Tab Title\u{2026}"), Some("win.prompt-context-tab-title"));
+        self.tab_view.set_menu_model(Some(&menu));
+        let weak = Rc::downgrade(self);
+        self.tab_view.connect_setup_menu(move |_, page| {
+            if let Some(app) = weak.upgrade() {
+                *app.context_page.borrow_mut() = page.cloned();
+            }
+        });
         let weak = Rc::downgrade(self);
         self.tab_view.connect_close_page(move |view, page| {
             let Some(app) = weak.upgrade() else { return glib::Propagation::Proceed };
@@ -456,12 +469,26 @@ impl App {
         add("paste", Box::new(|app| app.paste()));
         add("reset", Box::new(|app| app.reset()));
         add("clear", Box::new(|app| app.clear()));
-        add("prompt-tab-title", Box::new(|app| app.title_dialog(TitleTarget::Tab)));
-        add("prompt-context-tab-title", Box::new(|app| app.title_dialog(TitleTarget::Tab)));
+        add("prompt-tab-title", Box::new(|app| app.title_dialog(TitleTarget::Tab(app.current_window_id()))));
+        add(
+            "prompt-context-tab-title",
+            Box::new(|app| {
+                let page = app.context_page.borrow().clone();
+                let id = page.and_then(|page| app.state.borrow().tabs.iter().find(|(_, t)| t.page == page).map(|(&id, _)| id));
+                if let Some(id) = id {
+                    app.title_dialog(TitleTarget::Tab(id));
+                }
+            }),
+        );
         add("prompt-window-title", Box::new(|app| app.title_dialog(TitleTarget::Window)));
         add("prompt-surface-title", Box::new(|app| app.title_dialog(TitleTarget::Surface)));
         add("about", Box::new(|app| {
-            let about = adw::AboutDialog::builder().application_name("tapust").version(env!("CARGO_PKG_VERSION")).build();
+            let about = adw::AboutDialog::builder()
+                .application_name("tapust")
+                .developer_name("tapust Developers")
+                .application_icon(theme::ICON)
+                .version(env!("CARGO_PKG_VERSION"))
+                .build();
             about.present(Some(&app.window));
         }));
         let close_tab = gio::SimpleAction::new("close-tab", Some(glib::VariantTy::STRING));
@@ -501,6 +528,10 @@ impl App {
         }
         self.apply(out.effects);
         self.queue_reconcile();
+    }
+
+    fn current_window_id(&self) -> u32 {
+        self.state.borrow().session.windows().into_iter().find(|w| w.active).expect("the current window").id
     }
 
     fn window_of_page(&self, page: &adw::TabPage) -> Option<u32> {
@@ -994,7 +1025,7 @@ impl App {
                 let (heading, text) = if prompt.contains("session") {
                     ("Rename Session", text)
                 } else {
-                    ("Change Tab Title", self.title_initial(TitleTarget::Tab))
+                    ("Change Tab Title", self.title_initial(TitleTarget::Tab(self.current_window_id())))
                 };
                 let (dialog, entry) = title_dialog_widgets(heading, &text);
                 let weak = Rc::downgrade(self);
@@ -1043,14 +1074,13 @@ impl App {
         dialog.present(Some(&self.window));
     }
 
-    /// ghostty's TitleDialog for a tab, the window or the focused surface.
     /// ghostty's TitleDialog initial value: the target's title override, else
     /// the title it shows now.
     fn title_initial(&self, target: TitleTarget) -> String {
         match target {
-            TitleTarget::Tab => {
+            TitleTarget::Tab(id) => {
                 let windows = self.state.borrow().session.windows();
-                let info = windows.iter().find(|w| w.active).expect("the current window");
+                let Some(info) = windows.iter().find(|w| w.id == id) else { return String::new() };
                 if info.renamed && !info.name.is_empty() { info.name.clone() } else { self.tab_title(info) }
             }
             TitleTarget::Window => {
@@ -1065,9 +1095,10 @@ impl App {
         }
     }
 
+    /// ghostty's TitleDialog for a tab, the window or the focused surface.
     fn title_dialog(self: &Rc<Self>, target: TitleTarget) {
         let heading = match target {
-            TitleTarget::Tab => "Change Tab Title",
+            TitleTarget::Tab(_) => "Change Tab Title",
             TitleTarget::Window => "Change Window Title",
             TitleTarget::Surface => "Change Terminal Title",
         };
@@ -1081,7 +1112,11 @@ impl App {
             let text = entry.text().to_string();
             let value = Some(text.clone()).filter(|t| !t.is_empty());
             match target {
-                TitleTarget::Tab => app.command(Command::RenameWindow(text)),
+                TitleTarget::Tab(id) => {
+                    app.state.borrow_mut().session.rename_window_id(id, &text);
+
+                    app.queue_reconcile();
+                }
                 TitleTarget::Window => {
                     app.state.borrow_mut().window_title_override = value;
                     app.queue_reconcile();
@@ -1148,7 +1183,8 @@ type Action = Box<dyn Fn(&Rc<App>)>;
 
 #[derive(Clone, Copy)]
 enum TitleTarget {
-    Tab,
+    /// The tab of the window with this tmux id.
+    Tab(u32),
     Window,
     Surface,
 }

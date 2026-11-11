@@ -48,3 +48,7 @@ pub const BLINK_RESET: std::time::Duration = std::time::Duration::from_millis(50
 /// ghostty's resize overlay: shown 750 ms, not during the first 250 ms.
 pub const RESIZE_OVERLAY: std::time::Duration = std::time::Duration::from_millis(750);
 pub const RESIZE_OVERLAY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The window and About icon: the icon theme's generic terminal, since
+/// tapust installs no icon of its own (ghostty uses its bundle id).
+pub const ICON: &str = "utilities-terminal";

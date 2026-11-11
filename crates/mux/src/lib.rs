@@ -351,6 +351,12 @@ impl Session {
         self.op(|s| s.destroy_pane(pane))
     }
 
+    /// rename-window -t @`id`.
+    pub fn rename_window_id(&mut self, id: u32, name: &str) {
+        self.rename_window(id, name);
+        self.generation += 1;
+    }
+
     /// Sets `#{pane_title}` (OSC 0/2; tmux defaults it to the host name).
     pub fn set_pane_title(&mut self, pane: PaneId, title: &str) {
         if let Some(p) = self.find_pane_mut(pane)
