@@ -133,6 +133,8 @@ pub(crate) struct Term {
     pub cursor_visible: bool,
     pub cursor_shape: CursorShape,
     pub cursor_blink: bool,
+    /// Whether the terminal's surface has focus (for DEC 1004 reports).
+    pub focused: bool,
     top: usize,
     bottom: usize,
     tabs: Vec<bool>,
@@ -184,6 +186,7 @@ impl Term {
             cursor_shape: CursorShape::Block,
             // ghostty's default for DEC mode 12 (cursor-style-blink unset).
             cursor_blink: true,
+            focused: true,
             top: 0,
             bottom: rows - 1,
             tabs: default_tabs(cols),
@@ -993,10 +996,11 @@ impl Term {
                     _ => MouseMode::AnyMotion,
                 }
             }
-            1005 | 1006 | 1015 => {
+            1005 | 1006 | 1015 | 1016 => {
                 let enc = match mode {
                     1005 => MouseEncoding::Utf8,
                     1006 => MouseEncoding::Sgr,
+                    1016 => MouseEncoding::SgrPixels,
                     _ => MouseEncoding::Urxvt,
                 };
                 if on {
@@ -1005,7 +1009,14 @@ impl Term {
                     m.mouse_encoding = MouseEncoding::Default;
                 }
             }
-            1004 => m.focus_events = on,
+            1004 => {
+                m.focus_events = on;
+                // ghostty reports the current focus as soon as it is asked.
+                if on {
+                    let report: &[u8] = if self.focused { b"\x1b[I" } else { b"\x1b[O" };
+                    self.replies.extend_from_slice(report);
+                }
+            }
             1007 => m.alternate_scroll = on,
             2004 => m.bracketed_paste = on,
             2026 => m.sync_update = on,
@@ -1054,6 +1065,7 @@ impl Term {
             1005 => m.mouse_encoding == MouseEncoding::Utf8,
             1006 => m.mouse_encoding == MouseEncoding::Sgr,
             1015 => m.mouse_encoding == MouseEncoding::Urxvt,
+            1016 => m.mouse_encoding == MouseEncoding::SgrPixels,
             1007 => m.alternate_scroll,
             2004 => m.bracketed_paste,
             2026 => m.sync_update,

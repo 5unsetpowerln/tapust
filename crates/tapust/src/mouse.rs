@@ -11,9 +11,18 @@ pub struct Mods {
 }
 
 /// Appends the report of a wheel step (button 4 up, 5 down) over grid cell
-/// `cell` (zero-based). X10 mode reports only the left, middle and right
-/// buttons, so it gets nothing.
-pub fn encode_wheel(out: &mut Vec<u8>, mode: MouseMode, encoding: MouseEncoding, up: bool, mods: Mods, cell: (u16, u16)) {
+/// `cell` (zero-based), at `pixels` from the grid's origin for SGR-pixels.
+/// X10 mode reports only the left, middle and right buttons, so it gets
+/// nothing.
+pub fn encode_wheel(
+    out: &mut Vec<u8>,
+    mode: MouseMode,
+    encoding: MouseEncoding,
+    up: bool,
+    mods: Mods,
+    cell: (u16, u16),
+    pixels: (i32, i32),
+) {
     if matches!(mode, MouseMode::None | MouseMode::X10) {
         return;
     }
@@ -38,6 +47,7 @@ pub fn encode_wheel(out: &mut Vec<u8>, mode: MouseMode, encoding: MouseEncoding,
             }
         }
         MouseEncoding::Sgr => out.extend_from_slice(format!("\x1b[<{code};{};{}M", x + 1, y + 1).as_bytes()),
+        MouseEncoding::SgrPixels => out.extend_from_slice(format!("\x1b[<{code};{};{}M", pixels.0, pixels.1).as_bytes()),
         MouseEncoding::Urxvt => out.extend_from_slice(format!("\x1b[{};{};{}M", 32 + u32::from(code), x + 1, y + 1).as_bytes()),
     }
 }
@@ -49,14 +59,16 @@ mod tests {
     #[test]
     fn wheel_reports_follow_ghostty() {
         let mut out = Vec::new();
-        encode_wheel(&mut out, MouseMode::Normal, MouseEncoding::Sgr, true, Mods::default(), (2, 3));
+        encode_wheel(&mut out, MouseMode::Normal, MouseEncoding::Sgr, true, Mods::default(), (2, 3), (25, 70));
         assert_eq!(out, b"\x1b[<64;3;4M");
         out.clear();
         let ctrl = Mods { ctrl: true, ..Mods::default() };
-        encode_wheel(&mut out, MouseMode::Normal, MouseEncoding::Default, false, ctrl, (0, 0));
+        encode_wheel(&mut out, MouseMode::Normal, MouseEncoding::Default, false, ctrl, (0, 0), (0, 0));
         assert_eq!(out, [0x1b, b'[', b'M', 32 + 65 + 16, 33, 33]);
         out.clear();
-        encode_wheel(&mut out, MouseMode::X10, MouseEncoding::Default, true, Mods::default(), (0, 0));
+        encode_wheel(&mut out, MouseMode::X10, MouseEncoding::Default, true, Mods::default(), (0, 0), (0, 0));
         assert!(out.is_empty());
+        encode_wheel(&mut out, MouseMode::Normal, MouseEncoding::SgrPixels, true, Mods::default(), (2, 3), (25, 70));
+        assert_eq!(out, b"\x1b[<64;25;70M");
     }
 }

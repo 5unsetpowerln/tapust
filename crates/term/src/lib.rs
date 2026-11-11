@@ -82,7 +82,7 @@ pub enum MouseMode {
     AnyMotion,
 }
 
-/// Mouse report encoding (DECSET 1005/1006/1015).
+/// Mouse report encoding (DECSET 1005/1006/1015/1016).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MouseEncoding {
     #[default]
@@ -90,6 +90,8 @@ pub enum MouseEncoding {
     Utf8,
     Sgr,
     Urxvt,
+    /// SGR with the position in pixels (DEC 1016).
+    SgrPixels,
 }
 
 /// Modes that affect input encoding and rendering.
@@ -248,6 +250,12 @@ impl Terminal {
     /// The working directory reported with OSC 7, as a path.
     pub fn reported_cwd(&self) -> Option<&str> {
         self.term.cwd.as_deref()
+    }
+
+    /// Tells the terminal whether its surface has focus; a DEC 1004 report
+    /// enabled later starts from it.
+    pub fn set_focused(&mut self, focused: bool) {
+        self.term.focused = focused;
     }
 
     /// True once for each BEL received since the last call.

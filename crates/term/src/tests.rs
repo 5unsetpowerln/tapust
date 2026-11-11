@@ -1082,3 +1082,13 @@ fn alternate_scroll_starts_on() {
     feed(&mut t, "\x1bc");
     assert!(t.modes().alternate_scroll);
 }
+
+#[test]
+fn focus_reporting_starts_with_the_current_state() {
+    let mut t = term(10, 2);
+    t.set_focused(false);
+    feed(&mut t, "\x1b[?1004h");
+    assert_eq!(t.take_replies().as_deref(), Some(&b"\x1b[O"[..]));
+    feed(&mut t, "\x1b[?1016h");
+    assert_eq!(t.modes().mouse_encoding, MouseEncoding::SgrPixels);
+}

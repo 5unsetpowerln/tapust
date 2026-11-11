@@ -712,6 +712,9 @@ impl App {
                     let mut bytes = Vec::new();
                     input::encode(key, text.as_deref(), app_cursor, &mut bytes);
                     io.shared.write(&bytes);
+                    if !bytes.is_empty() {
+                        st.panes[&target].surface.scroll_to_bottom();
+                    }
                 }
                 drop(st);
             }

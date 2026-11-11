@@ -585,6 +585,16 @@ impl Surface {
 
     fn set_focused(self: &Rc<Self>, focused: bool) {
         self.focused.set(focused);
+        // ghostty's focusGained: DEC 1004 reports focus changes.
+        if let Some(shared) = self.draw.borrow().shared.clone() {
+            let mut term = shared.term.lock();
+            term.set_focused(focused);
+            let report = term.modes().focus_events;
+            drop(term);
+            if report {
+                shared.write(if focused { b"\x1b[I" } else { b"\x1b[O" });
+            }
+        }
         self.veil.set_reveal_child(self.split.get() && !focused);
         if focused {
             self.set_bell_ringing(false);
@@ -651,6 +661,23 @@ impl Surface {
     }
 
     /// ghostty's setScrollbar from the terminal's scrollback.
+    /// ghostty's scroll-to-bottom on a keystroke that writes to the PTY.
+    pub fn scroll_to_bottom(&self) {
+        {
+            let mut d = self.draw.borrow_mut();
+            let Some(shared) = d.shared.clone() else { return };
+            let mut term = shared.term.lock();
+            let offset = term.view_offset() as isize;
+            if offset == 0 {
+                return;
+            }
+            term.scroll_view(-offset);
+            d.full = true;
+        }
+        self.area.queue_render();
+        self.sync_scrollbar();
+    }
+
     pub fn sync_scrollbar(&self) {
         let (offset, total, len) = {
             let d = self.draw.borrow();
@@ -724,9 +751,9 @@ impl Surface {
                 alt: state.contains(gdk::ModifierType::ALT_MASK),
                 ctrl: state.contains(gdk::ModifierType::CONTROL_MASK),
             };
-            let cell = self.pointer_cell(&term);
+            let (cell, pixels) = self.pointer_cell(&term);
             for _ in 0..delta.unsigned_abs() {
-                mouse::encode_wheel(&mut bytes, modes.mouse_mode, modes.mouse_encoding, delta > 0, mods, cell);
+                mouse::encode_wheel(&mut bytes, modes.mouse_mode, modes.mouse_encoding, delta > 0, mods, cell, pixels);
             }
         } else {
             term.scroll_view(delta);
@@ -740,15 +767,18 @@ impl Surface {
         shared.write(&bytes);
     }
 
-    /// The grid cell under the pointer, clamped to the grid.
-    fn pointer_cell(&self, term: &term::Terminal) -> (u16, u16) {
-        let Some((cw, ch)) = self.cell_size() else { return (0, 0) };
+    /// The grid cell under the pointer, clamped to the grid, and the
+    /// pointer's position from the grid's origin in device pixels.
+    fn pointer_cell(&self, term: &term::Terminal) -> ((u16, u16), (i32, i32)) {
+        let Some((cw, ch)) = self.cell_size() else { return ((0, 0), (0, 0)) };
         let scale = self.font_scale.get();
         let pad = f64::from(padding(scale));
         let (x, y) = self.pointer.get();
-        let col = ((x * scale - pad) / f64::from(cw)).floor().max(0.0) as u16;
-        let row = ((y * scale - pad) / f64::from(ch)).floor().max(0.0) as u16;
-        (col.min(term.cols().saturating_sub(1)), row.min(term.rows().saturating_sub(1)))
+        let (px, py) = (x * scale - pad, y * scale - pad);
+        let col = (px / f64::from(cw)).floor().max(0.0) as u16;
+        let row = (py / f64::from(ch)).floor().max(0.0) as u16;
+        let cell = (col.min(term.cols().saturating_sub(1)), row.min(term.rows().saturating_sub(1)));
+        (cell, (px.round() as i32, py.round() as i32))
     }
 
     fn set_preedit(&self, text: Option<String>) {
