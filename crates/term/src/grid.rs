@@ -167,6 +167,9 @@ pub(crate) struct Grid {
     hist_start: usize,
     hist_cap: usize,
     free: Vec<u32>,
+    /// Lines ever moved into the scrollback, including those dropped since:
+    /// the absolute number of screen row 0.
+    pushed: u64,
 }
 
 impl Grid {
@@ -182,6 +185,7 @@ impl Grid {
             hist_start: 0,
             hist_cap,
             free: Vec::new(),
+            pushed: 0,
         }
     }
 
@@ -232,6 +236,10 @@ impl Grid {
         let slot = self.slot(y);
         let s = slot * self.cols;
         (&mut self.cells[s..s + self.cols], &mut self.meta[slot])
+    }
+
+    pub fn pushed(&self) -> u64 {
+        self.pushed
     }
 
     pub fn hist_len(&self) -> usize {
@@ -307,6 +315,7 @@ impl Grid {
     /// Moves `slot` into the scrollback and returns a slot to reuse for a new row.
     #[inline]
     fn push_history(&mut self, slot: u32) -> u32 {
+        self.pushed += 1;
         if self.hist.len() < self.hist_cap {
             // The ring starts at 0 until it is full.
             self.hist.push(slot);
@@ -455,6 +464,11 @@ impl Grid {
         }
     }
 
+    fn with_pushed(mut self, pushed: u64) -> Grid {
+        self.pushed = pushed;
+        self
+    }
+
     /// A grid of a new size holding the given history and screen rows.
     fn from_rows(cols: usize, rows: usize, hist_cap: usize, hist: Vec<NewRow>, screen: Vec<NewRow>) -> Grid {
         let mut g = Grid::new(cols, rows, hist_cap);
@@ -496,7 +510,7 @@ impl Grid {
             }
             screen.push(r);
         }
-        (Grid::from_rows(cols, rows, self.hist_cap, Vec::new(), screen), shift)
+        (Grid::from_rows(cols, rows, self.hist_cap, Vec::new(), screen).with_pushed(self.pushed), shift)
     }
 
     /// Resizes with reflow: logical lines joined by soft-wrap marks are
@@ -522,7 +536,7 @@ impl Grid {
         let hist_drop = start.saturating_sub(self.hist_cap);
         let hist: Vec<NewRow> = out.into_iter().skip(hist_drop).collect();
         cr -= start;
-        let grid = Grid::from_rows(cols, rows, self.hist_cap, hist, screen);
+        let grid = Grid::from_rows(cols, rows, self.hist_cap, hist, screen).with_pushed(self.pushed);
         (grid, ReflowCursor { x: cc.min(cols - 1), y: cr, pending })
     }
 

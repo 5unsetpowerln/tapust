@@ -274,6 +274,49 @@ impl Terminal {
         self.term.view_offset
     }
 
+    /// Absolute line numbers count every line that ever scrolled from the
+    /// top of the active screen into its scrollback, so a line keeps its
+    /// number while output scrolls. The oldest line still stored:
+    pub fn first_line(&self) -> u64 {
+        let g = &self.term.grid;
+        g.pushed() - g.hist_len() as u64
+    }
+
+    /// The absolute line shown at the top of the viewport.
+    pub fn view_top(&self) -> u64 {
+        self.term.grid.pushed() - self.term.view_offset as u64
+    }
+
+    /// One past the absolute line of the last screen row.
+    pub fn end_line(&self) -> u64 {
+        self.term.grid.pushed() + self.term.rows as u64
+    }
+
+    fn line_slot(&self, line: u64) -> Option<usize> {
+        let first = self.first_line();
+        (line >= first && line < self.end_line()).then(|| self.term.grid.line_slot((line - first) as usize))
+    }
+
+    /// The cells of absolute line `line`, if it is still stored.
+    pub fn line(&self, line: u64) -> Option<&[Cell]> {
+        self.line_slot(line).map(|slot| self.term.grid.slot_cells(slot))
+    }
+
+    /// Whether absolute line `line` was soft-wrapped into the next one.
+    pub fn line_wrapped(&self, line: u64) -> bool {
+        self.line_slot(line).is_some_and(|slot| self.term.grid.slot_meta(slot).wrapped)
+    }
+
+    /// The grapheme cluster of a cell of absolute line `line` whose
+    /// [`Cell::has_grapheme`] is set.
+    pub fn line_grapheme(&self, line: u64, x: u16) -> Option<&str> {
+        let slot = self.line_slot(line)?;
+        if !self.term.grid.slot_cells(slot).get(x as usize)?.has_grapheme() {
+            return None;
+        }
+        self.term.grid.slot_meta(slot).grapheme(x)
+    }
+
     /// Lines currently stored in the primary screen's scrollback.
     pub fn history_len(&self) -> usize {
         self.term.primary().hist_len()

@@ -1092,3 +1092,20 @@ fn focus_reporting_starts_with_the_current_state() {
     feed(&mut t, "\x1b[?1016h");
     assert_eq!(t.modes().mouse_encoding, MouseEncoding::SgrPixels);
 }
+
+#[test]
+fn absolute_lines_follow_their_content() {
+    let mut t = term(4, 2);
+    feed(&mut t, "ab\r\ncd");
+    let top = t.first_line();
+    assert_eq!(&t.line(top).unwrap()[..2], &t.row(0)[..2]);
+    feed(&mut t, "\r\nef");
+    // "ab" scrolled into the history and kept its number.
+    assert_eq!(t.first_line(), top);
+    assert_eq!(t.line(top).unwrap()[0].char(), Some('a'));
+    assert_eq!(t.view_top(), top + 1);
+    assert_eq!(t.line(t.end_line() - 1).unwrap()[0].char(), Some('e'));
+    assert!(t.line(t.end_line()).is_none());
+    feed(&mut t, "\x1b[2J\x1b[Hwxyzq");
+    assert!(t.line_wrapped(t.view_top()));
+}
