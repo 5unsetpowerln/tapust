@@ -351,10 +351,10 @@ impl Terminal {
 
     /// Absolute line numbers count every line that ever scrolled from the
     /// top of the active screen into its scrollback, so a line keeps its
-    /// number while output scrolls. The oldest line still stored:
+    /// number while output scrolls (a reflow renumbers the lines after the
+    /// oldest one). The oldest line still stored:
     pub fn first_line(&self) -> u64 {
-        let g = &self.term.grid;
-        g.pushed() - g.hist_len() as u64
+        self.term.grid.first_line()
     }
 
     /// The absolute line shown at the top of the viewport.

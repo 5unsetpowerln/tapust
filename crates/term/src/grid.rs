@@ -179,7 +179,8 @@ pub(crate) struct Grid {
     hist_cap: usize,
     free: Vec<u32>,
     /// Lines ever moved into the scrollback, including those dropped since:
-    /// the absolute number of screen row 0.
+    /// the absolute number of screen row 0. A reflow counts the rows above
+    /// the screen, so the oldest stored line keeps its number.
     pushed: u64,
 }
 
@@ -255,6 +256,11 @@ impl Grid {
 
     pub fn hist_len(&self) -> usize {
         self.hist.len()
+    }
+
+    /// The absolute number of the oldest stored line.
+    pub fn first_line(&self) -> u64 {
+        self.pushed - self.hist.len() as u64
     }
 
     /// Slot of history line `i` (0 = oldest).
@@ -548,7 +554,8 @@ impl Grid {
         let hist_drop = start.saturating_sub(self.hist_cap);
         let hist: Vec<NewRow> = out.into_iter().skip(hist_drop).collect();
         cr -= start;
-        let grid = Grid::from_rows(cols, rows, self.hist_cap, hist, screen).with_pushed(self.pushed);
+        let pushed = self.first_line() + start as u64;
+        let grid = Grid::from_rows(cols, rows, self.hist_cap, hist, screen).with_pushed(pushed);
         (grid, ReflowCursor { x: cc.min(cols - 1), y: cr, pending })
     }
 

@@ -1295,3 +1295,14 @@ fn ris_removes_the_progress_report() {
     t.full_reset();
     assert_eq!(t.take_messages(), []);
 }
+
+#[test]
+fn narrowing_reflow_keeps_line_numbers_valid() {
+    let mut t = Terminal::new(20, 5, 100);
+    t.feed(b"aaaaaaaaaaaaaaaaaa\r\nbbbbbbbbbbbbbbbbbb\r\ncccccccccccccccccc\r\ndddd");
+    t.resize(10, 5);
+    // The rows wrapped into the scrollback come before the oldest line's
+    // number instead of below zero.
+    assert_eq!((t.first_line(), t.view_top(), t.end_line()), (0, 2, 7));
+    assert_eq!(t.line(0).unwrap()[0].char(), Some('a'));
+}
