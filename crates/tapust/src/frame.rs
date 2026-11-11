@@ -1,6 +1,5 @@
 //! What the renderer draws: one grid of resolved cells per visible pane at
-//! the pane's pixel origin, the cursors, then shapes in window pixels
-//! (dividers, dimming, the tab bar, dialogs). Colors are already resolved, so
+//! the pane's pixel origin, then the cursors. Colors are already resolved, so
 //! the renderer knows nothing about palettes, styles or the multiplexer.
 
 pub const BOLD: u16 = 1 << 0;
@@ -114,34 +113,15 @@ pub struct FrameCursor {
     pub wide: bool,
 }
 
-/// Drawn above the grids, in window pixels.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Shape {
-    /// A rectangle; `radius` rounds its corners and `ring` keeps only a 1px outline.
-    Rect { x: i32, y: i32, w: i32, h: i32, color: [u8; 4], radius: u16, ring: bool },
-    /// One line of text whose line box starts at (`x`, `y`).
-    Text { x: i32, y: i32, text: String, color: [u8; 4], face: crate::font::Face },
-    /// A rectangle with fractional edges, `color` at `alpha`; a pixel it
-    /// covers partly gets that part of the alpha, as GTK's renderer draws
-    /// widgets at fractional scales.
-    Area { x0: f64, y0: f64, x1: f64, y1: f64, color: [u8; 3], alpha: f64 },
-}
-
 pub struct Frame {
     pub grids: Vec<Grid>,
     pub cursors: Vec<FrameCursor>,
-    pub shapes: Vec<Shape>,
     /// The window background, wherever no pane is.
     pub window_bg: [u8; 4],
-    /// Device pixels (x, y, width, height) to keep as the drag preview once
-    /// the grids are drawn.
-    pub capture: Option<(i32, i32, u32, u32)>,
-    /// Where to draw the kept pixels, scaled, above everything (x, y, width, height).
-    pub preview: Option<(f64, f64, f64, f64)>,
 }
 
 impl Frame {
     pub fn new(window_bg: [u8; 4]) -> Frame {
-        Frame { grids: Vec::new(), cursors: Vec::new(), shapes: Vec::new(), window_bg, capture: None, preview: None }
+        Frame { grids: Vec::new(), cursors: Vec::new(), window_bg }
     }
 }

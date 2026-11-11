@@ -20,7 +20,7 @@ mod window;
 #[cfg(test)]
 mod tests;
 
-pub use split::{Grab, Hit, DRAG_HANDLE_HEIGHT};
+pub use split::{f16, Node, Split};
 
 use keys::KeyState;
 use prompt::Prompt;
@@ -30,77 +30,13 @@ use window::Window;
 pub type PaneId = u32;
 
 /// A rectangle in logical pixels (GTK's widget coordinates), relative to the
-/// top-left of the area the panes share.
+/// top-left of a window's split tree.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Rect {
     pub x: u32,
     pub y: u32,
     pub w: u32,
     pub h: u32,
-}
-
-/// A rectangle in device pixels, relative to the window.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct DeviceRect {
-    pub x: i32,
-    pub y: i32,
-    pub w: u32,
-    pub h: u32,
-}
-
-/// The client's geometry. Splits are laid out in logical pixels, as GTK
-/// allocates ghostty's widgets; terminal grids are measured in the device
-/// pixels each pane covers.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Metrics {
-    /// The area the panes of a window share, in logical pixels.
-    pub width: u32,
-    pub height: u32,
-    /// Where that area starts in the window (below the tab bar), in logical pixels.
-    pub top: u32,
-    /// Width of the divider between split panes, in logical pixels.
-    pub divider: u32,
-    /// The smallest a pane may get, in logical pixels.
-    pub min_width: u32,
-    pub min_height: u32,
-    /// Device pixels per logical pixel.
-    pub scale: f64,
-    /// The cell size and the space on each side of a pane's grid (ghostty's
-    /// `window-padding-x`/`-y`), in device pixels.
-    pub cell_width: u32,
-    pub cell_height: u32,
-    pub padding_x: u32,
-    pub padding_y: u32,
-}
-
-impl Metrics {
-    pub fn area(&self) -> Rect {
-        Rect { x: 0, y: 0, w: self.width, h: self.height }
-    }
-
-    /// The device pixels a pane at `rect` covers: ghostty rounds both edges
-    /// (`snappedAxis` in its GTK scale.zig), half away from zero.
-    pub fn device(&self, rect: Rect) -> DeviceRect {
-        let s = self.scale;
-        let snap = |origin: u32, size: u32| {
-            let start = (f64::from(origin) * s).round();
-            let end = (f64::from(origin + size) * s).round();
-            (start as i32, (end - start).max(0.0) as u32)
-        };
-        let (x, w) = snap(rect.x, rect.w);
-        let (y, h) = snap(self.top + rect.y, rect.h);
-        DeviceRect { x, y, w, h }
-    }
-
-    /// The terminal grid that fits in a pane at `rect`, at least one cell.
-    pub fn grid(&self, rect: Rect) -> (u16, u16) {
-        let d = self.device(rect);
-        let fit = |size: u32, padding: u32, cell: u32| {
-            let n = size.saturating_sub(2 * padding) / cell.max(1);
-            u16::try_from(n.max(1)).unwrap_or(u16::MAX)
-        };
-        (fit(d.w, self.padding_x, self.cell_width), fit(d.h, self.padding_y, self.cell_height))
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -153,12 +89,15 @@ pub struct Mods {
 /// What the GUI must do after the model changed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
-    /// Start a shell for a new pane. `cwd_of` names the pane whose current
-    /// directory (`#{pane_current_path}`) to start in; `None` means the
-    /// session's default directory.
-    Spawn { pane: PaneId, cols: u16, rows: u16, cwd_of: Option<PaneId> },
-    /// The pane's size changed; resize its PTY and terminal.
-    Resize { pane: PaneId, cols: u16, rows: u16 },
+    /// A new pane: make its surface, and start a shell once GTK gives it a
+    /// size. `cwd_of` names the pane whose current directory
+    /// (`#{pane_current_path}`) to start in; `None` means the session's
+    /// default directory.
+    Spawn { pane: PaneId, cwd_of: Option<PaneId> },
+    /// `resize-pane`: move the divider nearest to `pane` with that
+    /// orientation by `cells` cells (negative is left or up), as ghostty's
+    /// resize_split does with pixels; the GUI answers with [`Session::resize_split`].
+    ResizeSplit { pane: PaneId, horizontal: bool, cells: i32 },
     /// The pane was removed; kill its process and drop it.
     Destroy { pane: PaneId },
     /// Write bytes to the pane's PTY (e.g. `send-prefix`).
@@ -174,36 +113,6 @@ pub enum KeyResult {
     Forward(PaneId),
     /// Consumed by the multiplexer (possibly with no effects, like the prefix key).
     Handled(Vec<Effect>),
-}
-
-/// A pane visible in the current window.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PaneView {
-    pub pane: PaneId,
-    pub rect: Rect,
-    pub active: bool,
-}
-
-/// The current window's panes and the dividers between them.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct View {
-    pub panes: Vec<PaneView>,
-    pub dividers: Vec<Divider>,
-    /// The window is split, zoomed or not (ghostty's `is-split`).
-    pub split: bool,
-    /// The prompt or message tmux would show on the status line.
-    pub overlay: Option<Overlay>,
-}
-
-/// The divider of a split. GtkPaned draws its first child, the divider and
-/// then its second child, so a divider is drawn after the first `after`
-/// panes of the view and before the others.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Divider {
-    pub rect: Rect,
-    pub after: usize,
-    /// The split puts its panes side by side (the divider is a vertical line).
-    pub horizontal: bool,
 }
 
 /// A prompt or message.
@@ -302,6 +211,8 @@ pub struct PaneInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowInfo {
     pub index: u32,
+    /// tmux `@N`, which stays with the window when its index changes.
+    pub id: u32,
     pub name: String,
     /// The name was set with rename-window, which turns automatic-rename off.
     pub renamed: bool,
@@ -316,7 +227,6 @@ pub struct WindowInfo {
 /// One tmux session shown in one GUI window.
 pub struct Session {
     name: String,
-    metrics: Metrics,
     /// Winlinks by index; a winlink is identified by its index.
     winlinks: BTreeMap<u32, Window>,
     curw: u32,
@@ -343,50 +253,53 @@ pub struct Session {
 }
 
 impl Session {
-    /// A session with one window and one pane for a client of `metrics`.
-    /// Returns the first pane's `Spawn` effect.
-    pub fn new(metrics: Metrics) -> (Session, Vec<Effect>) {
-        session::new_session(metrics)
+    /// A session with one window and one pane. Returns the first pane's
+    /// `Spawn` effect.
+    pub fn new() -> (Session, Vec<Effect>) {
+        session::new_session()
     }
 
-    /// The client (GUI window) was resized, or its cell size changed. The
-    /// splits keep their ratios.
-    pub fn resize(&mut self, metrics: Metrics) -> Vec<Effect> {
-        self.op(|s| s.set_metrics(metrics))
+    /// The split tree of the window at `index`, with its zoomed pane (GTK
+    /// then shows only that pane) and its active pane.
+    pub fn tree(&self, index: u32) -> Option<(&Node, Option<PaneId>, PaneId)> {
+        let w = self.winlinks.get(&index)?;
+        Some((&w.tree, w.zoomed.then_some(w.active), w.active))
     }
 
-    /// The smallest pane area the windows can be laid out in, in logical
-    /// pixels; the GUI makes it the window's minimum size, as GTK does.
-    pub fn min_area(&self) -> (u32, u32) {
-        self.min_area_of_windows()
-    }
-
-    /// What the pointer at (`x`, `y`) is over, in logical pixels of the pane area.
-    pub fn hit(&self, x: f64, y: f64) -> Option<Hit> {
-        if self.dead { None } else { self.cur().hit((x, y)) }
-    }
-
-    /// The divider a pointer press at (`x`, `y`) starts dragging, if any.
-    pub fn grab_divider(&self, x: f64, y: f64) -> Option<Grab> {
-        if self.dead { None } else { self.cur().grab((x, y)) }
-    }
-
-    /// Moves a grabbed divider with the pointer at (`x`, `y`).
-    pub fn drag_divider(&mut self, grab: Grab, x: f64, y: f64) -> Vec<Effect> {
-        self.op(|s| s.cur_mut().tree.drag(grab, (x, y)))
-    }
-
-    /// ghostty's idle callbacks: dragged dividers write their ratio to the
-    /// tree. The GUI calls this when it has handled the pending events.
-    pub fn idle(&mut self) {
-        if !self.dead {
-            let w = self.cur_mut();
-            let m = w.metrics;
-            w.tree.sync_dragged(&m);
+    /// GTK allocated the split tree of the window at `index`: its size, and
+    /// for each pane the rectangle and the grid it holds (tmux's directional
+    /// selection and formats read them).
+    pub fn set_geometry(&mut self, index: u32, area: Rect, panes: &[(PaneId, Rect, u16, u16)]) {
+        let Some(w) = self.winlinks.get_mut(&index) else { return };
+        w.area = area;
+        for &(wp, rect, cols, rows) in panes {
+            if let Some(p) = w.pane_mut_opt(wp) {
+                (p.rect, p.cols, p.rows) = (rect, cols, rows);
+            }
         }
     }
 
-    /// A click on a pane focuses it.
+    /// ghostty's resize_split after a `ResizeSplit` effect: `delta` is the
+    /// move as a share of the tree's extent (pixels over the tree's width or
+    /// height, the sign of the effect's cells).
+    pub fn resize_split(&mut self, pane: PaneId, horizontal: bool, delta: f64) -> Vec<Effect> {
+        self.op(|s| {
+            if let Some(idx) = s.window_of(pane) {
+                s.winlinks.get_mut(&idx).expect("window").resize_split(pane, horizontal, delta);
+            }
+        })
+    }
+
+    /// A split widget writes its ratio back (ghostty's setTreeRatio after a
+    /// drag or a clamp): the tree keeps it as f16. The widgets stay, so the
+    /// generation does not change.
+    pub fn set_ratio(&mut self, index: u32, split: usize, ratio: f64) {
+        if let Some(s) = self.winlinks.get_mut(&index).and_then(|w| w.tree.split_at(split)) {
+            s.ratio = f16(ratio);
+        }
+    }
+
+    /// A pane got the keyboard focus (a click on it).
     pub fn focus_pane(&mut self, pane: PaneId) -> Vec<Effect> {
         self.op(|s| s.focus(pane))
     }
@@ -395,6 +308,17 @@ impl Session {
     /// drag and drop of a split).
     pub fn move_pane(&mut self, source: PaneId, target: PaneId, dir: Direction) -> Vec<Effect> {
         self.op(|s| s.drop_pane(source, target, dir))
+    }
+
+    /// Answers the prompt [`Session::overlay`] shows, from a dialog: `Some`
+    /// confirms or accepts the text, `None` cancels.
+    pub fn answer(&mut self, reply: Option<&str>, now: Instant) -> Vec<Effect> {
+        self.op(|s| s.prompt_answer(reply, now))
+    }
+
+    /// The current window's index (the selected tab).
+    pub fn current(&self) -> u32 {
+        self.curw
     }
 
     /// Offers a key to the key tables (prefix, repeat, prompts).
@@ -460,22 +384,9 @@ impl Session {
         self.generation
     }
 
-    /// The visible state of the current window.
-    pub fn view(&self) -> View {
-        if self.dead {
-            return View { panes: Vec::new(), dividers: Vec::new(), split: false, overlay: self.overlay() };
-        }
-        let w = self.cur();
-        let panes = w
-            .panes
-            .iter()
-            .filter(|p| w.visible(p.id))
-            .map(|p| PaneView { pane: p.id, rect: p.rect, active: p.id == w.active })
-            .collect();
-        View { panes, dividers: w.dividers.clone(), split: w.panes.len() > 1, overlay: self.overlay() }
-    }
-
-    fn overlay(&self) -> Option<Overlay> {
+    /// The prompt or message tmux would show on the status line, which the
+    /// GUI shows as a dialog or a toast.
+    pub fn overlay(&self) -> Option<Overlay> {
         if let Some((text, _)) = &self.message {
             return Some(Overlay::Message(text.clone()));
         }
@@ -503,6 +414,7 @@ impl Session {
             .iter()
             .map(|(&index, w)| WindowInfo {
                 index,
+                id: w.id,
                 name: w.name().to_owned(),
                 renamed: w.fixed_name.is_some(),
                 active: index == self.curw && !self.dead,

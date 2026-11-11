@@ -6,7 +6,7 @@
 //!    the pane's background around the cells.
 //! 2. Foreground: one instanced draw of quads in window pixels for glyphs
 //!    (from one RGBA atlas) and rectangles (cursors, underlines, box-drawing
-//!    lines, dividers, the tab bar and dialogs).
+//!    lines).
 //!
 //! Only dirty grid rows rebuild their background texels and instances.
 
@@ -15,18 +15,11 @@ use std::collections::HashMap;
 use glow::HasContext;
 
 use crate::font::{Face, Fonts, face_for};
-use crate::frame::{BOLD, CursorStyle, Frame, FrameCell, Grid, ITALIC, STRIKE, Shape, UNDERLINE, WIDE};
+use crate::frame::{BOLD, CursorStyle, Frame, FrameCell, Grid, ITALIC, STRIKE, UNDERLINE, WIDE};
 
 const ATLAS_SIZE: i32 = 2048;
 const FLAG_COLORED: u32 = 1;
 const FLAG_RECT: u32 = 2;
-/// Rounded rectangle; the radius is in `uv[0]`.
-const FLAG_ROUND: u32 = 4;
-/// Only the 1px outline of a rounded rectangle.
-const FLAG_RING: u32 = 8;
-/// A rectangle whose alpha is `uv[1] / 65535`, precise enough to blend like
-/// GTK's renderer does with float alphas.
-const FLAG_ALPHA16: u32 = 16;
 
 /// A quad whose top-left corner is at `pos` in window pixels.
 #[derive(Clone, Copy, Debug, Default)]
@@ -44,7 +37,6 @@ struct Glyph {
     uv: [u16; 2],
     size: [u16; 2],
     offset: [i16; 2],
-    advance: i16,
     colored: bool,
 }
 
@@ -84,36 +76,6 @@ struct GridCache {
     rows: Vec<Vec<Instance>>,
 }
 
-/// The drag preview: a copy of a pane's pixels drawn scaled down.
-struct Preview {
-    program: glow::Program,
-    rect: glow::UniformLocation,
-    viewport: glow::UniformLocation,
-    texture: glow::Texture,
-}
-
-const PREVIEW_VS: &str = r#"#version 330 core
-uniform vec4 u_rect;
-uniform vec2 u_viewport;
-out vec2 v_uv;
-void main() {
-    vec2 corner = vec2(gl_VertexID & 1, (gl_VertexID >> 1) & 1);
-    // The copy is bottom-up, as OpenGL reads the framebuffer.
-    v_uv = vec2(corner.x, 1.0 - corner.y);
-    vec2 ndc = (u_rect.xy + corner * u_rect.zw) / u_viewport * 2.0 - 1.0;
-    gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
-}
-"#;
-
-const PREVIEW_FS: &str = r#"#version 330 core
-uniform sampler2D u_tex;
-in vec2 v_uv;
-out vec4 frag;
-void main() {
-    frag = texture(u_tex, v_uv);
-}
-"#;
-
 struct BgUniforms {
     rect: glow::UniformLocation,
     origin: glow::UniformLocation,
@@ -131,13 +93,12 @@ pub struct Renderer {
     grids: HashMap<u32, GridCache>,
     fg_program: glow::Program,
     fg_viewport: glow::UniformLocation,
-    preview: Preview,
     empty_vao: glow::VertexArray,
     fg_vao: glow::VertexArray,
     fg_buffer: glow::Buffer,
     fg_capacity: usize,
     atlas: Atlas,
-    ascii: Box<[[Option<Glyph>; 128]; 6]>,
+    ascii: Box<[[Option<Glyph>; 128]; 4]>,
     glyphs: HashMap<(u32, Face), Option<Glyph>>,
     upload: Vec<Instance>,
     viewport: (u32, u32),
@@ -179,18 +140,10 @@ layout(location = 3) in vec4 a_color;
 layout(location = 4) in uint a_flags;
 uniform vec2 u_viewport;
 out vec2 v_uv;
-out vec2 v_local;
-flat out vec2 v_size;
-flat out float v_radius;
-flat out float v_alpha;
 flat out vec4 v_color;
 flat out uint v_flags;
 void main() {
     vec2 corner = vec2(gl_VertexID & 1, (gl_VertexID >> 1) & 1);
-    v_local = corner * vec2(a_size);
-    v_size = vec2(a_size);
-    v_radius = float(a_uv.x);
-    v_alpha = float(a_uv.y) / 65535.0;
     vec2 px = vec2(a_pos) + corner * vec2(a_size);
     vec2 ndc = px / u_viewport * 2.0 - 1.0;
     gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
@@ -203,29 +156,12 @@ void main() {
 const FG_FS: &str = r#"#version 330 core
 uniform sampler2D u_atlas;
 in vec2 v_uv;
-in vec2 v_local;
-flat in vec2 v_size;
-flat in float v_radius;
-flat in float v_alpha;
 flat in vec4 v_color;
 flat in uint v_flags;
 out vec4 frag;
 void main() {
     if ((v_flags & 2u) != 0u) {
-        float a = (v_flags & 16u) != 0u ? v_alpha : v_color.a;
-        if ((v_flags & 4u) != 0u) {
-            // Signed distance to a rounded box, antialiased over one pixel.
-            vec2 half_size = v_size * 0.5;
-            float r = min(v_radius, min(half_size.x, half_size.y));
-            vec2 q = abs(v_local - half_size) - half_size + r;
-            float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
-            float cover = clamp(0.5 - d, 0.0, 1.0);
-            if ((v_flags & 8u) != 0u) {
-                cover *= clamp(d + 1.5, 0.0, 1.0);
-            }
-            a *= cover;
-        }
-        frag = vec4(v_color.rgb * a, a);
+        frag = vec4(v_color.rgb * v_color.a, v_color.a);
     } else if ((v_flags & 1u) != 0u) {
         frag = texture(u_atlas, v_uv);
     } else {
@@ -329,15 +265,6 @@ impl Renderer {
             };
             let fg_program = program(&gl, FG_VS, FG_FS);
             let fg_viewport = uniform(&gl, fg_program, "u_viewport");
-            let preview_program = program(&gl, PREVIEW_VS, PREVIEW_FS);
-            let preview = Preview {
-                program: preview_program,
-                rect: uniform(&gl, preview_program, "u_rect"),
-                viewport: uniform(&gl, preview_program, "u_viewport"),
-                texture: new_texture(&gl, 1, 1),
-            };
-            gl.use_program(Some(preview_program));
-            gl.uniform_1_i32(gl.get_uniform_location(preview_program, "u_tex").as_ref(), 2);
 
             let empty_vao = gl.create_vertex_array().expect("vao");
             let fg_vao = gl.create_vertex_array().expect("vao");
@@ -377,27 +304,16 @@ impl Renderer {
                 grids: HashMap::new(),
                 fg_program,
                 fg_viewport,
-                preview,
                 empty_vao,
                 fg_vao,
                 fg_buffer,
                 fg_capacity: 0,
                 atlas: Atlas { texture: atlas_texture, x: 0, y: 0, shelf_height: 0 },
-                ascii: Box::new([[None; 128]; 6]),
+                ascii: Box::new([[None; 128]; 4]),
                 glyphs: HashMap::new(),
                 upload: Vec::new(),
                 viewport: (1, 1),
             }
-        }
-    }
-
-    pub fn info(&self) -> String {
-        unsafe {
-            format!(
-                "{} / {}",
-                self.gl.get_parameter_string(glow::RENDERER),
-                self.gl.get_parameter_string(glow::VERSION)
-            )
         }
     }
 
@@ -431,8 +347,8 @@ impl Renderer {
     fn load_glyph(&mut self, ch: u32, face: Face) -> Option<Glyph> {
         let bitmap = self.fonts.rasterize(char::from_u32(ch)?, face)?;
         if bitmap.width == 0 || bitmap.height == 0 {
-            // Blank glyphs (spaces) still carry an advance for proportional text.
-            return Some(Glyph { uv: [0, 0], size: [0, 0], offset: [0, 0], advance: bitmap.advance as i16, colored: false });
+            // Blank glyphs are cached as empty, not as None, so they are not rasterized again.
+            return Some(Glyph { uv: [0, 0], size: [0, 0], offset: [0, 0], colored: false });
         }
         let (x, y) = self.atlas.reserve(bitmap.width as i32, bitmap.height as i32)?;
         unsafe {
@@ -450,12 +366,10 @@ impl Renderer {
                 glow::PixelUnpackData::Slice(Some(&bitmap.rgba)),
             );
         }
-        let baseline = if face >= crate::font::UI { self.fonts.ui_baseline } else { self.fonts.baseline };
         Some(Glyph {
             uv: [x as u16, y as u16],
             size: [bitmap.width as u16, bitmap.height as u16],
-            offset: [bitmap.left as i16, (baseline - bitmap.top) as i16],
-            advance: bitmap.advance as i16,
+            offset: [bitmap.left as i16, (self.fonts.baseline - bitmap.top) as i16],
             colored: bitmap.colored,
         })
     }
@@ -506,84 +420,6 @@ impl Renderer {
         }
         if cell.flags & STRIKE != 0 {
             out.push(Self::rect(px, py + self.fonts.strike_y, width, self.fonts.underline_thickness, fg));
-        }
-    }
-
-    /// Width in pixels of `text` in `face`, using glyph advances.
-    pub fn text_width(&mut self, text: &str, face: Face) -> i32 {
-        text.chars().map(|c| self.glyph(c as u32, face).map_or(0, |g| g.advance as i32)).sum()
-    }
-
-    fn push_shape(&mut self, out: &mut Vec<Instance>, shape: &Shape) {
-        match shape {
-            Shape::Rect { x, y, w, h, color, radius, ring } => {
-                let mut flags = FLAG_RECT;
-                if *radius > 0 {
-                    flags |= FLAG_ROUND;
-                }
-                if *ring {
-                    flags |= FLAG_ROUND | FLAG_RING;
-                }
-                out.push(Instance {
-                    pos: [*x as i16, *y as i16],
-                    size: [(*w).max(0) as u16, (*h).max(0) as u16],
-                    uv: [*radius, 0],
-                    color: *color,
-                    flags,
-                });
-            }
-            Shape::Text { x, y, text, color, face } => {
-                let mut pen = *x;
-                for ch in text.chars() {
-                    let Some(g) = self.glyph(ch as u32, *face) else { continue };
-                    if g.size[0] > 0 {
-                        out.push(Instance {
-                            pos: [(pen + g.offset[0] as i32) as i16, (y + g.offset[1] as i32) as i16],
-                            size: g.size,
-                            uv: g.uv,
-                            color: *color,
-                            flags: if g.colored { FLAG_COLORED } else { 0 },
-                        });
-                    }
-                    pen += g.advance as i32;
-                }
-            }
-            Shape::Area { x0, y0, x1, y1, color, alpha } => {
-                // Every pixel gets the alpha times the part of it the area
-                // covers: up to three spans per axis (partial, whole, partial).
-                let spans = |a: f64, b: f64| {
-                    let mut out: Vec<(i32, i32, f64)> = Vec::with_capacity(3);
-                    if b <= a {
-                        return out;
-                    }
-                    let (first, last) = (a.floor() as i32, b.ceil() as i32 - 1);
-                    if first == last {
-                        out.push((first, 1, b - a));
-                        return out;
-                    }
-                    out.push((first, 1, f64::from(first + 1) - a));
-                    if last - first > 1 {
-                        out.push((first + 1, last - first - 1, 1.0));
-                    }
-                    out.push((last, 1, b - f64::from(last)));
-                    out
-                };
-                let [r, g, b] = *color;
-                for &(x, w, cx) in &spans(*x0, *x1) {
-                    for &(y, h, cy) in &spans(*y0, *y1) {
-                        let a = (alpha * cx * cy * 65535.0).round() as u16;
-                        if a > 0 {
-                            out.push(Instance {
-                                pos: [x as i16, y as i16],
-                                size: [w as u16, h as u16],
-                                uv: [0, a],
-                                color: [r, g, b, 0xff],
-                                flags: FLAG_RECT | FLAG_ALPHA16,
-                            });
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -705,9 +541,6 @@ impl Renderer {
                 }
             }
         }
-        for shape in &frame.shapes {
-            self.push_shape(&mut upload, shape);
-        }
 
         let gl = &self.gl;
         let (vw, vh) = (self.viewport.0 as f32, self.viewport.1 as f32);
@@ -749,26 +582,6 @@ impl Renderer {
                 }
                 gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytes_of(&upload));
                 gl.draw_arrays_instanced(glow::TRIANGLE_STRIP, 0, 4, upload.len() as i32);
-            }
-            if let Some((x, y, w, h)) = frame.capture.take() {
-                // Keep the pane's pixels, with mipmaps to scale them down smoothly.
-                gl.active_texture(glow::TEXTURE2);
-                gl.bind_texture(glow::TEXTURE_2D, Some(self.preview.texture));
-                let bottom = self.viewport.1 as i32 - y - h as i32;
-                gl.copy_tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8, x, bottom, w as i32, h as i32, 0);
-                gl.generate_mipmap(glow::TEXTURE_2D);
-                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR_MIPMAP_LINEAR as i32);
-                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
-            }
-            if let Some((x, y, w, h)) = frame.preview {
-                gl.enable(glow::BLEND);
-                gl.use_program(Some(self.preview.program));
-                gl.uniform_4_f32(Some(&self.preview.rect), x as f32, y as f32, w as f32, h as f32);
-                gl.uniform_2_f32(Some(&self.preview.viewport), vw, vh);
-                gl.active_texture(glow::TEXTURE2);
-                gl.bind_texture(glow::TEXTURE_2D, Some(self.preview.texture));
-                gl.bind_vertex_array(Some(self.empty_vao));
-                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
             }
             if cfg!(debug_assertions) {
                 let error = gl.get_error();

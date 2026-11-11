@@ -8,9 +8,8 @@ license.workspace = true
 [dependencies]
 term = { package = "tapust-term", path = "../term" }
 mux = { package = "tapust-mux", path = "../mux" }
-winit = { version = "0.30", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen"] }
-glutin = { version = "0.32", default-features = false, features = ["egl", "wayland"] }
-glutin-winit = { version = "0.5", default-features = false, features = ["egl", "wayland"] }
+gtk = { package = "gtk4", version = "0.10", features = ["v4_20"] }
+adw = { package = "libadwaita", version = "0.8", features = ["v1_8"] }
 glow = "0.16"
 crossfont = "0.8"
 libc = "0.2"

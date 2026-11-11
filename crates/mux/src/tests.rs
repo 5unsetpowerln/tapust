@@ -1,28 +1,13 @@
 //! Unit tests: tmux's pane and window bookkeeping and key tables over
-//! ghostty's split layout, in a 1276x796 area of 10x20 cells with 2px padding
-//! and a 1px divider (one pane holds 127x39 cells).
+//! ghostty's split tree, whose layout GTK does (geometry for directional
+//! selection is laid out here as GtkPaned would, in a 1276x796 area).
 
 use std::time::{Duration, Instant};
 
 use crate::*;
 
-const M: Metrics =
-    Metrics {
-        width: 1276,
-        height: 796,
-        top: 0,
-        divider: 1,
-        min_width: 14,
-        min_height: 24,
-        scale: 1.0,
-        cell_width: 10,
-        cell_height: 20,
-        padding_x: 2,
-        padding_y: 2,
-    };
-
 fn new_session() -> Session {
-    Session::new(M).0
+    Session::new().0
 }
 
 fn run(s: &mut Session, cmd: Command) -> CommandOutput {
@@ -43,10 +28,60 @@ fn full_split(horizontal: bool) -> Command {
     Command::SplitWindow { horizontal, before: false, full: true, cwd_of_active: false }
 }
 
-/// (x, y, w, h) of the current window's panes in index order.
-fn rects(s: &Session) -> Vec<(u32, u32, u32, u32)> {
+/// The current window's tree, as `[a | b]` (side by side) and `[a / b]`.
+fn shape(s: &Session) -> String {
+    fn walk(n: &Node) -> String {
+        match n {
+            Node::Leaf(p) => p.to_string(),
+            Node::Split(sp) => {
+                format!("[{} {} {}]", walk(&sp.first), if sp.horizontal { "|" } else { "/" }, walk(&sp.second))
+            }
+        }
+    }
+    walk(s.tree(s.current()).unwrap().0)
+}
+
+fn root_ratio(s: &Session) -> f64 {
+    match s.tree(s.current()).unwrap().0 {
+        Node::Split(sp) => sp.ratio,
+        Node::Leaf(_) => panic!("not split"),
+    }
+}
+
+fn ids(s: &Session) -> Vec<PaneId> {
     let w = s.windows().into_iter().find(|w| w.active).unwrap();
-    w.panes.iter().map(|p| (p.rect.x, p.rect.y, p.rect.w, p.rect.h)).collect()
+    w.panes.iter().map(|p| p.pane).collect()
+}
+
+/// Lays the current window out as GtkPaned would (first child
+/// round((size - 1) * ratio)) and reports the geometry, as the GUI does.
+fn lay(s: &mut Session) {
+    fn place(n: &Node, r: Rect, out: &mut Vec<(PaneId, Rect, u16, u16)>) {
+        match n {
+            Node::Leaf(p) => out.push((*p, r, 0, 0)),
+            Node::Split(sp) => {
+                let total = if sp.horizontal { r.w } else { r.h };
+                let pos = (f64::from(total - 1) * sp.ratio).round() as u32;
+                let rest = total - pos - 1;
+                let (a, b) = if sp.horizontal {
+                    (Rect { w: pos, ..r }, Rect { x: r.x + pos + 1, w: rest, ..r })
+                } else {
+                    (Rect { h: pos, ..r }, Rect { y: r.y + pos + 1, h: rest, ..r })
+                };
+                place(&sp.first, a, out);
+                place(&sp.second, b, out);
+            }
+        }
+    }
+    let area = Rect { x: 0, y: 0, w: 1276, h: 796 };
+    let idx = s.current();
+    let (tree, zoomed, _) = s.tree(idx).unwrap();
+    let mut out = Vec::new();
+    match zoomed {
+        Some(p) => out.push((p, area, 0, 0)),
+        None => place(tree, area, &mut out),
+    }
+    s.set_geometry(idx, area, &out);
 }
 
 fn active_index(s: &Session) -> usize {
@@ -86,7 +121,7 @@ fn meta(code: KeyCode) -> Key {
 
 /// The text of the current prompt or message, empty without one.
 fn overlay_text(s: &Session) -> String {
-    match s.view().overlay {
+    match s.overlay() {
         Some(Overlay::Confirm { prompt, .. }) => prompt,
         Some(Overlay::Input { prompt, text, .. }) => prompt + &text,
         Some(Overlay::Message(text)) => text,
@@ -94,96 +129,41 @@ fn overlay_text(s: &Session) -> String {
     }
 }
 
-// --- Layout ------------------------------------------------------------------
-
-#[test]
-fn split_horizontal_halves() {
-    let mut s = new_session();
-    ok(&mut s, split(true));
-    // GtkPaned: round((1276 - 1) * 0.5) = 638 for the first pane.
-    assert_eq!(rects(&s), [(0, 0, 638, 796), (639, 0, 637, 796)]);
-    assert_eq!(s.view().dividers, [Divider { rect: Rect { x: 638, y: 0, w: 1, h: 796 }, after: 1, horizontal: true }]);
+fn resize_effect(result: KeyResult) -> Vec<Effect> {
+    match result {
+        KeyResult::Handled(effects) => effects,
+        other => panic!("{other:?}"),
+    }
 }
 
+// --- Tree ----------------------------------------------------------------------
+
 #[test]
-fn split_vertical_halves() {
+fn splits_wrap_the_active_pane() {
     let mut s = new_session();
+    ok(&mut s, split(true));
+    assert_eq!(shape(&s), "[0 | 1]");
+    assert_eq!(root_ratio(&s), 0.5);
     ok(&mut s, split(false));
-    assert_eq!(rects(&s), [(0, 0, 1276, 398), (0, 399, 1276, 397)]);
+    assert_eq!(shape(&s), "[0 | [1 / 2]]");
+    assert_eq!(ids(&s), [0, 1, 2]);
 }
 
 #[test]
 fn split_before_puts_the_new_pane_first() {
     let mut s = new_session();
     ok(&mut s, Command::SplitWindow { horizontal: true, before: true, full: false, cwd_of_active: false });
-    let ids: Vec<PaneId> = s.windows()[0].panes.iter().map(|p| p.pane).collect();
-    assert_eq!(ids, [1, 0]);
-    assert_eq!(rects(&s), [(0, 0, 638, 796), (639, 0, 637, 796)]);
+    assert_eq!(shape(&s), "[1 | 0]");
+    assert_eq!(ids(&s), [1, 0]);
     assert_eq!(s.active_pane(), 1);
 }
 
 #[test]
-fn resize_right_by_five_cells() {
+fn full_split_wraps_the_whole_tree() {
     let mut s = new_session();
     ok(&mut s, split(true));
-    select_index(&mut s, 0);
-    ok(&mut s, Command::ResizePane(Direction::Right, 5));
-    // The divider moves 50 of the 1276 pixels: round(1275 * (0.5 + 50 / 1276)).
-    assert_eq!(rects(&s), [(0, 0, 687, 796), (688, 0, 588, 796)]);
-}
-
-#[test]
-fn repeated_resizes_round_the_ratio_like_ghostty() {
-    // ghostty keeps the ratio in f16: after six 50-pixel moves the divider
-    // sits at 936, where an f64 ratio would put it at 937.
-    let mut s = new_session();
-    ok(&mut s, split(true));
-    select_index(&mut s, 0);
-    for _ in 0..6 {
-        ok(&mut s, Command::ResizePane(Direction::Right, 5));
-    }
-    assert_eq!(rects(&s)[0].2, 936);
-}
-
-#[test]
-fn resize_moves_the_divider_of_the_panes_own_split() {
-    // Splitting the first of two panes gives [[0 | 2] | 1]. resize-pane -R on
-    // pane 2 moves the divider of its own split, on its left (ghostty);
-    // tmux's flat [0 | 2 | 1] would move the one on its right.
-    let mut s = new_session();
-    ok(&mut s, split(true));
-    select_index(&mut s, 0);
-    ok(&mut s, split(true));
-    assert_eq!(rects(&s), [(0, 0, 319, 796), (320, 0, 318, 796), (639, 0, 637, 796)]);
-    ok(&mut s, Command::ResizePane(Direction::Right, 5));
-    assert_eq!(rects(&s), [(0, 0, 368, 796), (369, 0, 269, 796), (639, 0, 637, 796)]);
-}
-
-#[test]
-fn window_resize_keeps_the_ratios() {
-    let mut s = new_session();
-    ok(&mut s, split(true));
-    select_index(&mut s, 0);
-    ok(&mut s, Command::ResizePane(Direction::Right, 5));
-    let before = rects(&s);
-    s.resize(Metrics { width: 638, height: 398, ..M });
-    assert_eq!(rects(&s), [(0, 0, 343, 398), (344, 0, 294, 398)]);
-    s.resize(M);
-    assert_eq!(rects(&s), before);
-}
-
-#[test]
-fn window_resize_moves_the_divider_like_gtk() {
-    // GtkPaned scales its last position to the new size and ghostty keeps
-    // that while it is within 0.001 of the ratio: 1268 * 687 / 1275 + 0.5
-    // truncates to 683, where round(1268 * 0.5390625) would give 684.
-    let mut s = new_session();
-    ok(&mut s, split(true));
-    select_index(&mut s, 0);
-    ok(&mut s, Command::ResizePane(Direction::Right, 5));
-    assert_eq!(rects(&s)[0].2, 687);
-    s.resize(Metrics { width: 1269, ..M });
-    assert_eq!(rects(&s), [(0, 0, 683, 796), (684, 0, 585, 796)]);
+    ok(&mut s, full_split(false));
+    assert_eq!(shape(&s), "[[0 | 1] / 2]");
 }
 
 #[test]
@@ -191,25 +171,56 @@ fn kill_gives_the_space_to_the_sibling() {
     let mut s = new_session();
     ok(&mut s, split(true));
     ok(&mut s, split(true));
-    assert_eq!(rects(&s), [(0, 0, 638, 796), (639, 0, 318, 796), (958, 0, 318, 796)]);
+    assert_eq!(shape(&s), "[0 | [1 | 2]]");
     select_index(&mut s, 1);
     ok(&mut s, Command::KillPane);
-    assert_eq!(rects(&s), [(0, 0, 638, 796), (639, 0, 637, 796)]);
+    assert_eq!(shape(&s), "[0 | 2]");
+    select_index(&mut s, 0);
+    ok(&mut s, Command::KillPane);
+    assert_eq!(shape(&s), "2");
 }
 
 #[test]
-fn kill_first_of_two() {
+fn resize_pane_asks_the_gui_and_moves_the_nearest_split() {
     let mut s = new_session();
     ok(&mut s, split(true));
     select_index(&mut s, 0);
-    ok(&mut s, Command::KillPane);
-    assert_eq!(rects(&s), [(0, 0, 1276, 796)]);
+    let effects = ok(&mut s, Command::ResizePane(Direction::Right, 5));
+    assert_eq!(effects, [Effect::ResizeSplit { pane: 0, horizontal: true, cells: 5 }]);
+    // The GUI turns 5 cells of 10 pixels into a share of the 1276 pixel tree.
+    let mut expected = 0.5;
+    for _ in 0..6 {
+        s.resize_split(0, true, 50.0 / 1276.0);
+        expected = f16(expected + f16(f16(50.0 / 1276.0) / 1.0));
+    }
+    assert_eq!(root_ratio(&s), expected);
+    assert_eq!(ok(&mut s, Command::ResizePane(Direction::Up, 2)), [Effect::ResizeSplit { pane: 0, horizontal: false, cells: -2 }]);
+}
+
+#[test]
+fn set_ratio_writes_back_as_f16_without_a_rebuild() {
+    let mut s = new_session();
+    ok(&mut s, split(true));
+    let generation = s.generation();
+    s.set_ratio(0, 0, 698.0 / 1275.0);
+    assert_eq!(root_ratio(&s), f16(698.0 / 1275.0));
+    assert_eq!(s.generation(), generation);
+}
+
+#[test]
+fn equalize_evens_out() {
+    let mut s = new_session();
+    ok(&mut s, split(true));
+    ok(&mut s, split(true));
+    ok(&mut s, Command::Equalize);
+    assert_eq!(root_ratio(&s), f16(1.0 / 3.0));
 }
 
 #[test]
 fn select_left_wraps() {
     let mut s = new_session();
     ok(&mut s, split(true));
+    lay(&mut s);
     select_index(&mut s, 0);
     ok(&mut s, Command::SelectPane(Direction::Left));
     assert_eq!(active_index(&s), 1);
@@ -220,6 +231,7 @@ fn select_uses_recency() {
     let mut s = new_session();
     ok(&mut s, split(true));
     ok(&mut s, split(false));
+    lay(&mut s);
     assert_eq!(active_index(&s), 2);
     ok(&mut s, Command::SelectPane(Direction::Left));
     assert_eq!(active_index(&s), 0);
@@ -231,6 +243,32 @@ fn select_uses_recency() {
     assert_eq!(active_index(&s), 0);
     ok(&mut s, Command::SelectPane(Direction::Right));
     assert_eq!(active_index(&s), 1);
+}
+
+#[test]
+fn zoom_shows_the_active_pane_alone_until_a_split() {
+    let mut s = new_session();
+    assert_eq!(ok(&mut s, Command::ZoomPane), []);
+    assert!(!s.windows()[0].zoomed);
+    ok(&mut s, split(true));
+    ok(&mut s, Command::ZoomPane);
+    assert_eq!(s.tree(0).map(|t| t.1), Some(Some(1)));
+    ok(&mut s, split(false));
+    assert!(!s.windows()[0].zoomed);
+    assert_eq!(shape(&s), "[0 | [1 / 2]]");
+}
+
+#[test]
+fn click_focuses_and_drop_moves_a_pane() {
+    let mut s = new_session();
+    ok(&mut s, split(true));
+    assert_eq!(s.active_pane(), 1);
+    s.focus_pane(0);
+    assert_eq!(s.active_pane(), 0);
+    // Dropping pane 1 on the left side of pane 0 swaps their places.
+    s.move_pane(1, 0, Direction::Left);
+    assert_eq!(shape(&s), "[1 | 0]");
+    assert_eq!(ids(&s), [1, 0]);
 }
 
 #[test]
@@ -262,135 +300,12 @@ fn new_window_fills_gap() {
     assert!(s.windows()[1].active);
 }
 
-#[test]
-fn zoom_single_pane_does_nothing() {
-    let mut s = new_session();
-    assert_eq!(ok(&mut s, Command::ZoomPane), []);
-    assert!(!s.windows()[0].zoomed);
-}
-
-#[test]
-fn zoom_shows_the_active_pane_alone() {
-    let mut s = new_session();
-    ok(&mut s, split(true));
-    let effects = ok(&mut s, Command::ZoomPane);
-    assert_eq!(effects, [Effect::Resize { pane: 1, cols: 127, rows: 39 }]);
-    let v = s.view();
-    assert!(v.dividers.is_empty());
-    assert_eq!(v.panes, [PaneView { pane: 1, rect: M.area(), active: true }]);
-    // Splitting unzooms.
-    ok(&mut s, split(false));
-    assert!(!s.windows()[0].zoomed);
-    assert_eq!(rects(&s), [(0, 0, 638, 796), (639, 0, 637, 398), (639, 399, 637, 397)]);
-}
-
-#[test]
-fn full_vertical_split_after_horizontal() {
-    let mut s = new_session();
-    ok(&mut s, split(true));
-    ok(&mut s, full_split(false));
-    assert_eq!(rects(&s), [(0, 0, 638, 398), (639, 0, 637, 398), (0, 399, 1276, 397)]);
-    assert_eq!(
-        s.view().dividers,
-        // The inner divider comes after pane 0; the root's after both upper panes.
-        [
-            Divider { rect: Rect { x: 638, y: 0, w: 1, h: 398 }, after: 1, horizontal: true },
-            Divider { rect: Rect { x: 0, y: 398, w: 1276, h: 1 }, after: 2, horizontal: false },
-        ]
-    );
-}
-
-#[test]
-fn equalize_evens_out() {
-    let mut s = new_session();
-    ok(&mut s, split(true));
-    ok(&mut s, split(true));
-    ok(&mut s, Command::Equalize);
-    assert_eq!(rects(&s), [(0, 0, 425, 796), (426, 0, 425, 796), (852, 0, 424, 796)]);
-}
-
-#[test]
-fn split_without_room_grows_the_layout() {
-    // ghostty never refuses a split: GTK raises the window's minimum size
-    // and lays the tree out at that minimum, past the window's edge if the
-    // compositor keeps the window smaller.
-    let mut s = Session::new(Metrics { width: 30, ..M }).0;
-    ok(&mut s, split(true));
-    assert_eq!(rects(&s), [(0, 0, 15, 796), (16, 0, 14, 796)]);
-    ok(&mut s, split(true));
-    assert_eq!(s.min_area(), (44, 24));
-    assert_eq!(rects(&s), [(0, 0, 14, 796), (15, 0, 14, 796), (30, 0, 14, 796)]);
-}
-
-#[test]
-fn small_window_keeps_the_minimum_sizes_in_order() {
-    let mut s = Session::new(Metrics { height: 100, ..M }).0;
-    ok(&mut s, split(false));
-    ok(&mut s, split(false));
-    assert_eq!(rects(&s), [(0, 0, 1276, 50), (0, 51, 1276, 24), (0, 76, 1276, 24)]);
-    s.resize(Metrics { height: 60, ..M });
-    // Every pane keeps its minimum: the tree is laid out at its minimum
-    // height, past the bottom of the window.
-    assert_eq!(rects(&s), [(0, 0, 1276, 24), (0, 25, 1276, 24), (0, 50, 1276, 24)]);
-    assert!(s.windows()[0].panes.iter().all(|p| M.grid(p.rect).1 == 1));
-}
-
-// --- Pointer ---------------------------------------------------------------
-
-#[test]
-fn dragging_a_divider_follows_gtk_paned() {
-    let mut s = new_session();
-    ok(&mut s, split(true));
-    // The divider is at 638; GtkPaned takes presses 6 pixels around it.
-    assert_eq!(s.grab_divider(631.0, 100.0), None);
-    assert!(s.grab_divider(632.0, 100.0).is_some());
-    let grab = s.grab_divider(640.0, 100.0).expect("grab");
-    s.drag_divider(grab, 700.0, 300.0);
-    // The pointer keeps its 2 pixel offset into the divider.
-    assert_eq!(rects(&s)[0].2, 698);
-    s.idle();
-    // GtkPaned scales the dragged position to a new size, and ghostty keeps
-    // it within 0.001 of the ratio the drag wrote: 1268 * 698 / 1275 + 0.5.
-    s.resize(Metrics { width: 1269, ..M });
-    assert_eq!(rects(&s)[0].2, 694);
-}
-
-#[test]
-fn hits_follow_gtk_picking() {
-    let mut s = new_session();
-    assert_eq!(s.hit(5.0, 5.0), Some(Hit::Pane(0)));
-    ok(&mut s, split(true));
-    // Split panes carry ghostty's drag handle in their top 16 pixels.
-    assert_eq!(s.hit(5.0, 5.0), Some(Hit::DragHandle(0)));
-    assert_eq!(s.hit(5.0, 16.0), Some(Hit::Pane(0)));
-    // The divider's handle lies above the first pane but below the second.
-    assert_eq!(s.hit(632.0, 100.0), Some(Hit::Divider { horizontal: true }));
-    assert_eq!(s.hit(631.0, 100.0), Some(Hit::Pane(0)));
-    assert_eq!(s.hit(639.0, 100.0), Some(Hit::Pane(1)));
-    ok(&mut s, Command::ZoomPane);
-    assert_eq!(s.hit(5.0, 5.0), Some(Hit::DragHandle(1)));
-}
-
-#[test]
-fn click_focuses_and_drop_moves_a_pane() {
-    let mut s = new_session();
-    ok(&mut s, split(true));
-    assert_eq!(s.active_pane(), 1);
-    s.focus_pane(0);
-    assert_eq!(s.active_pane(), 0);
-    // Dropping pane 1 on the left side of pane 0 swaps their places.
-    s.move_pane(1, 0, Direction::Left);
-    let ids: Vec<PaneId> = s.windows()[0].panes.iter().map(|p| p.pane).collect();
-    assert_eq!(ids, [1, 0]);
-    assert_eq!(rects(&s), [(0, 0, 638, 796), (639, 0, 637, 796)]);
-}
-
 // --- Effects ---------------------------------------------------------------
 
 #[test]
 fn new_session_spawns_first_pane() {
-    let (s, effects) = Session::new(M);
-    assert_eq!(effects, [Effect::Spawn { pane: 0, cols: 127, rows: 39, cwd_of: None }]);
+    let (s, effects) = Session::new();
+    assert_eq!(effects, [Effect::Spawn { pane: 0, cwd_of: None }]);
     assert_eq!(s.active_pane(), 0);
 }
 
@@ -399,27 +314,7 @@ fn split_effects() {
     let mut s = new_session();
     let effects =
         ok(&mut s, Command::SplitWindow { horizontal: true, before: false, full: false, cwd_of_active: true });
-    assert_eq!(
-        effects,
-        [
-            Effect::Resize { pane: 0, cols: 63, rows: 39 },
-            Effect::Spawn { pane: 1, cols: 63, rows: 39, cwd_of: Some(0) },
-        ]
-    );
-}
-
-#[test]
-fn hidden_windows_are_laid_out_when_selected() {
-    // libadwaita allocates only the selected tab.
-    let mut s = new_session();
-    ok(&mut s, split(true));
-    ok(&mut s, Command::NewWindow { cwd_of_active: false });
-    let effects = s.resize(Metrics { width: 1576, height: 896, ..M });
-    assert_eq!(effects, [Effect::Resize { pane: 2, cols: 157, rows: 44 }]);
-    assert_eq!(
-        ok(&mut s, Command::SelectWindow(0)),
-        [Effect::Resize { pane: 0, cols: 78, rows: 44 }, Effect::Resize { pane: 1, cols: 78, rows: 44 }]
-    );
+    assert_eq!(effects, [Effect::Spawn { pane: 1, cwd_of: Some(0) }]);
 }
 
 #[test]
@@ -436,12 +331,9 @@ fn last_pane_exit_exits() {
 fn break_pane_does_not_spawn() {
     let mut s = new_session();
     ok(&mut s, split(true));
-    let effects = ok(&mut s, Command::BreakPane);
-    // The pane left behind grows when its window is selected again.
-    assert_eq!(effects, [Effect::Resize { pane: 1, cols: 127, rows: 39 }]);
+    assert_eq!(ok(&mut s, Command::BreakPane), []);
     assert_eq!(s.windows().len(), 2);
     assert!(s.windows()[1].active);
-    assert_eq!(ok(&mut s, Command::SelectWindow(0)), [Effect::Resize { pane: 0, cols: 127, rows: 39 }]);
 }
 
 // --- Keys ------------------------------------------------------------------
@@ -452,8 +344,8 @@ fn prefix_then_split() {
     let mut s = new_session();
     assert_eq!(s.key(ctrl('b'), t), KeyResult::Handled(vec![]));
     let KeyResult::Handled(effects) = s.key(ch('%'), t) else { panic!() };
-    assert_eq!(effects.len(), 2);
-    assert_eq!(rects(&s).len(), 2);
+    assert_eq!(effects, [Effect::Spawn { pane: 1, cwd_of: Some(0) }]);
+    assert_eq!(ids(&s).len(), 2);
     assert_eq!(s.key(ch('a'), t), KeyResult::Forward(1));
 }
 
@@ -482,16 +374,15 @@ fn repeat_within_repeat_time() {
     let mut s = new_session();
     ok(&mut s, split(true));
     select_index(&mut s, 0);
+    let resize = vec![Effect::ResizeSplit { pane: 0, horizontal: true, cells: 5 }];
     s.key(ctrl('b'), t);
-    s.key(ch('L'), t);
+    assert_eq!(resize_effect(s.key(ch('L'), t)), resize);
     assert_eq!(s.deadline(), Some(t + Duration::from_millis(500)));
     let t2 = t + Duration::from_millis(400);
-    s.key(ch('L'), t2);
+    assert_eq!(resize_effect(s.key(ch('L'), t2)), resize);
     assert_eq!(s.deadline(), Some(t2 + Duration::from_millis(500)));
-    assert_eq!(rects(&s)[0].2, 737);
     // Still repeating at t2 + 499 ms.
-    s.key(ch('L'), t2 + Duration::from_millis(499));
-    assert_eq!(rects(&s)[0].2, 787);
+    assert_eq!(resize_effect(s.key(ch('L'), t2 + Duration::from_millis(499))), resize);
 }
 
 #[test]
@@ -499,6 +390,7 @@ fn key_after_repeat_time_goes_to_pane() {
     let t = Instant::now();
     let mut s = new_session();
     ok(&mut s, split(true));
+    lay(&mut s);
     s.key(ctrl('b'), t);
     s.key(key(KeyCode::Left), t);
     assert_eq!(active_index(&s), 0);
@@ -527,7 +419,7 @@ fn non_repeat_key_during_repeat_is_forwarded() {
     s.key(ctrl('b'), t);
     s.key(key(KeyCode::Left), t);
     assert_eq!(s.key(ch('%'), t), KeyResult::Forward(0));
-    assert_eq!(rects(&s).len(), 2);
+    assert_eq!(ids(&s).len(), 2);
     // An unbound key during repeat is forwarded too.
     s.key(ctrl('b'), t);
     s.key(key(KeyCode::Right), t);
@@ -567,7 +459,7 @@ fn confirm_kill_pane() {
     s.key(ctrl('b'), t);
     s.key(ch('x'), t);
     assert_eq!(
-        s.view().overlay,
+        s.overlay(),
         // confirm-before appends a space to the prompt (cmd-confirm-before.c).
         Some(Overlay::Confirm { prompt: "kill-pane 1? (y/n) ".to_owned(), target: ConfirmTarget::Pane })
     );
@@ -575,14 +467,11 @@ fn confirm_kill_pane() {
     s.key(key(KeyCode::Left), t);
     assert!(overlay_text(&s).starts_with("kill-pane 1?"));
     assert_eq!(s.key(ch('n'), t), KeyResult::Handled(vec![]));
-    assert_eq!(rects(&s).len(), 2);
+    assert_eq!(ids(&s).len(), 2);
     s.key(ctrl('b'), t);
     s.key(ch('x'), t);
-    assert_eq!(s.key(ch('y'), t), KeyResult::Handled(vec![
-        Effect::Destroy { pane: 1 },
-        Effect::Resize { pane: 0, cols: 127, rows: 39 },
-    ]));
-    assert_eq!(s.view().overlay, None);
+    assert_eq!(s.key(ch('y'), t), KeyResult::Handled(vec![Effect::Destroy { pane: 1 }]));
+    assert_eq!(s.overlay(), None);
 }
 
 #[test]
@@ -594,7 +483,7 @@ fn confirm_kill_window() {
     s.key(ctrl('b'), t);
     s.key(ch('&'), t);
     assert_eq!(
-        s.view().overlay,
+        s.overlay(),
         Some(Overlay::Confirm { prompt: "kill-window vim? (y/n) ".to_owned(), target: ConfirmTarget::Window })
     );
     s.key(ch('y'), t);
@@ -609,7 +498,7 @@ fn rename_window_editing() {
     s.key(ctrl('b'), t);
     s.key(ch(','), t);
     let input = |text: &str, cursor| Some(Overlay::Input { prompt: "(rename-window) ".to_owned(), text: text.to_owned(), cursor });
-    assert_eq!(s.view().overlay, input("bash", 4));
+    assert_eq!(s.overlay(), input("bash", 4));
     s.key(key(KeyCode::Backspace), t);
     s.key(key(KeyCode::Home), t);
     s.key(ch('x'), t);
@@ -618,7 +507,7 @@ fn rename_window_editing() {
     s.key(key(KeyCode::Left), t);
     s.key(key(KeyCode::Left), t);
     s.key(ch('-'), t);
-    assert_eq!(s.view().overlay, input("xba-sy", 4));
+    assert_eq!(s.overlay(), input("xba-sy", 4));
     s.key(ctrl('a'), t);
     s.key(key(KeyCode::Right), t);
     s.key(key(KeyCode::End), t);
@@ -644,7 +533,7 @@ fn rename_prompt_cancel_and_clear() {
     s.key(ch(','), t);
     s.key(ctrl('c'), t);
     assert_eq!(s.windows()[0].name, "bash");
-    assert_eq!(s.view().overlay, None);
+    assert_eq!(s.overlay(), None);
 }
 
 #[test]
@@ -681,18 +570,18 @@ fn error_message_and_expiry() {
     let mut s = new_session();
     s.key(ctrl('b'), t);
     s.key(ch('5'), t);
-    assert_eq!(s.view().overlay, Some(Overlay::Message("Can't find window: 5".to_owned())));
+    assert_eq!(s.overlay(), Some(Overlay::Message("Can't find window: 5".to_owned())));
     assert_eq!(s.deadline(), Some(t + Duration::from_millis(750)));
     let g = s.generation();
     s.tick(t + Duration::from_millis(750));
     assert_ne!(s.generation(), g);
-    assert_eq!(s.view().overlay, None);
+    assert_eq!(s.overlay(), None);
     // A key press clears a message and is then processed normally.
     s.key(ctrl('b'), t);
     s.key(ch('n'), t);
     assert_eq!(overlay_text(&s), "No next window");
     assert_eq!(s.key(ch('q'), t), KeyResult::Forward(0));
-    assert_eq!(s.view().overlay, None);
+    assert_eq!(s.overlay(), None);
 }
 
 #[test]
@@ -701,15 +590,14 @@ fn arrow_resize_bindings() {
     let mut s = new_session();
     ok(&mut s, split(true));
     select_index(&mut s, 0);
+    let resize = |cells| vec![Effect::ResizeSplit { pane: 0, horizontal: true, cells }];
     s.key(ctrl('b'), t);
-    s.key(meta(KeyCode::Right), t);
-    assert_eq!(rects(&s)[0].2, 687);
-    s.key(meta(KeyCode::Right), t + Duration::from_millis(100));
-    assert_eq!(rects(&s)[0].2, 737);
+    assert_eq!(resize_effect(s.key(meta(KeyCode::Right), t)), resize(5));
+    assert_eq!(resize_effect(s.key(meta(KeyCode::Right), t + Duration::from_millis(100))), resize(5));
     let later = t + Duration::from_secs(1);
     s.key(ctrl('b'), later);
-    s.key(Key { code: KeyCode::Left, mods: Mods { ctrl: true, ..Mods::default() } }, later);
-    assert_eq!(rects(&s)[0].2, 727);
+    let ctrl_left = Key { code: KeyCode::Left, mods: Mods { ctrl: true, ..Mods::default() } };
+    assert_eq!(resize_effect(s.key(ctrl_left, later)), resize(-1));
 }
 
 #[test]
@@ -735,15 +623,14 @@ fn swap_and_rotate_bindings() {
     let mut s = new_session();
     ok(&mut s, split(true));
     ok(&mut s, split(false));
-    let ids = |s: &Session| -> Vec<PaneId> { s.windows()[0].panes.iter().map(|p| p.pane).collect() };
-    s.key(ctrl('b'), t);
+        s.key(ctrl('b'), t);
     s.key(ch('{'), t);
     assert_eq!(ids(&s), [0, 2, 1]);
     assert_eq!(s.active_pane(), 2);
     s.key(ctrl('b'), t);
     s.key(ctrl('o'), t);
     assert_eq!(ids(&s), [2, 1, 0]);
-    assert_eq!(rects(&s), [(0, 0, 638, 796), (639, 0, 637, 398), (639, 399, 637, 397)]);
+    assert_eq!(shape(&s), "[2 | [1 / 0]]");
 }
 
 #[test]
@@ -753,8 +640,7 @@ fn exit_of_pane_in_other_window() {
     ok(&mut s, Command::NewWindow { cwd_of_active: false });
     assert_eq!(s.pane_exited(1), [Effect::Destroy { pane: 1 }]);
     assert_eq!(s.active_pane(), 2);
-    // Window 0 is selected again and only now takes the space of pane 1.
-    assert_eq!(s.pane_exited(2), [Effect::Destroy { pane: 2 }, Effect::Resize { pane: 0, cols: 127, rows: 39 }]);
+    assert_eq!(s.pane_exited(2), [Effect::Destroy { pane: 2 }]);
     assert_eq!(s.active_pane(), 0);
 }
 
@@ -762,8 +648,7 @@ fn exit_of_pane_in_other_window() {
 fn dead_session_view() {
     let mut s = new_session();
     assert_eq!(ok(&mut s, Command::KillWindow), [Effect::Destroy { pane: 0 }, Effect::Exit]);
-    let v = s.view();
-    assert!(v.panes.is_empty() && v.dividers.is_empty());
+    assert_eq!(s.overlay(), None);
     assert_eq!(s.active_pane(), 0);
     assert_eq!(s.key(ctrl('b'), Instant::now()), KeyResult::Handled(vec![]));
 }

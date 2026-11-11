@@ -307,6 +307,22 @@ impl Session {
         }
     }
 
+    /// Answers the open prompt from a dialog: `Some` confirms (a
+    /// confirmation) or accepts the text (an input prompt), `None` cancels.
+    pub(crate) fn prompt_answer(&mut self, reply: Option<&str>, now: Instant) {
+        let Some(p) = self.prompt.take() else { return };
+        let Some(text) = reply else { return };
+        if p.single() {
+            match p.kind {
+                PromptKind::ConfirmKillPane { pane } => self.kill_pane_target(pane),
+                PromptKind::ConfirmKillWindow { window } => self.kill_window_target(window),
+                _ => {}
+            }
+        } else {
+            self.prompt_accept(p.kind, text, now);
+        }
+    }
+
     /// cmd_command_prompt_callback: run the command with "%%" replaced.
     fn prompt_accept(&mut self, kind: PromptKind, line: &str, now: Instant) {
         let result = match kind {

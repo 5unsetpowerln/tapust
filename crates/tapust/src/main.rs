@@ -1,17 +1,18 @@
-mod app;
 mod compose;
 mod font;
 mod frame;
-mod handle;
+mod gl;
+mod gui;
 mod input;
 mod pty;
 mod renderer;
+mod surface;
 mod theme;
-mod window;
 
 use std::error::Error;
 
-use winit::event_loop::EventLoop;
+use adw::prelude::*;
+use gtk::{gdk, gio};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -22,8 +23,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(_) => return Err("usage: tapust [-e PROGRAM [ARGS...]]".into()),
     };
     font::register_embedded_fonts()?;
-    let event_loop = EventLoop::<app::UserEvent>::with_user_event().build()?;
-    let mut app = app::App::new(event_loop.create_proxy(), command);
-    event_loop.run_app(&mut app)?;
+    let application = adw::Application::builder()
+        .application_id("dev.tapust.tapust")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    application.connect_startup(|_| {
+        let provider = gtk::CssProvider::new();
+        provider.load_from_string(&gui::css());
+        let display = gdk::Display::default().expect("display");
+        gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    });
+    let command = std::cell::RefCell::new(command);
+    application.connect_activate(move |application| {
+        gui::App::build(application, command.borrow_mut().take());
+    });
+    application.run_with_args::<&str>(&[]);
     Ok(())
 }

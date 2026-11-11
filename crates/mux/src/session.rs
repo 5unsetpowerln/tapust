@@ -6,12 +6,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::keys::KeyState;
 use crate::split::Side;
 use crate::window::{Pane, Window};
-use crate::{format, Command, Direction, Effect, Metrics, PaneId, Session};
+use crate::{format, Command, Direction, Effect, PaneId, Session};
 
-pub(crate) fn new_session(metrics: Metrics) -> (Session, Vec<Effect>) {
+pub(crate) fn new_session() -> (Session, Vec<Effect>) {
     let mut s = Session {
         name: "0".to_owned(),
-        metrics,
         winlinks: BTreeMap::new(),
         curw: 0,
         lastw: Vec::new(),
@@ -42,43 +41,26 @@ impl Session {
         if self.dead {
             return Vec::new();
         }
-        let before = self.size_map();
+        let before = self.pane_ids();
         f(self);
-        if !self.dead {
-            // Other windows keep their layout until they are selected.
-            let area = self.layout_area();
-            let w = self.cur_mut();
-            w.area = area;
-            w.relayout();
-        }
         self.generation += 1;
         self.collect_effects(&before)
     }
 
-    fn size_map(&self) -> BTreeMap<PaneId, (u16, u16)> {
-        self.winlinks
-            .values()
-            .flat_map(|w| w.panes.iter())
-            .map(|p| (p.id, (p.cols, p.rows)))
-            .collect()
+    fn pane_ids(&self) -> BTreeSet<PaneId> {
+        self.winlinks.values().flat_map(|w| w.panes.iter()).map(|p| p.id).collect()
     }
 
-    fn collect_effects(&mut self, before: &BTreeMap<PaneId, (u16, u16)>) -> Vec<Effect> {
-        let after = self.size_map();
+    fn collect_effects(&mut self, before: &BTreeSet<PaneId>) -> Vec<Effect> {
+        let after = self.pane_ids();
         let spawned: Vec<_> = std::mem::take(&mut self.spawned);
-        let new: BTreeSet<PaneId> = spawned.iter().map(|s| s.0).collect();
         let mut effects = Vec::new();
-        for pane in before.keys().filter(|p| !after.contains_key(p)) {
+        for pane in before.difference(&after) {
             effects.push(Effect::Destroy { pane: *pane });
         }
-        for (pane, &(cols, rows)) in &after {
-            if !new.contains(pane) && before.get(pane).is_some_and(|&b| b != (cols, rows)) {
-                effects.push(Effect::Resize { pane: *pane, cols, rows });
-            }
-        }
         for (pane, cwd_of) in spawned {
-            if let Some(&(cols, rows)) = after.get(&pane) {
-                effects.push(Effect::Spawn { pane, cols, rows, cwd_of });
+            if after.contains(&pane) {
+                effects.push(Effect::Spawn { pane, cwd_of });
             }
         }
         effects.append(&mut self.writes);
@@ -133,7 +115,7 @@ impl Session {
         let idx = self.free_index();
         let pane = self.new_pane();
         let id = pane.id;
-        let mut w = Window::new(self.next_window_id, self.metrics, pane);
+        let mut w = Window::new(self.next_window_id, pane);
         self.next_window_id += 1;
         // window_set_active_pane with no previous active pane.
         w.panes[0].active_point = self.next_active_point;
@@ -239,32 +221,6 @@ impl Session {
         }
     }
 
-    /// The smallest the pane area can be: the largest minimum of all the
-    /// windows' trees, as GTK raises a window's minimum size to its content's.
-    pub(crate) fn min_area_of_windows(&self) -> (u32, u32) {
-        let m = &self.metrics;
-        self.winlinks.values().fold((0, 0), |(w, h), win| {
-            (w.max(win.tree.min_size(true, m)), h.max(win.tree.min_size(false, m)))
-        })
-    }
-
-    /// The size libadwaita's tab view gives the selected page: a GTK window is
-    /// never smaller than its content's minimum, and the tab view's minimum
-    /// is the largest of all its pages, hidden ones included.
-    fn layout_area(&self) -> crate::Rect {
-        let (w, h) = self.min_area_of_windows();
-        crate::Rect { x: 0, y: 0, w: w.max(self.metrics.width), h: h.max(self.metrics.height) }
-    }
-
-    /// The client's pixel geometry changed: every window takes the new area
-    /// (the others are laid out for it when they are selected).
-    pub(crate) fn set_metrics(&mut self, metrics: Metrics) {
-        self.metrics = metrics;
-        for w in self.winlinks.values_mut() {
-            w.metrics = metrics;
-        }
-    }
-
     pub(crate) fn exec(&mut self, cmd: &Command) -> Result<(), String> {
         match *cmd {
             Command::SplitWindow { horizontal, before, full, cwd_of_active } => {
@@ -357,13 +313,11 @@ impl Session {
         let w = self.cur_mut();
         let wp = w.active;
         w.push_zoom(true, false);
-        // ghostty always splits; a window too small for the new minimum is
-        // laid out at that minimum (see layout_area) and grows if it can.
+        // ghostty always splits; GTK raises the window's minimum size instead.
         let pane = self.new_pane();
         let id = pane.id;
         let (w, point) = self.cur_point();
         w.add_pane(pane, wp, side, full);
-        w.relayout();
         w.set_active(id, point);
         w.pop_zoom(point);
         self.spawned.push((id, cwd_of_active.then_some(wp)));
@@ -436,15 +390,11 @@ impl Session {
         let Ok(adjust) = i32::try_from(adjust) else {
             return Err("adjustment too large".to_owned());
         };
-        let m = w.metrics;
-        // tmux counts cells; ghostty moves dividers by logical pixels.
-        let (horizontal, cell) = match dir {
-            Direction::Left | Direction::Right => (true, m.cell_width),
-            Direction::Up | Direction::Down => (false, m.cell_height),
-        };
-        let amount = (f64::from(adjust) * f64::from(cell) / m.scale).round().min(f64::from(i32::MAX)) as i32;
-        let amount = if matches!(dir, Direction::Left | Direction::Up) { -amount } else { amount };
-        w.resize_split(horizontal, amount);
+        // The GUI turns cells into a share of the tree, as ghostty's
+        // resize_split turns pixels into one, and calls resize_split.
+        let pane = w.active;
+        let cells = if matches!(dir, Direction::Left | Direction::Up) { -adjust } else { adjust };
+        self.writes.push(Effect::ResizeSplit { pane, horizontal: matches!(dir, Direction::Left | Direction::Right), cells });
         Ok(())
     }
 
@@ -465,7 +415,7 @@ impl Session {
         }
         let wp = w.active;
         let pane = w.remove_pane(wp);
-        let nw = Window::new(self.next_window_id, self.metrics, pane);
+        let nw = Window::new(self.next_window_id, pane);
         self.next_window_id += 1;
         let new = self.free_index();
         self.winlinks.insert(new, nw);
@@ -484,8 +434,7 @@ impl Session {
         };
         if src != dst {
             w.swap_panes(src, dst);
-            w.relayout();
-            w.set_active(dst, point);
+                w.set_active(dst, point);
         }
         w.pop_zoom(point);
     }
@@ -505,7 +454,6 @@ impl Session {
             w.place_in_order();
             w.next_of(w.active).unwrap_or(w.panes[0].id)
         };
-        w.relayout();
         w.set_active(new_active, point);
         w.pop_zoom(point);
     }

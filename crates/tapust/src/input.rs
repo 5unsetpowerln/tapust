@@ -1,55 +1,55 @@
-//! Keyboard input: winit key events to multiplexer keys, and keys to the
+//! Keyboard input: GDK key events to multiplexer keys, and keys to the
 //! byte sequences xterm sends (xterm ctlseqs, "PC-Style Function Keys").
 
+use gtk::gdk;
 use mux::{Key, KeyCode, Mods};
-use winit::event::KeyEvent;
-use winit::keyboard::{Key as WKey, ModifiersState, NamedKey};
 
 /// Converts a key press. Returns the key and, for characters typed without
-/// Ctrl or Alt, the text it produced (keeps composed input intact).
-pub fn from_winit(event: &KeyEvent, modifiers: ModifiersState) -> Option<(Key, Option<String>)> {
-    let mods = Mods { ctrl: modifiers.control_key(), meta: modifiers.alt_key(), shift: modifiers.shift_key() };
+/// Ctrl or Alt, the text it produced.
+pub fn from_gdk(keyval: gdk::Key, state: gdk::ModifierType) -> Option<(Key, Option<String>)> {
+    let mods = Mods {
+        ctrl: state.contains(gdk::ModifierType::CONTROL_MASK),
+        meta: state.contains(gdk::ModifierType::ALT_MASK),
+        shift: state.contains(gdk::ModifierType::SHIFT_MASK),
+    };
     let plain = !mods.ctrl && !mods.meta;
-    let code = match &event.logical_key {
-        WKey::Character(s) => {
-            let ch = s.chars().next()?;
-            let text = plain.then(|| event.text.as_deref().unwrap_or(s).to_owned());
+    use gdk::Key as K;
+    let code = match keyval {
+        K::Return | K::KP_Enter => KeyCode::Enter,
+        K::Escape => KeyCode::Escape,
+        K::Tab | K::ISO_Left_Tab => KeyCode::Tab,
+        K::BackSpace => KeyCode::Backspace,
+        K::Up | K::KP_Up => KeyCode::Up,
+        K::Down | K::KP_Down => KeyCode::Down,
+        K::Left | K::KP_Left => KeyCode::Left,
+        K::Right | K::KP_Right => KeyCode::Right,
+        K::Home | K::KP_Home => KeyCode::Home,
+        K::End | K::KP_End => KeyCode::End,
+        K::Page_Up | K::KP_Page_Up => KeyCode::PageUp,
+        K::Page_Down | K::KP_Page_Down => KeyCode::PageDown,
+        K::Insert | K::KP_Insert => KeyCode::Insert,
+        K::Delete | K::KP_Delete => KeyCode::Delete,
+        K::F1 => KeyCode::F(1),
+        K::F2 => KeyCode::F(2),
+        K::F3 => KeyCode::F(3),
+        K::F4 => KeyCode::F(4),
+        K::F5 => KeyCode::F(5),
+        K::F6 => KeyCode::F(6),
+        K::F7 => KeyCode::F(7),
+        K::F8 => KeyCode::F(8),
+        K::F9 => KeyCode::F(9),
+        K::F10 => KeyCode::F(10),
+        K::F11 => KeyCode::F(11),
+        K::F12 => KeyCode::F(12),
+        _ => {
+            // GDK gives the keyval with Shift already applied (`|`, `H`).
+            let ch = keyval.to_unicode()?;
+            if ch.is_control() {
+                return None;
+            }
+            let text = plain.then(|| ch.to_string());
             return Some((Key { code: KeyCode::Char(ch), mods: Mods { shift: false, ..mods } }, text));
         }
-        WKey::Named(NamedKey::Space) => {
-            let text = plain.then(|| " ".to_owned());
-            return Some((Key { code: KeyCode::Char(' '), mods: Mods { shift: false, ..mods } }, text));
-        }
-        WKey::Named(named) => match named {
-            NamedKey::Enter => KeyCode::Enter,
-            NamedKey::Escape => KeyCode::Escape,
-            NamedKey::Tab => KeyCode::Tab,
-            NamedKey::Backspace => KeyCode::Backspace,
-            NamedKey::ArrowUp => KeyCode::Up,
-            NamedKey::ArrowDown => KeyCode::Down,
-            NamedKey::ArrowLeft => KeyCode::Left,
-            NamedKey::ArrowRight => KeyCode::Right,
-            NamedKey::Home => KeyCode::Home,
-            NamedKey::End => KeyCode::End,
-            NamedKey::PageUp => KeyCode::PageUp,
-            NamedKey::PageDown => KeyCode::PageDown,
-            NamedKey::Insert => KeyCode::Insert,
-            NamedKey::Delete => KeyCode::Delete,
-            NamedKey::F1 => KeyCode::F(1),
-            NamedKey::F2 => KeyCode::F(2),
-            NamedKey::F3 => KeyCode::F(3),
-            NamedKey::F4 => KeyCode::F(4),
-            NamedKey::F5 => KeyCode::F(5),
-            NamedKey::F6 => KeyCode::F(6),
-            NamedKey::F7 => KeyCode::F(7),
-            NamedKey::F8 => KeyCode::F(8),
-            NamedKey::F9 => KeyCode::F(9),
-            NamedKey::F10 => KeyCode::F(10),
-            NamedKey::F11 => KeyCode::F(11),
-            NamedKey::F12 => KeyCode::F(12),
-            _ => return None,
-        },
-        _ => return None,
     };
     Some((Key { code, mods }, None))
 }

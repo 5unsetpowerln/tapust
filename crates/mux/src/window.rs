@@ -1,16 +1,16 @@
 //! Windows and panes: tmux 3.6's `window.c` bookkeeping (pane order, the
 //! last-pane stack, zoom, directional selection) over ghostty's split tree.
 
-use crate::split::{leaf_hit, Grab, Hit, Node, Side};
-use crate::{Divider, Metrics, PaneId, Rect};
+use crate::split::{Node, Side};
+use crate::{PaneId, Rect};
 
 #[derive(Clone, Debug)]
 pub(crate) struct Pane {
     pub id: PaneId,
-    /// The last laid-out position in pixels, relative to the window area;
-    /// hidden panes of a zoomed window keep the one they had before the zoom.
+    /// Where GTK last allocated the pane, in logical pixels of the tree's
+    /// area; hidden panes of a zoomed window keep the one they had.
     pub rect: Rect,
-    /// The terminal grid inside the padding.
+    /// The terminal grid GTK's allocation holds.
     pub cols: u16,
     pub rows: u16,
     pub active_point: u32,
@@ -37,9 +37,7 @@ impl Pane {
 pub(crate) struct Window {
     /// tmux `@N`, never reused within a session.
     pub id: u32,
-    pub metrics: Metrics,
-    /// What the tab view allocates to the window's tree: the pane area, or
-    /// more when the window cannot be that small.
+    /// The size GTK gives the window's split tree, in logical pixels.
     pub area: Rect,
     /// `w->panes`, kept in the tree's order; a pane's index is its position.
     pub panes: Vec<Pane>,
@@ -47,8 +45,6 @@ pub(crate) struct Window {
     pub last_panes: Vec<PaneId>,
     pub active: PaneId,
     pub tree: Node,
-    /// The dividers of the last layout.
-    pub dividers: Vec<Divider>,
     pub zoomed: bool,
     pub was_zoomed: bool,
     /// Set by rename-window, which turns automatic-rename off.
@@ -56,23 +52,19 @@ pub(crate) struct Window {
 }
 
 impl Window {
-    pub(crate) fn new(id: u32, metrics: Metrics, pane: Pane) -> Window {
+    pub(crate) fn new(id: u32, pane: Pane) -> Window {
         let active = pane.id;
-        let mut w = Window {
+        Window {
             id,
-            metrics,
-            area: metrics.area(),
+            area: Rect::default(),
             panes: vec![pane],
             last_panes: Vec::new(),
             active,
             tree: Node::Leaf(active),
-            dividers: Vec::new(),
             zoomed: false,
             was_zoomed: false,
             fixed_name: None,
-        };
-        w.relayout();
-        w
+        }
     }
 
     pub(crate) fn pos(&self, wp: PaneId) -> Option<usize> {
@@ -114,31 +106,8 @@ impl Window {
         pos.checked_sub(1).map(|i| self.panes[i].id)
     }
 
-    /// Lays the panes out for the window's metrics: the whole area for the
-    /// zoomed pane, else the split tree. Only the current window is laid out,
-    /// as libadwaita allocates only the selected tab.
-    pub(crate) fn relayout(&mut self) {
-        let (m, area) = (self.metrics, self.area);
-        let mut placed = Vec::new();
-        self.dividers.clear();
-        if self.zoomed {
-            placed.push((self.active, area));
-        } else {
-            self.tree.layout(area, &m, &mut placed, &mut self.dividers);
-        }
-        for (wp, rect) in placed {
-            let (cols, rows) = m.grid(rect);
-            let p = self.pane_mut(wp);
-            p.rect = rect;
-            p.cols = cols;
-            p.rows = rows;
-        }
-    }
-
-    /// After every change of the tree: ghostty builds new GtkPaned widgets,
-    /// and `panes` goes back to the tree's order.
+    /// After every change of the tree `panes` goes back to the tree's order.
     fn tree_changed(&mut self) {
-        self.tree.rebuild();
         let mut order = Vec::with_capacity(self.panes.len());
         self.tree.leaves(&mut order);
         self.panes.sort_by_key(|p| order.iter().position(|&wp| wp == p.id));
@@ -173,27 +142,11 @@ impl Window {
         self.tree_changed();
     }
 
-    /// ghostty's resize_split for the active pane, by `amount` logical pixels.
-    pub(crate) fn resize_split(&mut self, horizontal: bool, amount: i32) {
-        let (m, area) = (self.metrics, self.area);
-        let wp = self.active;
-        self.tree.resize(wp, horizontal, amount, area, &m);
+    /// ghostty's resize_split for pane `wp`, by `delta` of the tree's extent.
+    pub(crate) fn resize_split(&mut self, wp: PaneId, horizontal: bool, delta: f64) -> bool {
+        let moved = self.tree.resize(wp, horizontal, delta);
         self.tree_changed();
-    }
-
-    /// What the pointer at `point` (logical, in the pane area) is over. A
-    /// zoomed window still counts as split, as ghostty's `is-split` does.
-    pub(crate) fn hit(&self, point: (f64, f64)) -> Option<Hit> {
-        let split = matches!(self.tree, Node::Split(_));
-        if self.zoomed {
-            return leaf_hit(self.active, self.pane(self.active).rect, point, split);
-        }
-        self.tree.hit(point, split, &|wp| self.pane(wp).rect)
-    }
-
-    /// The divider a press at `point` grabs (no dividers show while zoomed).
-    pub(crate) fn grab(&self, point: (f64, f64)) -> Option<Grab> {
-        if self.zoomed { None } else { self.tree.grab(point) }
+        moved
     }
 
     /// ghostty's moveSplit: `source` leaves its place (its sibling takes it)
@@ -262,8 +215,6 @@ impl Window {
             self.set_active(wp, next_point);
         }
         self.zoomed = true;
-        self.tree_changed();
-        self.relayout();
         true
     }
 
@@ -273,8 +224,6 @@ impl Window {
             return false;
         }
         self.zoomed = false;
-        self.tree_changed();
-        self.relayout();
         true
     }
 
@@ -291,11 +240,6 @@ impl Window {
             return self.zoom(active, next_point);
         }
         false
-    }
-
-    /// window_pane_visible
-    pub(crate) fn visible(&self, wp: PaneId) -> bool {
-        !self.zoomed || wp == self.active
     }
 
     /// window_pane_next_by_number
@@ -337,7 +281,8 @@ impl Window {
     pub(crate) fn find(&self, wp: PaneId, dir: crate::Direction) -> Option<PaneId> {
         use crate::Direction::{Down, Left, Right, Up};
         let p = self.pane(wp).rect;
-        let (d, area) = (self.metrics.divider, self.area);
+        // GtkPaned's separator is one logical pixel.
+        let (d, area) = (1, self.area);
         let across = |n: &Rect| Self::overlaps(n.y, n.y + n.h.saturating_sub(1), p.y, p.y + p.h);
         let along = |n: &Rect| Self::overlaps(n.x, n.x + n.w.saturating_sub(1), p.x, p.x + p.w);
         match dir {
