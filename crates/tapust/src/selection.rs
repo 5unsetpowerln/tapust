@@ -2,7 +2,7 @@
 //! SelectionGesture (drag rules), Screen.selectWord and selectLine, and the
 //! plain formatter it copies with.
 
-use term::{Cell, Terminal, Width};
+use term::{Cell, PromptMark, Semantic, Terminal, Width};
 
 /// A cell: an absolute line and a column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -140,23 +140,57 @@ fn word_between(term: &Terminal, from: Point, to: Point) -> Option<Selection> {
     }
 }
 
-/// Screen.selectLine: the soft-wrapped logical line around `p`, with the
+/// Screen.selectLine: the soft-wrapped logical line around `p`, cut where
+/// the shell's semantic content (prompt, input, output) changes, with the
 /// whitespace at both ends left out when `trim` (none if it is all
 /// whitespace).
 pub fn line(term: &Terminal, p: Point, trim: bool) -> Option<Selection> {
-    let mut first = p.line;
-    while first > term.first_line() && term.line_wrapped(first - 1) {
-        first -= 1;
-    }
-    let mut last = p.line;
-    while term.line_wrapped(last) {
-        if last + 1 >= term.end_line() {
-            return None;
+    let cols = term.cols();
+    let row = |l: u64| term.line(l);
+    let v = row(p.line)?[p.col as usize].semantic();
+    let start = 'start: {
+        let cells = row(p.line)?;
+        if let Some(x) = (0..=p.col).rev().find(|&x| cells[x as usize].semantic() != v) {
+            break 'start Point { line: p.line, col: x + 1 };
         }
-        last += 1;
-    }
-    let mut start = Point { line: first, col: 0 };
-    let mut end = Point { line: last, col: term.cols() - 1 };
+        let mut prev = Point { line: p.line, col: 0 };
+        let mut l = p.line;
+        while l > term.first_line() {
+            l -= 1;
+            if !term.line_wrapped(l) {
+                break 'start Point { line: prev.line, col: 0 };
+            }
+            let cells = row(l)?;
+            for x in (0..cols).rev() {
+                if cells[x as usize].semantic() != v {
+                    break 'start prev;
+                }
+                prev = Point { line: l, col: x };
+            }
+        }
+        Point { line: prev.line, col: 0 }
+    };
+    let end = 'end: {
+        let mut l = p.line;
+        loop {
+            let cells = row(l)?;
+            let first = if l == p.line { p.col } else { 0 };
+            if first == 0 && cells[0].semantic() != v {
+                break 'end Point { line: l - 1, col: cols - 1 };
+            }
+            if let Some(x) = (first..cols).find(|&x| cells[x as usize].semantic() != v) {
+                break 'end Point { line: l, col: x - 1 };
+            }
+            if !term.line_wrapped(l) {
+                break 'end Point { line: l, col: cols - 1 };
+            }
+            l += 1;
+            if l >= term.end_line() {
+                return None;
+            }
+        }
+    };
+    let (mut start, mut end) = (start, end);
     if trim {
         let text = |q: Point| term.line(q.line).and_then(|row| char_at(row[q.col as usize]));
         let solid = |q: Point| text(q).is_some_and(|c| !LINE_WHITESPACE.contains(&c));
@@ -171,6 +205,62 @@ pub fn line(term: &Terminal, p: Point, trim: bool) -> Option<Selection> {
         }
     }
     Some(Selection { start, end, rect: false })
+}
+
+/// ghostty's Screen.promptClickLine: the arrow presses (left, right) that
+/// move a cursor at the shell's input to the input cell `click`, counting
+/// only input cells along soft-wrapped and continued prompt rows.
+pub fn prompt_click_move(term: &Terminal, cursor: Point, click: Point) -> (usize, usize) {
+    let input = |c: Cell| c.semantic() == Semantic::Input;
+    let cursor_on_input = term.line(cursor.line).is_some_and(|row| input(row[cursor.col as usize]));
+    if term.cursor_semantic() != Semantic::Input && !cursor_on_input || cursor == click {
+        return (0, 0);
+    }
+    let mut count = 0;
+    if cursor < click {
+        for l in cursor.line..=click.line {
+            let Some(row) = term.line(l) else { break };
+            let is_cursor_row = l == cursor.line;
+            if !is_cursor_row && term.line_prompt(l) != PromptMark::Continuation {
+                break;
+            }
+            let start = if is_cursor_row { cursor.col as usize + 1 } else { row.iter().position(|&c| input(c)).unwrap_or(row.len()) };
+            for (x, &cell) in row.iter().enumerate().skip(start) {
+                if !input(cell) {
+                    continue;
+                }
+                count += 1;
+                if l == click.line && x == click.col as usize {
+                    return (0, count);
+                }
+            }
+            if !term.line_wrapped(l) {
+                if cursor_on_input {
+                    count += 1;
+                }
+                break;
+            }
+        }
+        return (0, count);
+    }
+    for l in (click.line..=cursor.line).rev() {
+        let Some(row) = term.line(l) else { break };
+        let end = if l == cursor.line { cursor.col as usize } else { row.len() };
+        for x in (0..end).rev() {
+            if !input(row[x]) {
+                continue;
+            }
+            count += 1;
+            if l == click.line && x == click.col as usize {
+                return (count, 0);
+            }
+        }
+        // Keep going up only into the row this one wraps from.
+        if l == term.first_line() || !term.line_wrapped(l - 1) {
+            break;
+        }
+    }
+    (count, 0)
 }
 
 /// Where a drag happened: a cell and the pointer's x in device pixels from
@@ -334,6 +424,18 @@ mod tests {
         let l = line(&t, at(&t, 1, 0), true).unwrap();
         assert_eq!(text(&t, &l), "abcdefg");
         assert!(line(&t, at(&t, 2, 0), true).is_none());
+    }
+
+    #[test]
+    fn lines_stop_at_semantic_boundaries_and_clicks_move_along_input() {
+        let t = term(20, 3, "\x1b]133;A\x07$ \x1b]133;B\x07echo hi");
+        let l = line(&t, at(&t, 0, 4), true).unwrap();
+        assert_eq!(text(&t, &l), "echo hi");
+        // The cursor is after "echo hi"; a click on 'e' is 7 cells left.
+        let cursor = Point { line: t.view_top(), col: 9 };
+        assert_eq!(prompt_click_move(&t, cursor, at(&t, 0, 2)), (7, 0));
+        // Past the end of the input there is nothing to the right to reach.
+        assert_eq!(prompt_click_move(&t, at(&t, 0, 3), at(&t, 0, 5)), (0, 2));
     }
 
     #[test]

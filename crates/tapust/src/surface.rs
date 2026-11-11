@@ -978,12 +978,63 @@ impl Surface {
         if button == mouse::Button::Left && self.has_selection() {
             self.copy_primary();
         }
-        // ghostty opens the hovered link on a left release that did not drag.
+        // ghostty opens the hovered link on a left release that did not drag,
+        // or else moves the cursor to a click at the prompt.
         if button == mouse::Button::Left && !self.gesture.borrow().dragged {
             let link = self.hover.borrow().as_ref().map(|(_, text)| text.clone());
-            if let Some(text) = link {
-                self.open_link(&text);
+            match link {
+                Some(text) => self.open_link(&text),
+                None => self.prompt_click(x, y),
             }
+        }
+    }
+
+    /// ghostty's maybePromptClick (cursor-click-to-move): with the shell's
+    /// click option, the cursor at the prompt, a counted click that did not
+    /// drag or select, at or below the current prompt.
+    fn prompt_click(&self, x: f64, y: f64) {
+        if self.gesture.borrow().count == 0 || self.has_selection() {
+            return;
+        }
+        let Some(shared) = self.draw.borrow().shared.clone() else { return };
+        let term = shared.term.lock();
+        let Some(mode) = term.prompt_click() else { return };
+        if !term.cursor_at_prompt() {
+            return;
+        }
+        let Some(click) = self.drag_point(&term, x, y).map(|p| p.cell) else { return };
+        let screen_top = term.end_line() - u64::from(term.rows());
+        let cursor = Point { line: screen_top + u64::from(term.cursor().y), col: term.cursor().x };
+        let Some(prompt) = (term.first_line()..=cursor.line).rev().find(|&l| term.line_prompt(l) == term::PromptMark::Prompt) else {
+            return;
+        };
+        if click < (Point { line: prompt, col: 0 }) {
+            return;
+        }
+        let mut bytes = Vec::new();
+        match mode {
+            term::PromptClick::Absolute | term::PromptClick::Relative => {
+                let row = match mode {
+                    term::PromptClick::Absolute => click.line - term.view_top() + 1,
+                    _ => click.line - prompt + 1,
+                };
+                bytes.extend_from_slice(format!("\x1b[<0;{};{row}M", click.col + 1).as_bytes());
+            }
+            term::PromptClick::Cl => {
+                let app = term.modes().app_cursor;
+                let (left, right) = selection::prompt_click_move(&term, cursor, click);
+                let (l, r): (&[u8], &[u8]) = if app { (b"\x1bOD", b"\x1bOC") } else { (b"\x1b[D", b"\x1b[C") };
+                for _ in 0..left {
+                    bytes.extend_from_slice(l);
+                }
+                for _ in 0..right {
+                    bytes.extend_from_slice(r);
+                }
+            }
+        }
+        drop(term);
+        if !bytes.is_empty() {
+            shared.write(&bytes);
         }
     }
 
