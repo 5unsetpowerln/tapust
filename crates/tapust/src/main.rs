@@ -8,6 +8,7 @@ mod mouse;
 mod pty;
 mod renderer;
 mod scroll;
+mod selection;
 mod surface;
 mod theme;
 

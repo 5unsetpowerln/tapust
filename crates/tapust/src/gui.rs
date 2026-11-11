@@ -513,6 +513,7 @@ impl App {
             }
         }));
         add("close", Box::new(|app| app.confirm_close_window()));
+        add("copy", Box::new(|app| app.copy()));
         add("paste", Box::new(|app| app.paste()));
         add("reset", Box::new(|app| app.reset()));
         add("clear", Box::new(|app| app.clear()));
@@ -629,6 +630,19 @@ impl App {
                 self.resized(pane, cols, rows, cell);
                 true
             }
+            Event::PastePrimary => {
+                let weak = Rc::downgrade(self);
+                self.window.primary_clipboard().read_text_async(gio::Cancellable::NONE, move |text| {
+                    if let (Some(app), Ok(Some(text))) = (weak.upgrade(), text) {
+                        app.paste_text(&text, false);
+                    }
+                });
+                true
+            }
+            Event::SelectionChanged => {
+                self.sync_copy_action();
+                true
+            }
             Event::BellChanged => {
                 self.queue_reconcile();
                 true
@@ -713,7 +727,11 @@ impl App {
                     input::encode(key, text.as_deref(), app_cursor, &mut bytes);
                     io.shared.write(&bytes);
                     if !bytes.is_empty() {
-                        st.panes[&target].surface.scroll_to_bottom();
+                        // ghostty's selection-clear-on-typing and
+                        // scroll-to-bottom = keystroke.
+                        let surface = &st.panes[&target].surface;
+                        surface.clear_selection();
+                        surface.scroll_to_bottom();
                     }
                 }
                 drop(st);
@@ -1042,6 +1060,7 @@ impl App {
         }
         self.syncing.set(false);
         self.show_overlay();
+        self.sync_copy_action();
         self.queue_geometry();
     }
 
@@ -1282,6 +1301,28 @@ impl App {
         st.panes.get(&st.session.active_pane()).and_then(|p| p.io.as_ref()).map(f)
     }
 
+    fn active_surface(&self) -> Option<Rc<Surface>> {
+        let st = self.state.borrow();
+        st.panes.get(&st.session.active_pane()).map(|p| p.surface.clone())
+    }
+
+    /// ghostty's Copy: the selection to the clipboard, with a toast.
+    fn copy(&self) {
+        if let Some(text) = self.active_surface().and_then(|s| s.selection_text()) {
+            self.window.clipboard().set_text(&text);
+            self.toast("Copied to clipboard");
+        }
+    }
+
+    /// ghostty's syncActions: Copy is enabled while the surface has a
+    /// selection.
+    fn sync_copy_action(&self) {
+        let selected = self.active_surface().is_some_and(|s| s.has_selection());
+        if let Some(action) = self.window.lookup_action("copy").and_then(|a| a.downcast::<gio::SimpleAction>().ok()) {
+            action.set_enabled(selected);
+        }
+    }
+
     fn paste(self: &Rc<Self>) {
         let clipboard = self.window.clipboard();
         let weak = Rc::downgrade(self);
@@ -1360,11 +1401,11 @@ impl App {
     }
 
     fn reset(&self) {
-        // RIS, as ghostty's reset action does.
+        // RIS, as ghostty's reset action does; it also drops the selection.
         self.active_io(|io| io.shared.term.lock().feed(b"\x1bc"));
-        let st = self.state.borrow();
-        if let Some(p) = st.panes.get(&st.session.active_pane()) {
-            p.surface.area.queue_render();
+        if let Some(surface) = self.active_surface() {
+            surface.clear_selection();
+            surface.area.queue_render();
         }
     }
 
@@ -1375,6 +1416,9 @@ impl App {
             io.shared.term.lock().feed(b"\x1b[H\x1b[2J\x1b[3J");
             io.shared.write(b"\x0c");
         });
+        if let Some(surface) = self.active_surface() {
+            surface.clear_selection();
+        }
     }
 }
 

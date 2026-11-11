@@ -2,6 +2,7 @@
 
 use term::{Attrs, Cell, Color, CursorShape, Palette, Rgb, Style, Terminal, Underline, Width};
 
+use crate::selection::Selection;
 use crate::frame::{BOLD, CursorStyle, FrameCell, FrameCursor, Grid, ITALIC, STRIKE, UNDERLINE, WIDE};
 
 fn rgba(c: Rgb) -> [u8; 4] {
@@ -65,7 +66,10 @@ fn frame_cell(cell: Cell, term: &Terminal, palette: &Palette, reverse_video: boo
 /// Copies the terminal's dirty rows (all rows when `full`) into its pane's
 /// grid and clears the terminal's dirty marks. Rows and columns the terminal
 /// does not have yet (it is resized after the grid) are blank.
-pub fn copy_pane(grid: &mut Grid, term: &mut Terminal, full: bool) {
+/// Copies the terminal's dirty viewport rows (all of them when `full`) into
+/// `grid`, drawing the cells of `selection` with ghostty's default selection
+/// colors: the terminal's default foreground and background swapped.
+pub fn copy_pane(grid: &mut Grid, term: &mut Terminal, full: bool, selection: Option<&Selection>) {
     let (rows, cols) = (term.rows().min(grid.rows()), term.cols().min(grid.cols()) as usize);
     let palette = term.palette();
     let reverse_video = term.modes().reverse_video;
@@ -83,6 +87,12 @@ pub fn copy_pane(grid: &mut Grid, term: &mut Terminal, full: bool) {
             *dst = if cell == Cell::EMPTY && !reverse_video { blank } else { frame_cell(cell, term, palette, reverse_video) };
         }
         out[cols..].fill(blank);
+        if let Some((left, right)) = selection.and_then(|s| s.columns(term.view_top() + u64::from(y), cols as u16)) {
+            let (fg, bg) = style_colors(&Style::DEFAULT, palette, false);
+            for cell in &mut out[left as usize..=(right as usize).min(cols - 1)] {
+                (cell.fg, cell.bg) = (bg, fg);
+            }
+        }
     }
     term.clear_dirty();
 }

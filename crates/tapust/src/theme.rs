@@ -64,3 +64,9 @@ pub const TERMIOS_POLL: std::time::Duration = std::time::Duration::from_millis(2
 /// for touchpad (precision) scrolling.
 pub const SCROLL_DISCRETE: f64 = 3.0;
 pub const SCROLL_PRECISION: f64 = 1.0;
+
+/// ghostty's click-repeat-interval on Linux (0 in the config, replaced by
+/// 500ms when the OS reports none).
+pub const CLICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// How often ghostty scrolls while a selection is dragged past the edge.
+pub const SELECTION_SCROLL: std::time::Duration = std::time::Duration::from_millis(15);

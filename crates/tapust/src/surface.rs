@@ -19,6 +19,7 @@ use crate::pty::Shared;
 use crate::renderer::Renderer;
 use crate::scroll::SurfaceBin;
 use crate::mouse;
+use crate::selection::{self, DragPoint, Point, Selection};
 use crate::theme;
 
 /// What a surface tells the application.
@@ -38,6 +39,10 @@ pub enum Event {
     Mapped,
     /// The bell-ringing state changed (the tab title shows it).
     BellChanged,
+    /// The middle button asks to paste the primary selection.
+    PastePrimary,
+    /// The surface's selection appeared or went away (the Copy action).
+    SelectionChanged,
     /// The cell size in device pixels is known or changed (ghostty's
     /// cell_size action).
     CellSize { cell: (u32, u32) },
@@ -52,6 +57,18 @@ enum InKeyEvent {
     No,
     Composing,
     NotComposing,
+}
+
+/// ghostty's SelectionGesture for the left button.
+#[derive(Default)]
+struct Gesture {
+    /// Clicks in the current series (1 cell, 2 word, 3 line).
+    count: u8,
+    last_press: Option<Instant>,
+    /// Where the series started, in device pixels.
+    first_px: (f64, f64),
+    click: Option<DragPoint>,
+    left_down: bool,
 }
 
 /// The drawing state, borrowed only by the GLArea's handlers.
@@ -101,6 +118,16 @@ pub struct Surface {
     precision_scroll: Cell<bool>,
     /// Wheel movement not yet worth a row (ghostty's pending_scroll_y).
     pending_scroll: Cell<f64>,
+    selection: RefCell<Option<Selection>>,
+    gesture: RefCell<Gesture>,
+    /// Mouse buttons held (bit per button number), for motion reports.
+    buttons: Cell<u8>,
+    /// A left click that only focused the surface; its release is ignored.
+    suppress_left_release: Cell<bool>,
+    /// Scrolls while a selection is dragged above or below the surface.
+    autoscroll: RefCell<Option<(glib::SourceId, bool)>>,
+    /// The terminal was on the alternate screen at the last frame.
+    was_alt: Cell<bool>,
     last_blink_reset: Cell<Option<Instant>>,
     font_scale: Cell<f64>,
     cell_idle: Cell<bool>,
@@ -112,6 +139,23 @@ pub struct Surface {
     size: Cell<(u16, u16)>,
     /// The GLArea's size in device pixels.
     pixels: Cell<(i32, i32)>,
+}
+
+fn mods_of(state: gdk::ModifierType) -> mouse::Mods {
+    mouse::Mods {
+        shift: state.contains(gdk::ModifierType::SHIFT_MASK),
+        alt: state.contains(gdk::ModifierType::ALT_MASK),
+        ctrl: state.contains(gdk::ModifierType::CONTROL_MASK),
+    }
+}
+
+fn button_of(number: u32) -> Option<mouse::Button> {
+    match number {
+        1 => Some(mouse::Button::Left),
+        2 => Some(mouse::Button::Middle),
+        3 => Some(mouse::Button::Right),
+        _ => None,
+    }
 }
 
 fn load_fonts(scale: f64) -> Option<Fonts> {
@@ -232,6 +276,12 @@ impl Surface {
             pointer: Cell::new((0.0, 0.0)),
             precision_scroll: Cell::new(false),
             pending_scroll: Cell::new(0.0),
+            selection: RefCell::new(None),
+            gesture: RefCell::new(Gesture::default()),
+            buttons: Cell::new(0),
+            suppress_left_release: Cell::new(false),
+            autoscroll: RefCell::new(None),
+            was_alt: Cell::new(false),
             last_blink_reset: Cell::new(None),
             font_scale: Cell::new(0.0),
             cell_idle: Cell::new(false),
@@ -326,14 +376,19 @@ impl Surface {
             h(Event::Mapped);
         });
 
-        let click = gtk::GestureClick::new();
-        let area = self.area.clone();
+        // ghostty's GestureClick for every button.
+        let click = gtk::GestureClick::builder().button(0).build();
         let weak = Rc::downgrade(self);
-        click.connect_pressed(move |_, _, _, _| {
+        click.connect_pressed(move |g, _, x, y| {
             if let Some(s) = weak.upgrade() {
-                s.set_bell_ringing(false);
+                s.button_pressed(g.current_button(), x, y, g.current_event_state());
             }
-            area.grab_focus();
+        });
+        let weak = Rc::downgrade(self);
+        click.connect_released(move |g, _, x, y| {
+            if let Some(s) = weak.upgrade() {
+                s.button_released(g.current_button(), x, y, g.current_event_state());
+            }
         });
         self.area.add_controller(click);
 
@@ -395,9 +450,10 @@ impl Surface {
         });
         let motion = gtk::EventControllerMotion::new();
         let weak = Rc::downgrade(self);
-        motion.connect_motion(move |_, x, y| {
+        motion.connect_motion(move |m, x, y| {
             if let Some(s) = weak.upgrade() {
                 s.pointer.set((x, y));
+                s.pointer_moved(m.current_event_state());
             }
         });
         self.area.add_controller(motion);
@@ -661,6 +717,247 @@ impl Surface {
     }
 
     /// ghostty's setScrollbar from the terminal's scrollback.
+    fn set_selection(&self, selection: Option<Selection>) {
+        if *self.selection.borrow() == selection {
+            return;
+        }
+        let changed = self.selection.borrow().is_some() != selection.is_some();
+        *self.selection.borrow_mut() = selection;
+        self.draw.borrow_mut().full = true;
+        self.area.queue_render();
+        if changed {
+            (self.handler)(Event::SelectionChanged);
+        }
+    }
+
+    pub fn clear_selection(&self) {
+        self.set_selection(None);
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selection.borrow().is_some()
+    }
+
+    /// The selected text as ghostty copies it.
+    pub fn selection_text(&self) -> Option<String> {
+        let sel = (*self.selection.borrow())?;
+        let shared = self.draw.borrow().shared.clone()?;
+        let text = selection::text(&shared.term.lock(), &sel);
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// ghostty's copy-on-select = primary.
+    fn copy_primary(&self) {
+        if let Some(text) = self.selection_text() {
+            self.area.primary_clipboard().set_text(&text);
+        }
+    }
+
+    /// The cell under the logical point (`x`, `y`), clamped to the grid,
+    /// with x in device pixels from the grid's left edge.
+    fn drag_point(&self, term: &term::Terminal, x: f64, y: f64) -> Option<DragPoint> {
+        let (cw, ch) = self.cell_size()?;
+        let scale = self.font_scale.get();
+        let pad = f64::from(padding(scale));
+        let (px, py) = (x * scale - pad, y * scale - pad);
+        let col = ((px / f64::from(cw)).floor().max(0.0) as u16).min(term.cols() - 1);
+        let row = ((py / f64::from(ch)).floor().max(0.0) as u16).min(term.rows() - 1);
+        Some(DragPoint { cell: Point { line: term.view_top() + u64::from(row), col }, x: px })
+    }
+
+    /// Reports a mouse event to the program if it asked for them; returns
+    /// whether it does.
+    fn report(&self, button: Option<mouse::Button>, action: mouse::Action, mods: mouse::Mods) -> bool {
+        let Some(shared) = self.draw.borrow().shared.clone() else { return false };
+        let term = shared.term.lock();
+        let modes = term.modes();
+        if modes.mouse_mode == term::MouseMode::None {
+            return false;
+        }
+        let (cell, pixels) = self.pointer_cell(&term);
+        drop(term);
+        let mut bytes = Vec::new();
+        mouse::encode(&mut bytes, modes.mouse_mode, modes.mouse_encoding, mouse::Event { button, action, mods, cell, pixels });
+        shared.write(&bytes);
+        true
+    }
+
+    fn reporting(&self) -> bool {
+        self.draw.borrow().shared.as_ref().is_some_and(|s| s.term.lock().modes().mouse_mode != term::MouseMode::None)
+    }
+
+    /// ghostty's mouseButtonCallback for a press.
+    fn button_pressed(self: &Rc<Self>, number: u32, x: f64, y: f64, state: gdk::ModifierType) {
+        self.set_bell_ringing(false);
+        self.pointer.set((x, y));
+        let focused = self.focused.get();
+        self.area.grab_focus();
+        // A left click on an unfocused surface only focuses it.
+        if !focused && number == 1 {
+            self.suppress_left_release.set(true);
+            return;
+        }
+        let Some(button) = button_of(number) else { return };
+        self.buttons.set(self.buttons.get() | 1 << number);
+        let mods = mods_of(state);
+        let Some(shared) = self.draw.borrow().shared.clone() else { return };
+        // shift+click extends the last left gesture after the click interval.
+        if button == mouse::Button::Left && mods.shift {
+            let g = self.gesture.borrow();
+            let extend = g.count > 0
+                && self.has_selection()
+                && g.last_press.is_some_and(|t| t.elapsed() > theme::CLICK_INTERVAL);
+            drop(g);
+            if extend {
+                self.gesture.borrow_mut().left_down = true;
+                self.drag_to(mods);
+                return;
+            }
+        }
+        if !mods.shift && self.reporting() {
+            self.set_selection(None);
+            *self.gesture.borrow_mut() = Gesture::default();
+            self.report(Some(button), mouse::Action::Press, mods);
+            return;
+        }
+        match button {
+            mouse::Button::Left => {
+                let term = shared.term.lock();
+                let Some(point) = self.drag_point(&term, x, y) else { return };
+                let scale = self.font_scale.get();
+                let px = (x * scale, y * scale);
+                let cw = f64::from(self.cell_size().map_or(1, |c| c.0));
+                let mut g = self.gesture.borrow_mut();
+                let repeat = g.last_press.is_some_and(|t| t.elapsed() <= theme::CLICK_INTERVAL)
+                    && (px.0 - g.first_px.0).hypot(px.1 - g.first_px.1) <= cw;
+                g.count = if repeat { (g.count + 1).min(3) } else { 1 };
+                if !repeat {
+                    g.first_px = px;
+                }
+                g.last_press = Some(Instant::now());
+                g.click = Some(point);
+                g.left_down = true;
+                let selection = match g.count {
+                    1 => None,
+                    2 => selection::word(&term, point.cell),
+                    _ => selection::line(&term, point.cell, true),
+                };
+                drop(g);
+                drop(term);
+                self.set_selection(selection);
+            }
+            mouse::Button::Middle => {
+                (self.handler)(Event::PastePrimary);
+            }
+            mouse::Button::Right => {
+                // ghostty selects the word under a right click outside the
+                // selection and copies it to the primary selection.
+                let term = shared.term.lock();
+                let Some(point) = self.drag_point(&term, x, y) else { return };
+                let inside = self.selection.borrow().is_some_and(|s| s.contains(point.cell, term.cols()));
+                if !inside && let Some(word) = selection::word(&term, point.cell) {
+                    drop(term);
+                    self.set_selection(Some(word));
+                    self.copy_primary();
+                }
+            }
+            mouse::Button::Four | mouse::Button::Five => {}
+        }
+    }
+
+    /// ghostty's mouseButtonCallback for a release.
+    fn button_released(self: &Rc<Self>, number: u32, x: f64, y: f64, state: gdk::ModifierType) {
+        self.pointer.set((x, y));
+        self.buttons.set(self.buttons.get() & !(1 << number));
+        if number == 1 && self.suppress_left_release.replace(false) {
+            return;
+        }
+        let Some(button) = button_of(number) else { return };
+        let mods = mods_of(state);
+        if button == mouse::Button::Left {
+            self.gesture.borrow_mut().left_down = false;
+            self.stop_autoscroll();
+        }
+        if !mods.shift && self.report(Some(button), mouse::Action::Release, mods) {
+            return;
+        }
+        if button == mouse::Button::Left && self.has_selection() {
+            self.copy_primary();
+        }
+    }
+
+    /// ghostty's cursorPosCallback: motion reports, or dragging the
+    /// selection with the left button.
+    fn pointer_moved(self: &Rc<Self>, state: gdk::ModifierType) {
+        let mods = mods_of(state);
+        let held = self.buttons.get();
+        if self.reporting() && !(mods.shift && held != 0) {
+            let button = [1, 2, 3].into_iter().find(|n| held & 1 << n != 0).and_then(button_of);
+            self.report(button, mouse::Action::Motion, mods);
+            return;
+        }
+        if self.gesture.borrow().left_down && !self.suppress_left_release.get() {
+            self.drag_to(mods);
+        }
+    }
+
+    /// Selects from the last left click to the pointer by the gesture's unit,
+    /// scrolling while the pointer is above or below the surface.
+    fn drag_to(self: &Rc<Self>, mods: mouse::Mods) {
+        let (x, y) = self.pointer.get();
+        let height = f64::from(self.area.height());
+        if y <= 1.0 {
+            self.start_autoscroll(true, mods);
+        } else if y > height - 1.0 {
+            self.start_autoscroll(false, mods);
+        } else {
+            self.stop_autoscroll();
+        }
+        let Some(shared) = self.draw.borrow().shared.clone() else { return };
+        let term = shared.term.lock();
+        let Some(drag) = self.drag_point(&term, x, y) else { return };
+        let g = self.gesture.borrow();
+        let Some(click) = g.click else { return };
+        let selection = match g.count {
+            1 => {
+                let cw = self.cell_size().map_or(1, |c| c.0);
+                selection::drag_cells(&term, click, drag, mods.ctrl && mods.alt, cw)
+            }
+            2 => selection::drag_words(&term, click.cell, drag.cell),
+            _ => selection::drag_lines(&term, click.cell, drag.cell),
+        };
+        drop(g);
+        drop(term);
+        self.set_selection(selection);
+    }
+
+    /// ghostty's selection scroll: one row every 15ms while dragging past
+    /// the top or the bottom.
+    fn start_autoscroll(self: &Rc<Self>, up: bool, mods: mouse::Mods) {
+        if self.autoscroll.borrow().as_ref().is_some_and(|&(_, u)| u == up) {
+            return;
+        }
+        self.stop_autoscroll();
+        let weak = Rc::downgrade(self);
+        let id = glib::timeout_add_local(theme::SELECTION_SCROLL, move || {
+            let Some(s) = weak.upgrade() else { return glib::ControlFlow::Break };
+            if let Some(shared) = s.draw.borrow().shared.clone() {
+                shared.term.lock().scroll_view(if up { 1 } else { -1 });
+            }
+            s.draw.borrow_mut().full = true;
+            s.sync_scrollbar();
+            s.drag_to(mods);
+            glib::ControlFlow::Continue
+        });
+        *self.autoscroll.borrow_mut() = Some((id, up));
+    }
+
+    fn stop_autoscroll(&self) {
+        if let Some((id, _)) = self.autoscroll.take() {
+            id.remove();
+        }
+    }
+
     /// ghostty's scroll-to-bottom on a keystroke that writes to the PTY.
     pub fn scroll_to_bottom(&self) {
         {
@@ -735,6 +1032,12 @@ impl Surface {
         let mut term = shared.term.lock();
         let modes = term.modes();
         let mut bytes = Vec::new();
+        let reports = modes.mouse_mode != term::MouseMode::None;
+        if reports || (modes.alt_screen && modes.alternate_scroll) {
+            drop(term);
+            self.set_selection(None);
+            term = shared.term.lock();
+        }
         if modes.alt_screen && modes.mouse_mode == term::MouseMode::None && modes.alternate_scroll {
             let seq: &[u8] = match (delta > 0, modes.app_cursor) {
                 (true, true) => b"\x1bOA",
@@ -746,14 +1049,12 @@ impl Surface {
                 bytes.extend_from_slice(seq);
             }
         } else if modes.mouse_mode != term::MouseMode::None {
-            let mods = mouse::Mods {
-                shift: state.contains(gdk::ModifierType::SHIFT_MASK),
-                alt: state.contains(gdk::ModifierType::ALT_MASK),
-                ctrl: state.contains(gdk::ModifierType::CONTROL_MASK),
-            };
+            let mods = mods_of(state);
             let (cell, pixels) = self.pointer_cell(&term);
+            let button = if delta > 0 { mouse::Button::Four } else { mouse::Button::Five };
+            let event = mouse::Event { button: Some(button), action: mouse::Action::Press, mods, cell, pixels };
             for _ in 0..delta.unsigned_abs() {
-                mouse::encode_wheel(&mut bytes, modes.mouse_mode, modes.mouse_encoding, delta > 0, mods, cell, pixels);
+                mouse::encode(&mut bytes, modes.mouse_mode, modes.mouse_encoding, event);
             }
         } else {
             term.scroll_view(delta);
@@ -782,6 +1083,9 @@ impl Surface {
     }
 
     fn set_preedit(&self, text: Option<String>) {
+        if text.is_some() {
+            self.set_selection(None);
+        }
         if *self.preedit.borrow() != text {
             *self.preedit.borrow_mut() = text;
             self.draw.borrow_mut().full = true;
@@ -846,7 +1150,13 @@ impl Surface {
             shared.want_lock.store(true, Ordering::Release);
             let mut term = shared.term.lock();
             shared.want_lock.store(false, Ordering::Release);
-            compose::copy_pane(grid, &mut term, d.full);
+            // ghostty drops the selection when the screen switches.
+            let alt = term.modes().alt_screen;
+            if alt != self.was_alt.replace(alt) && self.selection.borrow_mut().take().is_some() {
+                d.full = true;
+                (self.handler)(Event::SelectionChanged);
+            }
+            compose::copy_pane(grid, &mut term, d.full, self.selection.borrow().as_ref());
             let focused = self.focused.get();
             let preedit = self.preedit.borrow();
             let cursor = if let Some(text) = preedit.as_deref().filter(|t| !t.is_empty()) {
