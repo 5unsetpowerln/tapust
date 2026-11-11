@@ -1520,3 +1520,14 @@ fn alternate_screen_scrolls_move_the_selection_like_ghosttys_pins() {
     let s = t.selection().unwrap();
     assert_eq!((s.start, s.end), (Point { line: top, col: 1 }, Point { line: top + 1, col: 1 }));
 }
+
+#[test]
+fn narrowing_a_wide_char_after_a_full_row_does_not_overflow() {
+    let mut t = Terminal::new(10, 3, 100);
+    // U+4E2D and U+6587 are wide.
+    t.feed("abcdefghij\u{4e2d}\u{6587}\u{4e2d}\u{6587}".as_bytes());
+    t.resize(6, 3);
+    // "ghij" and a wide char fill a row exactly, so the next one starts the
+    // next row.
+    assert_eq!(screen(&t), ["ghij\u{4e2d}", "\u{6587}\u{4e2d}\u{6587}"]);
+}

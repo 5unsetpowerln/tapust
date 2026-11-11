@@ -738,7 +738,8 @@ fn rewrap(lines: &[Line], cols: usize, marks: &[(usize, Mark)]) -> (Vec<NewRow>,
             }
             if col + w > cols {
                 let r = out.last_mut().unwrap();
-                if w == 2 {
+                // A full row has no cell left for the spacer head.
+                if w == 2 && col < cols {
                     r.cells[col] = Cell::new(0, Width::SpacerHead, StyleId::DEFAULT);
                     r.meta.touch(col + 1);
                 }
