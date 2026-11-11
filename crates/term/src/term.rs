@@ -34,7 +34,7 @@ const DEC_SPECIAL: [u32; 32] = [
 ];
 
 #[inline(always)]
-fn char_width(cp: u32) -> u8 {
+pub(crate) fn char_width(cp: u32) -> u8 {
     if cp < 0x7F {
         return if cp >= 0x20 { 1 } else { UNPRINTABLE };
     }

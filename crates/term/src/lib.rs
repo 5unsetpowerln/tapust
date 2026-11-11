@@ -17,6 +17,14 @@ mod tests;
 
 pub use cell::{Attrs, Cell, Color, Style, StyleId, Underline, Width};
 
+/// Columns `c` takes on the grid: 1 or 2, 0 for controls and combining marks.
+pub fn char_width(c: char) -> usize {
+    match term::char_width(c as u32) {
+        w @ (1 | 2) => w as usize,
+        _ => 0,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Rgb {
     pub r: u8,
