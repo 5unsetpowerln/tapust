@@ -1258,19 +1258,76 @@ impl App {
         let weak = Rc::downgrade(self);
         clipboard.read_text_async(gio::Cancellable::NONE, move |text| {
             let (Some(app), Ok(Some(text))) = (weak.upgrade(), text) else { return };
-            app.active_io(|io| {
-                let bracketed = io.shared.term.lock().modes().bracketed_paste;
-                let mut bytes = Vec::new();
-                if bracketed {
-                    bytes.extend_from_slice(b"\x1b[200~");
-                }
-                bytes.extend_from_slice(text.as_bytes());
-                if bracketed {
-                    bytes.extend_from_slice(b"\x1b[201~");
-                }
-                io.shared.write(&bytes);
-            });
+            app.paste_text(&text, false);
         });
+    }
+
+    /// ghostty's completeClipboardPaste: with clipboard-paste-protection, an
+    /// unbracketed paste with a line break (or a bracketed one with the end
+    /// fence) waits for confirmation; the text is then encoded as xterm does
+    /// and the view returns to the bottom.
+    fn paste_text(self: &Rc<Self>, text: &str, allow_unsafe: bool) {
+        let Some(bracketed) = self.active_io(|io| io.shared.term.lock().modes().bracketed_paste) else { return };
+        let unsafe_paste = if bracketed { text.contains("\x1b[201~") } else { text.contains(['\r', '\n']) };
+        if unsafe_paste && !allow_unsafe {
+            self.confirm_paste(text);
+            return;
+        }
+        let bytes = encode_paste(text, bracketed);
+        self.active_io(|io| {
+            let mut term = io.shared.term.lock();
+            let offset = term.view_offset() as isize;
+            term.scroll_view(-offset);
+            drop(term);
+            io.shared.write(&bytes);
+        });
+    }
+
+    /// ghostty's ClipboardConfirmationDialog for an unsafe paste.
+    fn confirm_paste(self: &Rc<Self>, text: &str) {
+        let dialog = adw::AlertDialog::new(
+            Some("Warning: Potentially Unsafe Paste"),
+            Some("Pasting this text into the terminal may be dangerous as it looks like some commands may be executed."),
+        );
+        dialog.add_css_class("clipboard-confirmation-dialog");
+        dialog.add_response("cancel", "Deny");
+        dialog.add_response("ok", "Allow");
+        dialog.set_response_appearance("cancel", adw::ResponseAppearance::Suggested);
+        dialog.set_response_appearance("ok", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+
+        let view = gtk::TextView::builder().cursor_visible(false).editable(false).monospace(true).build();
+        view.buffer().set_text(text);
+        let scroll = gtk::ScrolledWindow::builder().child(&view).build();
+        let stack = gtk::Stack::builder().css_classes(["clipboard-contents"]).width_request(500).height_request(200).build();
+        stack.add_titled(&scroll, Some("part-0"), "text/plain;charset=utf-8");
+        let overlay = gtk::Overlay::builder().css_classes(["osd", "clipboard-overlay"]).child(&stack).build();
+        let parts = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
+        parts.append(&overlay);
+        // The remember switch is hidden for pastes but stays in the list,
+        // where it keeps the parts row from being the last row.
+        let remember = adw::SwitchRow::builder()
+            .title("Remember choice for this split")
+            .subtitle("Reload configuration to show this prompt again")
+            .css_classes(["card"])
+            .visible(false)
+            .build();
+        let list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).build();
+        list.append(&parts);
+        list.append(&remember);
+        dialog.set_extra_child(Some(&list));
+
+        let weak = Rc::downgrade(self);
+        let text = text.to_owned();
+        dialog.connect_response(None, move |_, response| {
+            if let Some(app) = weak.upgrade()
+                && response == "ok"
+            {
+                app.paste_text(&text, true);
+            }
+        });
+        dialog.present(Some(&self.window));
     }
 
     fn reset(&self) {
@@ -1335,6 +1392,25 @@ fn title_dialog_widgets(heading: &str, text: &str) -> (adw::AlertDialog, gtk::En
     (dialog, entry)
 }
 
+/// ghostty's input/paste encode (after xterm): bytes that could inject
+/// commands become spaces, a bracketed paste is fenced, and an unbracketed
+/// one sends line feeds as carriage returns.
+fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    const STRIP: [u8; 16] = [0x00, 0x08, 0x05, 0x04, 0x1B, 0x7F, 0x03, 0x1C, 0x15, 0x1A, 0x11, 0x13, 0x17, 0x16, 0x12, 0x0F];
+    let mut bytes: Vec<u8> = text.bytes().map(|b| if STRIP.contains(&b) { b' ' } else { b }).collect();
+    if bracketed {
+        bytes.splice(0..0, *b"\x1b[200~");
+        bytes.extend_from_slice(b"\x1b[201~");
+    } else {
+        for b in &mut bytes {
+            if *b == b'\n' {
+                *b = b'\r';
+            }
+        }
+    }
+    bytes
+}
+
 /// Runs on the main thread when a pane's I/O thread has news.
 fn wake(pane: PaneId) {
     let app = APP.with(|a| a.borrow().clone());
@@ -1351,4 +1427,15 @@ pub fn css() -> String {
         theme::GHOSTTY_CSS,
         theme::UNFOCUSED_ALPHA
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_paste;
+
+    #[test]
+    fn paste_encoding_follows_ghostty() {
+        assert_eq!(encode_paste("a\nb\x1bc\x03", false), b"a\rb c ");
+        assert_eq!(encode_paste("a\nb", true), b"\x1b[200~a\nb\x1b[201~");
+    }
 }
