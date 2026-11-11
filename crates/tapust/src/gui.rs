@@ -789,6 +789,7 @@ impl App {
         };
         p.surface.output();
         p.surface.area.queue_render();
+        p.surface.sync_scrollbar();
         let surface = p.surface.clone();
         let mut changed = pwd != p.pwd;
         p.pwd = pwd;

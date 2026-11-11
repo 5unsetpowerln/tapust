@@ -17,6 +17,8 @@ use crate::font::Fonts;
 use crate::frame::{Frame, Grid};
 use crate::pty::Shared;
 use crate::renderer::Renderer;
+use crate::scroll::SurfaceBin;
+use crate::mouse;
 use crate::theme;
 
 /// What a surface tells the application.
@@ -91,6 +93,14 @@ pub struct Surface {
     im_commit: RefCell<Option<String>>,
     /// The input method's preedit string, drawn at the cursor.
     preedit: RefCell<Option<String>>,
+    /// ghostty's GhosttySurface: scrollable, so the scrollbar shows the
+    /// scrollback.
+    scroll_bin: SurfaceBin,
+    /// The pointer over the GLArea, in logical pixels.
+    pointer: Cell<(f64, f64)>,
+    precision_scroll: Cell<bool>,
+    /// Wheel movement not yet worth a row (ghostty's pending_scroll_y).
+    pending_scroll: Cell<f64>,
     last_blink_reset: Cell<Option<Instant>>,
     font_scale: Cell<f64>,
     cell_idle: Cell<bool>,
@@ -190,10 +200,11 @@ impl Surface {
             .build();
         overlay.add_overlay(&drop_overlay);
 
+        let scroll_bin = SurfaceBin::new(&overlay);
         let scrolled = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vscrollbar_policy(gtk::PolicyType::Automatic)
-            .child(&overlay)
+            .child(&scroll_bin)
             .build();
         let outer = adw::Bin::builder().child(&adw::Bin::builder().child(&scrolled).build()).build();
 
@@ -217,6 +228,10 @@ impl Surface {
             in_keyevent: Cell::new(InKeyEvent::No),
             im_commit: RefCell::new(None),
             preedit: RefCell::new(None),
+            scroll_bin,
+            pointer: Cell::new((0.0, 0.0)),
+            precision_scroll: Cell::new(false),
+            pending_scroll: Cell::new(0.0),
             last_blink_reset: Cell::new(None),
             font_scale: Cell::new(0.0),
             cell_idle: Cell::new(false),
@@ -371,6 +386,41 @@ impl Surface {
             }
         });
         self.area.add_controller(keys);
+
+        let weak = Rc::downgrade(self);
+        self.scroll_bin.connect_scroll(move |value| {
+            if let Some(s) = weak.upgrade() {
+                s.scroll_to_row(value);
+            }
+        });
+        let motion = gtk::EventControllerMotion::new();
+        let weak = Rc::downgrade(self);
+        motion.connect_motion(move |_, x, y| {
+            if let Some(s) = weak.upgrade() {
+                s.pointer.set((x, y));
+            }
+        });
+        self.area.add_controller(motion);
+        let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        let weak = Rc::downgrade(self);
+        wheel.connect_scroll_begin(move |_| {
+            if let Some(s) = weak.upgrade() {
+                s.precision_scroll.set(true);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        wheel.connect_scroll_end(move |_| {
+            if let Some(s) = weak.upgrade() {
+                s.precision_scroll.set(false);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        wheel.connect_scroll(move |wheel, _, dy| {
+            let Some(s) = weak.upgrade() else { return glib::Propagation::Proceed };
+            s.wheel(dy, wheel.current_event_state());
+            glib::Propagation::Stop
+        });
+        self.area.add_controller(wheel);
 
         let weak = Rc::downgrade(self);
         self.im.connect_preedit_start(move |_| {
@@ -598,6 +648,107 @@ impl Surface {
         } else {
             self.draw.borrow_mut().blink_on = true;
         }
+    }
+
+    /// ghostty's setScrollbar from the terminal's scrollback.
+    pub fn sync_scrollbar(&self) {
+        let (offset, total, len) = {
+            let d = self.draw.borrow();
+            let Some(shared) = d.shared.as_ref() else { return };
+            let term = shared.term.lock();
+            let history = term.history_len();
+            (history - term.view_offset(), history + usize::from(term.rows()), usize::from(term.rows()))
+        };
+        self.scroll_bin.set_scrollbar(offset, total, len);
+    }
+
+    /// ghostty's scroll_to_row from the scrollbar: `value` is the top row.
+    fn scroll_to_row(&self, value: f64) {
+        {
+            let mut d = self.draw.borrow_mut();
+            let Some(shared) = d.shared.clone() else { return };
+            let mut term = shared.term.lock();
+            let history = term.history_len();
+            let row = (value.round().max(0.0) as usize).min(history);
+            let delta = (history - row) as isize - term.view_offset() as isize;
+            if delta == 0 {
+                return;
+            }
+            term.scroll_view(delta);
+            d.full = true;
+        }
+        self.area.queue_render();
+    }
+
+    /// ghostty's scrollCallback for the vertical wheel: rows from the wheel
+    /// (three per detent, scaled; touchpad deltas times ten), sent as cursor
+    /// keys on the alternate screen of a program that wants no mouse, as
+    /// wheel reports to one that does, or else scrolling the viewport.
+    fn wheel(&self, dy: f64, state: gdk::ModifierType) {
+        let (Some(renderer_cell), Some(shared)) = ({
+            let d = self.draw.borrow();
+            (d.renderer.as_ref().map(|r| r.cell_size()), d.shared.clone())
+        }) else {
+            return;
+        };
+        let scale = self.font_scale.get();
+        let precision = self.precision_scroll.get();
+        let multiplier = if precision { 10.0 } else { 1.0 };
+        let yoff = dy * scale * -multiplier;
+        let cell = f64::from(renderer_cell.1);
+        let adjusted = if precision { yoff * theme::SCROLL_PRECISION } else { yoff * cell * theme::SCROLL_DISCRETE };
+        let pending = self.pending_scroll.get() + adjusted;
+        if pending.abs() < cell {
+            self.pending_scroll.set(pending);
+            return;
+        }
+        let amount = pending / cell;
+        self.pending_scroll.set(pending - amount * cell);
+        let delta = amount.trunc() as isize;
+        let mut term = shared.term.lock();
+        let modes = term.modes();
+        let mut bytes = Vec::new();
+        if modes.alt_screen && modes.mouse_mode == term::MouseMode::None && modes.alternate_scroll {
+            let seq: &[u8] = match (delta > 0, modes.app_cursor) {
+                (true, true) => b"\x1bOA",
+                (true, false) => b"\x1b[A",
+                (false, true) => b"\x1bOB",
+                (false, false) => b"\x1b[B",
+            };
+            for _ in 0..delta.unsigned_abs() {
+                bytes.extend_from_slice(seq);
+            }
+        } else if modes.mouse_mode != term::MouseMode::None {
+            let mods = mouse::Mods {
+                shift: state.contains(gdk::ModifierType::SHIFT_MASK),
+                alt: state.contains(gdk::ModifierType::ALT_MASK),
+                ctrl: state.contains(gdk::ModifierType::CONTROL_MASK),
+            };
+            let cell = self.pointer_cell(&term);
+            for _ in 0..delta.unsigned_abs() {
+                mouse::encode_wheel(&mut bytes, modes.mouse_mode, modes.mouse_encoding, delta > 0, mods, cell);
+            }
+        } else {
+            term.scroll_view(delta);
+            drop(term);
+            self.draw.borrow_mut().full = true;
+            self.area.queue_render();
+            self.sync_scrollbar();
+            return;
+        }
+        drop(term);
+        shared.write(&bytes);
+    }
+
+    /// The grid cell under the pointer, clamped to the grid.
+    fn pointer_cell(&self, term: &term::Terminal) -> (u16, u16) {
+        let Some((cw, ch)) = self.cell_size() else { return (0, 0) };
+        let scale = self.font_scale.get();
+        let pad = f64::from(padding(scale));
+        let (x, y) = self.pointer.get();
+        let col = ((x * scale - pad) / f64::from(cw)).floor().max(0.0) as u16;
+        let row = ((y * scale - pad) / f64::from(ch)).floor().max(0.0) as u16;
+        (col.min(term.cols().saturating_sub(1)), row.min(term.rows().saturating_sub(1)))
     }
 
     fn set_preedit(&self, text: Option<String>) {

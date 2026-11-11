@@ -4,8 +4,10 @@ mod frame;
 mod gl;
 mod gui;
 mod input;
+mod mouse;
 mod pty;
 mod renderer;
+mod scroll;
 mod surface;
 mod theme;
 

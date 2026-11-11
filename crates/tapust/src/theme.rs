@@ -59,3 +59,8 @@ pub const OVERVIEW_FOCUS: std::time::Duration = std::time::Duration::from_millis
 
 /// How often ghostty checks the PTY's termios for a password prompt.
 pub const TERMIOS_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// ghostty's mouse-scroll-multiplier: rows per wheel detent, and the factor
+/// for touchpad (precision) scrolling.
+pub const SCROLL_DISCRETE: f64 = 3.0;
+pub const SCROLL_PRECISION: f64 = 1.0;
