@@ -15,6 +15,7 @@ use mux::{Command, ConfirmTarget, Effect, KeyResult, Node, Overlay, PaneId, Rect
 
 use crate::compose;
 use crate::input;
+use crate::notifications;
 use crate::pty::{ChildExit, PaneIo, Pty};
 use crate::surface::{Event, Surface};
 use crate::theme;
@@ -88,6 +89,9 @@ pub struct App {
     /// The last window closed while the tab overview was open: the window
     /// stays (ghostty's tabViewNPages) and the next new tab starts a session.
     session_ended: Cell<bool>,
+    /// When the last desktop notification was shown and its hash (ghostty's
+    /// last_notification_time and last_notification_digest).
+    last_notification: Cell<Option<(Instant, u64)>>,
 }
 
 /// ghostty's SplitTreeSplit: Adw.Bin > Adw.Bin > GtkPaned, keeping the
@@ -270,7 +274,7 @@ pub fn context_menu() -> gio::Menu {
         &section(&[
             ("Copy", "win.copy"),
             ("Paste", "win.paste"),
-            ("Notify on Next Command Finish", "win.notify-on-next-command-finish"),
+            ("Notify on Next Command Finish", "surface.notify-on-next-command-finish"),
         ]),
     );
     menu.append_section(None, &section(&[("Clear", "win.clear"), ("Reset", "win.reset")]));
@@ -422,6 +426,7 @@ impl App {
             overview: overview.clone(),
             overview_focus: RefCell::new(None),
             session_ended: Cell::new(false),
+            last_notification: Cell::new(None),
         });
         APP.with(|a| *a.borrow_mut() = Some(app.clone()));
 
@@ -597,6 +602,14 @@ impl App {
             }
         });
         self.window.add_action(&close_tab);
+        let present = gio::SimpleAction::new("present-surface", Some(glib::VariantTy::UINT64));
+        let weak = Rc::downgrade(self);
+        present.connect_activate(move |_, parameter| {
+            if let (Some(app), Some(id)) = (weak.upgrade(), parameter.and_then(|p| p.get::<u64>())) {
+                app.present_surface(id);
+            }
+        });
+        application.add_action(&present);
         let quit = gio::SimpleAction::new("quit", None);
         let weak = Rc::downgrade(self);
         quit.connect_activate(move |_, _| {
@@ -874,9 +887,9 @@ impl App {
         let Some(p) = st.panes.get_mut(&pane) else { return };
         let Some(io) = &p.io else { return };
         let exit = io.shared.exited.get().copied().filter(|_| !p.child_exited);
-        let (title, pwd, bell) = {
+        let (title, pwd, bell, messages) = {
             let mut term = io.shared.term.lock();
-            (term.title().to_owned(), term.reported_cwd().map(str::to_owned), term.take_bell())
+            (term.title().to_owned(), term.reported_cwd().map(str::to_owned), term.take_bell(), term.take_messages())
         };
         p.child_exited |= exit.is_some();
         p.surface.output();
@@ -894,6 +907,20 @@ impl App {
         drop(st);
         if bell {
             self.ring_bell(pane, &surface);
+        }
+        for message in messages {
+            match message {
+                term::Message::DesktopNotification { title, body } => {
+                    self.desktop_notification(&surface, &title, &body)
+                }
+                term::Message::ProgressReport(report) => surface.set_progress_report(report),
+                term::Message::StartCommand => surface.start_command(),
+                term::Message::StopCommand(_) => {
+                    if surface.stop_command() {
+                        self.ring_bell(pane, &surface);
+                    }
+                }
+            }
         }
         if changed {
             self.queue_reconcile();
@@ -920,6 +947,44 @@ impl App {
         let effects = self.state.borrow_mut().session.pane_exited(pane);
         self.apply(effects);
         self.queue_reconcile();
+    }
+
+    /// ghostty's Surface.showDesktopNotification: across surfaces, at most
+    /// one notification a second and the same one at most every 5 seconds.
+    fn desktop_notification(&self, surface: &Surface, title: &str, body: &str) {
+        let now = Instant::now();
+        let digest = notifications::hash(title, body);
+        if let Some((last, last_digest)) = self.last_notification.get() {
+            let since = now - last;
+            if since < Duration::from_secs(1) || (last_digest == digest && since < Duration::from_secs(5)) {
+                return;
+            }
+        }
+        self.last_notification.set(Some((now, digest)));
+        surface.send_desktop_notification(title, body);
+    }
+
+    /// ghostty's app.present-surface and the window's surfacePresentRequest:
+    /// the notification's surface gets its tab selected, the focus and the
+    /// window raised.
+    fn present_surface(self: &Rc<Self>, id: u64) {
+        if id == 0 {
+            return;
+        }
+        let found = {
+            let st = self.state.borrow();
+            let surface = st.panes.values().find(|p| p.surface.id == id).map(|p| p.surface.clone());
+            surface.and_then(|surface| {
+                let window =
+                    st.session.windows().into_iter().find(|w| w.panes.iter().any(|q| q.pane == surface.pane))?;
+                Some((surface, st.tabs.get(&window.id)?.page.clone()))
+            })
+        };
+        // A pane hidden by a zoomed split is not in the window.
+        let Some((surface, page)) = found.filter(|(s, _)| s.outer.is_ancestor(&self.window)) else { return };
+        self.tab_view.set_selected_page(&page);
+        surface.area.grab_focus();
+        self.window.present();
     }
 
     fn update_names(self: &Rc<Self>) {
@@ -1578,8 +1643,8 @@ impl App {
     }
 
     fn reset(&self) {
-        // RIS, as ghostty's reset action does; it also drops the selection.
-        self.active_io(|io| io.shared.term.lock().feed(b"\x1bc"));
+        // ghostty's reset action: a full reset, which also drops the selection.
+        self.active_io(|io| io.shared.term.lock().full_reset());
         if let Some(surface) = self.active_surface() {
             surface.clear_selection();
             surface.area.queue_render();

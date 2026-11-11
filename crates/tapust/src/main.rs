@@ -6,6 +6,7 @@ mod gui;
 mod input;
 mod links;
 mod mouse;
+mod notifications;
 mod pty;
 mod renderer;
 mod scroll;

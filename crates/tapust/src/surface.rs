@@ -1,8 +1,8 @@
 //! A pane's widgets, as ghostty builds them (surface-scrolled-window.blp and
 //! surface.blp): an Adw.Bin with a GtkScrolledWindow around an Overlay whose
-//! child is the GLArea that draws the terminal, with ghostty's child
-//! exited banner, resize overlay, unfocused-split veil, drag handle and drop
-//! overlay on top.
+//! child is the GLArea that draws the terminal, with ghostty's progress bar,
+//! child exited banner, resize overlay, unfocused-split veil, drag handle
+//! and drop overlay on top.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -21,6 +21,7 @@ use crate::renderer::Renderer;
 use crate::scroll::SurfaceBin;
 use crate::links;
 use crate::mouse;
+use crate::notifications::DesktopNotifications;
 use crate::selection::{self, DragPoint, Point, Selection};
 use crate::theme;
 
@@ -94,6 +95,8 @@ struct Draw {
 
 pub struct Surface {
     pub pane: PaneId,
+    /// ghostty's surface id, the target of a notification's default action.
+    pub id: u64,
     /// The leaf of the split tree (ghostty's SurfaceScrolledWindow).
     pub outer: adw::Bin,
     /// The surface (ghostty's terminal_page overlay), the drop target.
@@ -106,9 +109,17 @@ pub struct Surface {
     resize_bin: adw::Bin,
     url_left: gtk::Label,
     url_right: gtk::Label,
+    progress: gtk::ProgressBar,
+    progress_timer: RefCell<Option<glib::SourceId>>,
     /// ghostty's SurfaceChildExited and its banner.
     child_exited: adw::Bin,
     banner: adw::Banner,
+    notifications: Rc<DesktopNotifications>,
+    /// When the running command started (OSC 133;C), ghostty's command_timer.
+    command_timer: Cell<Option<Instant>>,
+    /// ghostty's surface.notify-on-next-command-finish: its state tells
+    /// whether the next command to finish notifies.
+    notify_next_command: gio::SimpleAction,
     resize_hide: RefCell<Option<glib::SourceId>>,
     resize_idle: Cell<bool>,
     blink_timer: RefCell<Option<glib::SourceId>>,
@@ -189,6 +200,19 @@ impl Drop for Surface {
         if let Some(menu) = self.menu.take() {
             menu.unparent();
         }
+        self.notifications.clear();
+    }
+}
+
+/// ghostty's surface id: random and never 0.
+fn surface_id() -> u64 {
+    loop {
+        let mut id = 0u64;
+        let n = unsafe { libc::getrandom((&mut id as *mut u64).cast(), 8, 0) };
+        assert_eq!(n, 8, "getrandom: {}", std::io::Error::last_os_error());
+        if id != 0 {
+            return id;
+        }
     }
 }
 
@@ -255,6 +279,11 @@ impl Surface {
         page.append(&area);
         let overlay = gtk::Overlay::builder().focusable(false).focus_on_click(false).child(&page).build();
 
+        let progress = theme::styled(
+            gtk::ProgressBar::builder().visible(false).halign(gtk::Align::Fill).valign(gtk::Align::Start).build(),
+            &["osd"],
+        );
+        overlay.add_overlay(&progress);
         // ghostty's SurfaceChildExited: a revealed banner at the bottom,
         // shown once the child exited.
         let banner = adw::Banner::builder()
@@ -335,6 +364,12 @@ impl Surface {
         overlay.add_overlay(&drop_overlay);
 
         let scroll_bin = SurfaceBin::new(&overlay);
+        // ghostty's surface action group, which the context menu targets.
+        let notify_next_command =
+            gio::SimpleAction::new_stateful("notify-on-next-command-finish", None, &false.to_variant());
+        let actions = gio::SimpleActionGroup::new();
+        actions.add_action(&notify_next_command);
+        scroll_bin.insert_action_group("surface", Some(&actions));
         let scrolled = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vscrollbar_policy(gtk::PolicyType::Automatic)
@@ -342,8 +377,10 @@ impl Surface {
             .build();
         let outer = adw::Bin::builder().child(&adw::Bin::builder().child(&scrolled).build()).build();
 
+        let id = surface_id();
         let surface = Rc::new(Surface {
             pane,
+            id,
             outer,
             overlay,
             area,
@@ -354,8 +391,13 @@ impl Surface {
             resize_bin,
             url_left,
             url_right,
+            progress,
+            progress_timer: RefCell::new(None),
             child_exited,
             banner,
+            notifications: DesktopNotifications::new(id),
+            command_timer: Cell::new(None),
+            notify_next_command,
             resize_hide: RefCell::new(None),
             resize_idle: Cell::new(false),
             blink_timer: RefCell::new(None),
@@ -774,7 +816,9 @@ impl Surface {
         }
         self.veil.set_reveal_child(self.split.get() && !focused);
         if focused {
+            // ghostty's updateFocus: focus clears the bell and the notifications.
             self.set_bell_ringing(false);
+            self.notifications.clear();
             // Focus shows the cursor and starts blinking unless it already does.
             if self.blink_timer.borrow().is_none() {
                 self.start_blink();
@@ -1457,6 +1501,56 @@ impl Surface {
         self.bell.get()
     }
 
+    /// ghostty's sendDesktopNotification.
+    pub fn send_desktop_notification(&self, title: &str, body: &str) {
+        self.notifications.send(self.focused.get(), title, body);
+    }
+
+    /// ghostty's setProgressReport with progress-style = true: any report
+    /// but a removal shows the bar until the next one or for 15 seconds.
+    pub fn set_progress_report(self: &Rc<Self>, report: term::ProgressReport) {
+        use term::ProgressState;
+        if let Some(timer) = self.progress_timer.take() {
+            timer.remove();
+        }
+        let bar = &self.progress;
+        let fraction = |progress: u8| f64::from(progress.min(100)) / 100.0;
+        match report.state {
+            ProgressState::Remove => {
+                // A value stops the pulse animation, if there is one.
+                bar.set_fraction(0.0);
+                bar.set_visible(false);
+                return;
+            }
+            ProgressState::Set | ProgressState::Error => {
+                if report.state == ProgressState::Error {
+                    bar.add_css_class("error");
+                } else {
+                    bar.remove_css_class("error");
+                }
+                match report.progress {
+                    Some(progress) => bar.set_fraction(fraction(progress)),
+                    None => bar.pulse(),
+                }
+            }
+            ProgressState::Indeterminate => bar.pulse(),
+            ProgressState::Pause => {
+                if let Some(progress) = report.progress {
+                    bar.set_fraction(fraction(progress));
+                }
+            }
+        }
+        bar.set_visible(true);
+        let weak = Rc::downgrade(self);
+        let timer = glib::timeout_add_local_once(theme::PROGRESS_TIMEOUT, move || {
+            if let Some(s) = weak.upgrade() {
+                s.progress_timer.take();
+                s.set_progress_report(term::ProgressReport { state: ProgressState::Remove, progress: None });
+            }
+        });
+        *self.progress_timer.borrow_mut() = Some(timer);
+    }
+
     /// ghostty's childExited on the GTK surface: the banner tells how the
     /// child ended.
     pub fn show_child_exited(&self, code: u32) {
@@ -1469,6 +1563,22 @@ impl Surface {
         self.child_exited.add_css_class(class);
         self.child_exited.remove_css_class(other);
         self.child_exited.set_visible(true);
+    }
+
+    /// ghostty's start_command message (OSC 133;C).
+    pub fn start_command(&self) {
+        self.command_timer.set(Some(Instant::now()));
+    }
+
+    /// ghostty's stop_command message (OSC 133;D) and commandFinished with
+    /// notify-on-command-finish = never and its action = bell: whether the
+    /// bell rings for the command that just finished.
+    pub fn stop_command(&self) -> bool {
+        let Some(started) = self.command_timer.take() else { return false };
+        // The next command finished, however long it took.
+        let notify = self.notify_next_command.state().and_then(|s| s.get::<bool>()) == Some(true);
+        self.notify_next_command.set_state(&false.to_variant());
+        notify && started.elapsed() > theme::NOTIFY_COMMAND_AFTER
     }
 
     pub fn set_password_input(&self, on: bool) {
