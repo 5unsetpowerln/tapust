@@ -52,3 +52,7 @@ pub const RESIZE_OVERLAY_DELAY: std::time::Duration = std::time::Duration::from_
 /// The window and About icon: the icon theme's generic terminal, since
 /// tapust installs no icon of its own (ghostty uses its bundle id).
 pub const ICON: &str = "utilities-terminal";
+
+/// ghostty refocuses the active surface this long after the tab overview
+/// closes.
+pub const OVERVIEW_FOCUS: std::time::Duration = std::time::Duration::from_millis(500);

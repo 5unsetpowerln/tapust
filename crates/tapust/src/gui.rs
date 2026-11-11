@@ -81,6 +81,11 @@ pub struct App {
     min_size_set: Cell<bool>,
     /// The tab whose context menu is open (ghostty's context_menu_page).
     context_page: RefCell<Option<adw::TabPage>>,
+    overview: adw::TabOverview,
+    overview_focus: RefCell<Option<glib::SourceId>>,
+    /// The last window closed while the tab overview was open: the window
+    /// stays (ghostty's tabViewNPages) and the next new tab starts a session.
+    session_ended: Cell<bool>,
 }
 
 /// ghostty's SplitTreeSplit: Adw.Bin > Adw.Bin > GtkPaned, keeping the
@@ -368,6 +373,9 @@ impl App {
             restore_focus_pending: Cell::new(false),
             min_size_set: Cell::new(false),
             context_page: RefCell::new(None),
+            overview: overview.clone(),
+            overview_focus: RefCell::new(None),
+            session_ended: Cell::new(false),
         });
         APP.with(|a| *a.borrow_mut() = Some(app.clone()));
 
@@ -378,6 +386,7 @@ impl App {
             }
         });
         app.connect_tabs(&overview);
+        app.connect_overview();
         app.add_actions(application);
         app.apply(effects);
         app.reconcile();
@@ -439,9 +448,41 @@ impl App {
         let weak = Rc::downgrade(self);
         overview.connect_create_tab(move |_| {
             let app = weak.upgrade().expect("app");
-            app.command(Command::NewWindow { cwd_of_active: true, after: true });
+            if app.session_ended.replace(false) {
+                let (session, effects) = Session::new();
+                app.state.borrow_mut().session = session;
+                app.apply(effects);
+            } else {
+                app.command(Command::NewWindow { cwd_of_active: true, after: true });
+            }
             app.reconcile();
             app.tab_view.selected_page().expect("new tab")
+        });
+    }
+
+    /// ghostty's tabOverviewOpen: focus can get lost when the overview
+    /// closes (libadwaita#670), so the active surface takes it again after
+    /// the 400ms animation.
+    fn connect_overview(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.overview.connect_open_notify(move |overview| {
+            let Some(app) = weak.upgrade() else { return };
+            if overview.is_open() {
+                return;
+            }
+            if let Some(old) = app.overview_focus.take() {
+                old.remove();
+            }
+            let weak = Rc::downgrade(&app);
+            let id = glib::timeout_add_local_once(theme::OVERVIEW_FOCUS, move || {
+                if let Some(app) = weak.upgrade() {
+                    app.overview_focus.take();
+                    if let Some(area) = app.active_area() {
+                        area.grab_focus();
+                    }
+                }
+            });
+            *app.overview_focus.borrow_mut() = Some(id);
         });
     }
 
@@ -762,7 +803,9 @@ impl App {
                 }
                 Effect::ResizeSplit { pane, horizontal, cells } => self.resize_split(pane, horizontal, cells),
                 Effect::Exit => {
-                    if let Some(app) = self.window.application() {
+                    if self.overview.is_open() {
+                        self.session_ended.set(true);
+                    } else if let Some(app) = self.window.application() {
                         app.quit();
                     }
                 }
