@@ -42,6 +42,8 @@ pub const DRAG_PREVIEW_SCALE: f64 = 0.2;
 pub const GHOSTTY_CSS: &str = include_str!("ghostty.css");
 /// `cursor-style-blink` interval.
 pub const BLINK: std::time::Duration = std::time::Duration::from_millis(600);
+/// ghostty resets the blink on output at most this often.
+pub const BLINK_RESET: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// ghostty's resize overlay: shown 750 ms, not during the first 250 ms.
 pub const RESIZE_OVERLAY: std::time::Duration = std::time::Duration::from_millis(750);

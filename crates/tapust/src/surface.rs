@@ -62,6 +62,8 @@ pub struct Surface {
     resize_bin: adw::Bin,
     resize_hide: RefCell<Option<glib::SourceId>>,
     resize_idle: Cell<bool>,
+    blink_timer: RefCell<Option<glib::SourceId>>,
+    last_blink_reset: Cell<Option<Instant>>,
     font_scale: Cell<f64>,
     cell_idle: Cell<bool>,
     handler: Handler,
@@ -179,6 +181,8 @@ impl Surface {
             resize_bin,
             resize_hide: RefCell::new(None),
             resize_idle: Cell::new(false),
+            blink_timer: RefCell::new(None),
+            last_blink_reset: Cell::new(None),
             font_scale: Cell::new(0.0),
             cell_idle: Cell::new(false),
             handler: handler.clone(),
@@ -424,10 +428,17 @@ impl Surface {
         });
     }
 
-    fn set_focused(&self, focused: bool) {
+    fn set_focused(self: &Rc<Self>, focused: bool) {
         self.focused.set(focused);
         self.veil.set_reveal_child(self.split.get() && !focused);
-        self.draw.borrow_mut().blink_on = true;
+        if focused {
+            // Focus shows the cursor and starts blinking unless it already does.
+            if self.blink_timer.borrow().is_none() {
+                self.start_blink();
+            }
+        } else if let Some(timer) = self.blink_timer.take() {
+            timer.remove();
+        }
         self.area.queue_render();
     }
 
@@ -448,12 +459,38 @@ impl Surface {
     }
 
     /// The cursor blinks while the surface has the focus.
-    pub fn blink(&self) {
-        if self.focused.get() {
-            let mut d = self.draw.borrow_mut();
+    /// ghostty's renderer cursor timer: the blink phase flips every 600ms
+    /// while the surface has focus.
+    fn start_blink(self: &Rc<Self>) {
+        if let Some(old) = self.blink_timer.take() {
+            old.remove();
+        }
+        self.draw.borrow_mut().blink_on = true;
+        self.area.queue_render();
+        let weak = Rc::downgrade(self);
+        let id = glib::timeout_add_local(theme::BLINK, move || {
+            let Some(s) = weak.upgrade() else { return glib::ControlFlow::Break };
+            let mut d = s.draw.borrow_mut();
             d.blink_on = !d.blink_on;
             drop(d);
-            self.area.queue_render();
+            s.area.queue_render();
+            glib::ControlFlow::Continue
+        });
+        *self.blink_timer.borrow_mut() = Some(id);
+    }
+
+    /// ghostty's reset_cursor_blink on PTY output, at most every 500ms: the
+    /// cursor shows again and the blink timer starts over.
+    pub fn output(self: &Rc<Self>) {
+        let now = Instant::now();
+        if self.last_blink_reset.get().is_some_and(|last| now - last <= theme::BLINK_RESET) {
+            return;
+        }
+        self.last_blink_reset.set(Some(now));
+        if self.blink_timer.borrow().is_some() {
+            self.start_blink();
+        } else {
+            self.draw.borrow_mut().blink_on = true;
         }
     }
 
@@ -475,7 +512,7 @@ impl Surface {
             shared.want_lock.store(false, Ordering::Release);
             compose::copy_pane(grid, &mut term, d.full);
             let focused = self.focused.get();
-            if (!focused || d.blink_on)
+            if (!focused || !term.cursor().blinking || d.blink_on)
                 && let Some(cursor) = compose::pane_cursor(&term, 0, focused)
             {
                 d.frame.cursors.push(cursor);

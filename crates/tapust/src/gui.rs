@@ -486,15 +486,6 @@ impl App {
 
     fn start_timers(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
-        glib::timeout_add_local(theme::BLINK, move || {
-            let Some(app) = weak.upgrade() else { return glib::ControlFlow::Break };
-            let surfaces: Vec<Rc<Surface>> = app.state.borrow().panes.values().map(|p| p.surface.clone()).collect();
-            for s in surfaces {
-                s.blink();
-            }
-            glib::ControlFlow::Continue
-        });
-        let weak = Rc::downgrade(self);
         glib::timeout_add_local(NAME_INTERVAL, move || {
             let Some(app) = weak.upgrade() else { return glib::ControlFlow::Break };
             app.update_names();
@@ -653,6 +644,7 @@ impl App {
             return;
         }
         let title = io.shared.term.lock().title().to_owned();
+        p.surface.output();
         p.surface.area.queue_render();
         if title != p.title {
             p.title = title.clone();
