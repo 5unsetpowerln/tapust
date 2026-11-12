@@ -1922,6 +1922,8 @@ fn capability(name: &[u8]) -> Option<Option<&'static str>> {
         b"Ss" => Some("\x1b[%p1%d q"),
         b"Se" => Some("\x1b[0 q"),
         b"Sync" => Some("\x1b[?2026%?%p1%{1}%-%tl%eh%;"),
+        b"Smulx" => Some("\x1b[4:%p1%dm"),
+        b"Setulc" => Some("\x1b[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%dm"),
         _ => return None,
     })
 }

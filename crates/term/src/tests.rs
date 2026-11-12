@@ -599,6 +599,43 @@ fn sgr_colors() {
 }
 
 #[test]
+fn sgr_underline_kinds_and_colors() {
+    let mut t = term(40, 2);
+    let (none, single, double) = (Underline::None, Underline::Single, Underline::Double);
+    let cases: &[(&str, Underline, Color)] = &[
+        ("\x1b[4m", single, Color::Default),
+        ("\x1b[4:0m", none, Color::Default),
+        ("\x1b[4:1m", single, Color::Default),
+        ("\x1b[4:2m", double, Color::Default),
+        ("\x1b[4:3m", Underline::Curly, Color::Default),
+        ("\x1b[4:4m", Underline::Dotted, Color::Default),
+        ("\x1b[4:5m", Underline::Dashed, Color::Default),
+        // ghostty draws a kind it does not know as a single underline.
+        ("\x1b[4:9m", single, Color::Default),
+        ("\x1b[21m", double, Color::Default),
+        ("\x1b[4:3;24m", none, Color::Default),
+        ("\x1b[58;5;99m", none, Color::Indexed(99)),
+        ("\x1b[58;2;1;2;3m", none, Color::Rgb(1, 2, 3)),
+        ("\x1b[58:2::4:5:6m", none, Color::Rgb(4, 5, 6)),
+        ("\x1b[58:2:7:8:9m", none, Color::Rgb(7, 8, 9)),
+        ("\x1b[58:5:42m", none, Color::Indexed(42)),
+        ("\x1b[58;5;99;59m", none, Color::Default),
+        // Parameters after the color still apply, and 24 keeps the color.
+        ("\x1b[58;2;1;2;3;4m", single, Color::Rgb(1, 2, 3)),
+        ("\x1b[4:3;58:2::1:2:3;4:2m", double, Color::Rgb(1, 2, 3)),
+        ("\x1b[4;58:5:9;24m", none, Color::Indexed(9)),
+    ];
+    for (i, (seq, underline, color)) in cases.iter().enumerate() {
+        feed(&mut t, &format!("\x1b[0m{seq}x"));
+        let s = style_at(&t, i as u16, 0);
+        let got = (s.underline, s.underline_color, s.fg, s.bg);
+        assert_eq!(got, (*underline, *color, Color::Default, Color::Default), "{seq:?}");
+    }
+    feed(&mut t, "\x1b[4:3;58;2;1;2;3m\x1b[0mx");
+    assert_eq!(style_at(&t, cases.len() as u16, 0), Style::DEFAULT);
+}
+
+#[test]
 fn packed_pen_round_trips() {
     use crate::style::Pen;
     let colors = [Color::Default, Color::Indexed(0), Color::Indexed(255), Color::Rgb(0, 0, 0), Color::Rgb(255, 128, 1)];
@@ -1542,6 +1579,16 @@ fn xtversion_and_xtgettcap_replies() {
         "\x1bP1+r5463\x1b\\\x1bP1+r436F={}\x1b\\\x1bP1+r5373={}\x1b\\\x1bP0+r7A7A\x1b\\",
         hex("256"),
         hex("\x1b[%p1%d q")
+    );
+    assert_eq!(String::from_utf8(t.take_replies().unwrap()).unwrap(), expected);
+    // The underline kinds and colors.
+    t.feed(format!("\x1bP+q{};{}\x1b\\", hex("Smulx"), hex("Setulc")).as_bytes());
+    let expected = format!(
+        "\x1bP1+r{}={}\x1b\\\x1bP1+r{}={}\x1b\\",
+        hex("Smulx"),
+        hex("\x1b[4:%p1%dm"),
+        hex("Setulc"),
+        hex("\x1b[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%dm")
     );
     assert_eq!(String::from_utf8(t.take_replies().unwrap()).unwrap(), expected);
     // Other DCS strings are still ignored, and printing goes on after ST.
