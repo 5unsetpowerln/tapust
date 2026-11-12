@@ -1,5 +1,6 @@
 mod bindings;
 mod compose;
+mod copy;
 mod font;
 mod frame;
 mod gl;

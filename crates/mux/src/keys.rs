@@ -1,10 +1,12 @@
 //! Key tables and the prefix/repeat state machine, ported from tmux 3.6
 //! `server_client_handle_key` and `server_client_key_callback`
 //! (server-client.c), with the default bindings of `key_bindings_init`
-//! (key-bindings.c) overlaid by tmux-pain-control.
+//! (key-bindings.c) overlaid by tmux-pain-control. A pane in copy mode
+//! takes keys with its mode's table (copy.rs) instead of the root table.
 
 use std::time::{Duration, Instant};
 
+use crate::copy::{self, ModeAction};
 use crate::prompt::PromptKind;
 use crate::{Command, Direction, Key, KeyCode, KeyResult, Session};
 
@@ -18,6 +20,9 @@ pub(crate) enum Table {
     #[default]
     Root,
     Prefix,
+    /// The active pane's mode table (`copy-mode` or `copy-mode-vi`), used
+    /// instead of the root table; never the client's table.
+    Mode,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -51,6 +56,8 @@ pub(crate) enum Action {
     /// `next-window -a` / `previous-window -a`; no window has an alert in
     /// this model, so they fail as tmux does then.
     AlertWindow { next: bool },
+    /// A binding of the copy-mode tables.
+    Mode(ModeAction),
     /// A default binding the model does not implement: the key is consumed.
     Unsupported,
 }
@@ -113,10 +120,10 @@ pub(crate) fn prefix_binding(key: Key) -> Option<Binding> {
             'z' => run(Command::ZoomPane),
             '{' => run(Command::SwapPane { up: true }),
             '}' => run(Command::SwapPane { up: false }),
-            ' ' | '#' | '\'' | '(' | ')' | '.' | '/' | ':' | '=' | '?' | 'C' | 'D' | 'M'
-            | '[' | ']' | 'd' | 'f' | 'i' | 'm' | 'q' | 'r' | 's' | 't' | 'w' | '~' => {
-                bind(false, Unsupported)
-            }
+            '[' => run(Command::CopyMode { page_up: false }),
+            ']' => run(Command::PasteBuffer { bracket: true }),
+            ' ' | '#' | '\'' | '(' | ')' | '.' | '/' | ':' | '=' | '?' | 'C' | 'D' | 'M' | 'd' | 'f' | 'i'
+            | 'm' | 'q' | 'r' | 's' | 't' | 'w' | '~' => bind(false, Unsupported),
             _ => None,
         },
         KeyCode::Char(c) if m.ctrl && !m.meta => match c {
@@ -152,7 +159,7 @@ pub(crate) fn prefix_binding(key: Key) -> Option<Binding> {
             }
         }
         KeyCode::Delete if m == Default::default() => bind(true, Unsupported),
-        KeyCode::PageUp if m == Default::default() => bind(false, Unsupported),
+        KeyCode::PageUp if m == Default::default() => run(Command::CopyMode { page_up: true }),
         _ => None,
     }
 }
@@ -167,11 +174,31 @@ impl Session {
         if self.message.take().is_some() {
             self.generation += 1;
         }
+        let mut effects = Vec::new();
         if self.prompt.is_some() {
-            return KeyResult::Handled(self.op(|s| s.prompt_key(key, now)));
+            let mut goes_on = false;
+            effects = self.op(|s| goes_on = s.prompt_key(key, now));
+            if !goes_on {
+                return KeyResult::Handled(effects);
+            }
         }
+        match self.key_callback(key, now) {
+            KeyResult::Handled(more) => {
+                effects.extend(more);
+                KeyResult::Handled(effects)
+            }
+            // A numeric prompt's answer only sets the mode's prefix.
+            forward => forward,
+        }
+    }
 
-        let mut table = self.keys.table;
+    /// server_client_key_callback
+    fn key_callback(&mut self, key: Key, now: Instant) -> KeyResult {
+        let in_mode = self.modes.contains_key(&self.cur().active);
+        let mut table = match self.keys.table {
+            Table::Root if in_mode => Table::Mode,
+            table => table,
+        };
         let mut first = table;
         loop {
             if is_prefix(key) && table != Table::Prefix {
@@ -180,7 +207,12 @@ impl Session {
             }
             let repeating = self.keys.repeat.is_some();
 
-            let binding = if table == Table::Prefix { prefix_binding(key) } else { None };
+            let binding = match table {
+                Table::Prefix => prefix_binding(key),
+                Table::Mode => copy::binding(key, self.mode_keys)
+                    .map(|action| Binding { repeat: false, action: Action::Mode(action) }),
+                Table::Root => None,
+            };
             if let Some(binding) = binding {
                 if repeating && !binding.repeat {
                     self.keys.table = Table::Root;
@@ -219,22 +251,27 @@ impl Session {
         let result = match action {
             Action::Run(cmd) => self.exec(&cmd),
             Action::RenamePrompt { session: true } => {
-                self.open_prompt(PromptKind::RenameSession);
+                self.open_prompt(PromptKind::RenameSession, now);
                 Ok(())
             }
             Action::RenamePrompt { session: false } => {
                 let window = self.cur().id;
-                self.open_prompt(PromptKind::RenameWindow { window });
+                self.open_prompt(PromptKind::RenameWindow { window }, now);
                 Ok(())
             }
             Action::ConfirmKill { window: true } => {
                 let window = self.cur().id;
-                self.open_prompt(PromptKind::ConfirmKillWindow { window });
+                self.open_prompt(PromptKind::ConfirmKillWindow { window }, now);
                 Ok(())
             }
             Action::ConfirmKill { window: false } => {
                 let pane = self.cur().active;
-                self.open_prompt(PromptKind::ConfirmKillPane { pane });
+                self.open_prompt(PromptKind::ConfirmKillPane { pane }, now);
+                Ok(())
+            }
+            Action::Mode(ModeAction::Send(command)) => self.send_copy(command),
+            Action::Mode(ModeAction::Prompt(kind)) => {
+                self.open_prompt(kind, now);
                 Ok(())
             }
             Action::AlertWindow { next: true } => Err("no next window".to_owned()),

@@ -1,12 +1,13 @@
 //! Session, winlink and command logic, ported from tmux 3.6 `session.c`,
 //! `server-fn.c`, `resize.c`, `spawn.c` and the `cmd-*.c` files.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::keys::KeyState;
 use crate::split::Side;
 use crate::window::{Pane, Window};
-use crate::{format, Command, Direction, Effect, PaneId, Session};
+use crate::{format, paste, Command, CopyCommand, Direction, Effect, ModeKeys, PaneId, Session};
 
 pub(crate) fn new_session() -> (Session, Vec<Effect>) {
     let mut s = Session {
@@ -20,7 +21,11 @@ pub(crate) fn new_session() -> (Session, Vec<Effect>) {
         keys: KeyState::default(),
         prompt: None,
         message: None,
-        history: Vec::new(),
+        history: [Vec::new(), Vec::new()],
+        mode_keys: ModeKeys::Emacs,
+        modes: BTreeMap::new(),
+        searches: BTreeMap::new(),
+        buffers: Default::default(),
         generation: 0,
         dead: false,
         last_active: 0,
@@ -58,6 +63,8 @@ impl Session {
         let mut effects = Vec::new();
         for pane in before.difference(&after) {
             effects.push(Effect::Destroy { pane: *pane });
+            self.modes.remove(pane);
+            self.searches.remove(pane);
         }
         for (pane, parent, inherit_cwd) in spawned {
             if after.contains(&pane) {
@@ -322,6 +329,34 @@ impl Session {
             Command::SendPrefix => {
                 let pane = self.cur().active;
                 self.writes.push(Effect::Write { pane, bytes: vec![0x02] });
+                Ok(())
+            }
+            Command::CopyMode { page_up } => {
+                let pane = self.cur().active;
+                // window_pane_set_mode leaves a pane already in copy mode as it is.
+                if let Entry::Vacant(mode) = self.modes.entry(pane) {
+                    mode.insert(1);
+                    let search = self.searches.get(&pane).cloned();
+                    self.writes.push(Effect::CopyMode { pane, search });
+                }
+                // window_copy_pageup, which neither uses nor resets the prefix.
+                if page_up {
+                    self.writes.push(Effect::CopyCommand { pane, command: CopyCommand::PageUp, count: 1 });
+                }
+                Ok(())
+            }
+            Command::PasteBuffer { bracket } => {
+                let pane = self.cur().active;
+                if let Some(top) = self.buffers.top() {
+                    self.writes.push(Effect::Paste { pane, data: paste::paste_data(&top.data), bracket });
+                }
+                Ok(())
+            }
+            Command::DeleteBuffer => {
+                let Some(name) = self.buffers.top().map(|b| b.name.clone()) else {
+                    return Err("no buffer".to_owned());
+                };
+                self.buffers.free(&name);
                 Ok(())
             }
         }

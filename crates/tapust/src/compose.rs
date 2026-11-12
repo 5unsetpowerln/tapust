@@ -1,6 +1,6 @@
 //! Copies terminal rows into pane grids, resolving styles to colors.
 
-use term::{Attrs, Cell, Color, CursorShape, Palette, Rgb, Selection, Style, StyleId, Terminal, Underline, Width};
+use term::{Attrs, Cell, Color, CursorShape, Palette, Point, Rgb, Selection, Style, StyleId, Terminal, Underline, Width};
 
 use crate::frame::{BOLD, CursorStyle, FrameCell, FrameCursor, Grid, ITALIC, STRIKE, WIDE};
 use crate::links::Link;
@@ -216,7 +216,8 @@ pub fn preedit(grid: &mut Grid, term: &Terminal, text: &str) {
 /// is hidden, unfocused or blinked off.
 pub fn lock_cursor(term: &Terminal, grid: usize) -> Option<FrameCursor> {
     let cursor = term.cursor();
-    (cursor.x < term.cols() && cursor.y < term.rows()).then(|| cursor_at(term, grid, CursorStyle::Lock))
+    let on_screen = cursor.x < term.cols() && cursor.y < term.rows();
+    on_screen.then(|| cursor_at(term, grid, cursor.x, cursor.y, CursorStyle::Lock))
 }
 
 pub fn pane_cursor(term: &Terminal, grid: usize, focused: bool) -> Option<FrameCursor> {
@@ -230,18 +231,35 @@ pub fn pane_cursor(term: &Terminal, grid: usize, focused: bool) -> Option<FrameC
         (true, CursorShape::Underline) => CursorStyle::Underline,
         (true, CursorShape::Bar) => CursorStyle::Bar,
     };
-    Some(cursor_at(term, grid, style))
+    Some(cursor_at(term, grid, cursor.x, cursor.y, style))
 }
 
-fn cursor_at(term: &Terminal, grid: usize, style: CursorStyle) -> FrameCursor {
-    let cursor = term.cursor();
+/// tmux's copy-mode cursor at (`x`, `y`) of the view, drawn as the pane's
+/// block cursor (hollow without the keyboard focus). On a selected cell it
+/// takes the selection's colors inverted, where ghostty's cursor, in the
+/// foreground color, would not show on the selection it moves.
+pub fn copy_cursor(term: &Terminal, grid: usize, x: u16, y: u16, focused: bool) -> Option<FrameCursor> {
+    if x >= term.cols() || y >= term.rows() {
+        return None;
+    }
+    let style = if focused { CursorStyle::Block } else { CursorStyle::Hollow };
+    let mut cursor = cursor_at(term, grid, x, y, style);
+    let cell = Point { line: term.view_top() + u64::from(y), col: x };
+    if term.palette().cursor.is_none() && term.selection().is_some_and(|s| s.contains(cell, term.cols())) {
+        let (fg, bg) = style_colors(&Style::DEFAULT, term.palette(), false);
+        (cursor.color, cursor.text_color) = (bg, fg);
+    }
+    Some(cursor)
+}
+
+fn cursor_at(term: &Terminal, grid: usize, x: u16, y: u16, style: CursorStyle) -> FrameCursor {
     let palette = term.palette();
-    let cell = term.row(cursor.y)[cursor.x as usize];
+    let cell = term.row(y)[x as usize];
     let (fg, bg) = style_colors(term.style(cell.style()), palette, term.modes().reverse_video);
     FrameCursor {
         grid,
-        x: cursor.x,
-        y: cursor.y,
+        x,
+        y,
         style,
         color: palette.cursor.map(rgba).unwrap_or(fg),
         text_color: bg,
@@ -252,7 +270,6 @@ fn cursor_at(term: &Terminal, grid: usize, style: CursorStyle) -> FrameCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use term::Point;
 
     #[test]
     fn search_matches_are_highlighted_under_the_selection() {
@@ -282,6 +299,23 @@ mod tests {
 
     fn new_grid() -> Grid {
         Grid::new(0, (0, 0, 120, 40), (0, 0), (12, 2), [0; 4])
+    }
+
+    #[test]
+    fn the_copy_cursor_shows_on_the_selection() {
+        let mut t = Terminal::new(12, 2, 10);
+        t.feed(b"abc");
+        let palette = t.palette().clone();
+        let (fg, bg) = (rgba(palette.foreground), rgba(palette.background));
+        let cursor = copy_cursor(&t, 0, 1, 0, true).unwrap();
+        assert_eq!((cursor.style, cursor.color, cursor.text_color), (CursorStyle::Block, fg, bg));
+        let top = t.view_top();
+        let (start, end) = (Point { line: top, col: 0 }, Point { line: top, col: 2 });
+        t.set_selection(Some(Selection { start, end, rect: false }));
+        let cursor = copy_cursor(&t, 0, 1, 0, true).unwrap();
+        assert_eq!((cursor.color, cursor.text_color), (bg, fg));
+        assert_eq!(copy_cursor(&t, 0, 1, 0, false).unwrap().style, CursorStyle::Hollow);
+        assert!(copy_cursor(&t, 0, 12, 0, true).is_none());
     }
 
     #[test]

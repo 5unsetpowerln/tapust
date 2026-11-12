@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
-use mux::{Command, ConfirmTarget, Effect, KeyResult, Node, Overlay, PaneId, Rect, Session};
+use mux::{
+    Command, ConfirmTarget, Copied, CopyResult, Effect, InputKind, KeyResult, ModeKeys, Node, Overlay, PaneId, Rect,
+    Session,
+};
 
 use crate::bindings::{self, Binding, Scroll};
 use crate::compose;
@@ -401,7 +404,7 @@ impl App {
         } else {
             adw::ColorScheme::PreferDark
         });
-        let (session, effects) = Session::new();
+        let (session, effects) = new_session();
         let app = Rc::new(App {
             state: RefCell::new(State {
                 session,
@@ -507,7 +510,7 @@ impl App {
         overview.connect_create_tab(move |_| {
             let app = weak.upgrade().expect("app");
             if app.session_ended.replace(false) {
-                let (session, effects) = Session::new();
+                let (session, effects) = new_session();
                 app.state.borrow_mut().session = session;
                 app.apply(effects);
             } else {
@@ -769,6 +772,13 @@ impl App {
                 self.close_pane(pane);
                 true
             }
+            Event::WheelKeys { pane, up, count } => {
+                let code = if up { mux::KeyCode::Up } else { mux::KeyCode::Down };
+                for _ in 0..count {
+                    self.send_key(pane, mux::Key { code, mods: mux::Mods::default() }, None);
+                }
+                true
+            }
         }
     }
 
@@ -873,6 +883,7 @@ impl App {
             Some(io) => {
                 io.shared.term.lock().resize(cols, rows);
                 let _ = io.pty.resize(cols, rows, cell);
+                p.surface.resize_copy_mode(cols, rows);
             }
             None => {
                 let pty = match Pty::spawn(st.command.take(), cols, rows, cell, &p.cwd) {
@@ -1081,6 +1092,28 @@ impl App {
                     }
                 }
                 Effect::ResizeSplit { pane, horizontal, cells } => self.resize_split(pane, horizontal, cells),
+                Effect::CopyMode { pane, search } => {
+                    let (surface, keys) = {
+                        let st = self.state.borrow();
+                        (st.panes.get(&pane).map(|p| p.surface.clone()), st.session.mode_keys())
+                    };
+                    // A pane GTK has not sized yet has no screen to copy.
+                    if !surface.is_some_and(|s| s.enter_copy_mode(keys, search)) {
+                        let result = CopyResult { cancel: true, ..CopyResult::default() };
+                        self.state.borrow_mut().session.copy_result(pane, result);
+                    }
+                }
+                Effect::CopyCommand { pane, command, count } => {
+                    let surface = self.state.borrow().panes.get(&pane).map(|p| p.surface.clone());
+                    let Some(result) = surface.and_then(|s| s.copy_command(&command, count)) else { continue };
+                    // tmux's set-clipboard external: the copy reaches the
+                    // outer terminal's clipboard too.
+                    if let Some(Copied::New(data) | Copied::Append(data)) = &result.copied {
+                        self.set_clipboard(&String::from_utf8_lossy(data));
+                    }
+                    self.state.borrow_mut().session.copy_result(pane, result);
+                }
+                Effect::Paste { pane, data, bracket } => self.paste_buffer(pane, &data, bracket),
                 Effect::Exit => {
                     if self.overview.is_open() {
                         self.session_ended.set(true);
@@ -1344,13 +1377,27 @@ impl App {
     }
 
     /// Shows tmux's prompt or message the way ghostty asks and tells:
-    /// confirmations and the title prompt as dialogs, messages as toasts.
+    /// confirmations and the title and copy-mode prompts as dialogs,
+    /// messages as toasts, and a prompt answered by keys in the active
+    /// pane's copy-mode label.
     fn show_overlay(self: &Rc<Self>) {
         let overlay = self.state.borrow().session.overlay();
         if self.state.borrow().shown == overlay {
             return;
         }
         self.state.borrow_mut().shown = overlay.clone();
+        let keys = match &overlay {
+            Some(Overlay::Keys { prompt, text }) => Some(format!("{prompt}{text}")),
+            _ => None,
+        };
+        let surfaces: Vec<(bool, Rc<Surface>)> = {
+            let st = self.state.borrow();
+            let active = st.session.active_pane();
+            st.panes.iter().map(|(&id, p)| (id == active, p.surface.clone())).collect()
+        };
+        for (active, surface) in surfaces {
+            surface.set_copy_prompt(if active { keys.clone() } else { None });
+        }
         match overlay {
             Some(Overlay::Message(text)) => self.toast(&text),
             Some(Overlay::Confirm { target, .. }) => {
@@ -1367,13 +1414,23 @@ impl App {
                 });
                 dialog.present(Some(&self.window));
             }
-            Some(Overlay::Input { prompt, text, .. }) => {
-                let (heading, text) = if prompt.contains("session") {
-                    ("Rename Session", text)
-                } else {
-                    ("Change Tab Title", self.title_initial(TitleTarget::Tab(self.current_window_id())))
+            Some(Overlay::Input { text, kind, .. }) => {
+                let (dialog, entry) = match kind {
+                    InputKind::RenameSession => title_dialog_widgets("Rename Session", &text),
+                    InputKind::RenameWindow => {
+                        let title = self.title_initial(TitleTarget::Tab(self.current_window_id()));
+                        title_dialog_widgets("Change Tab Title", &title)
+                    }
+                    InputKind::Search { forward, incremental, last } => {
+                        let heading = if forward { "Search Down" } else { "Search Up" };
+                        let (dialog, entry) = prompt_dialog_widgets(heading, &text);
+                        if incremental {
+                            self.connect_incremental(&entry, last);
+                        }
+                        (dialog, entry)
+                    }
+                    InputKind::GotoLine => prompt_dialog_widgets("Go to Line", &text),
                 };
-                let (dialog, entry) = title_dialog_widgets(heading, &text);
                 let weak = Rc::downgrade(self);
                 dialog.connect_response(None, move |_, response| {
                     if let Some(app) = weak.upgrade() {
@@ -1383,8 +1440,48 @@ impl App {
                 });
                 dialog.present(Some(&self.window));
             }
-            None => {}
+            Some(Overlay::Keys { .. }) | None => {}
         }
+    }
+
+    /// An incremental search prompt in a dialog: each change of the text
+    /// searches again from where the search started, and C-s and C-r in it
+    /// go to the next match down or up, or bring back the pane's last
+    /// search (`last`) into an empty prompt, as tmux's prompt does.
+    fn connect_incremental(self: &Rc<Self>, entry: &gtk::Entry, last: String) {
+        let weak = Rc::downgrade(self);
+        entry.connect_changed(move |entry| {
+            if let Some(app) = weak.upgrade() {
+                app.prompt_changed(&entry.text(), '=');
+            }
+        });
+        let keys = gtk::EventControllerKey::builder().propagation_phase(gtk::PropagationPhase::Capture).build();
+        let (weak, target) = (Rc::downgrade(self), entry.clone());
+        keys.connect_key_pressed(move |_, keyval, _, state| {
+            use gdk::ModifierType as M;
+            let held = state & (M::CONTROL_MASK | M::SHIFT_MASK | M::ALT_MASK);
+            let prefix = match keyval {
+                gdk::Key::s if held == M::CONTROL_MASK => '+',
+                gdk::Key::r if held == M::CONTROL_MASK => '-',
+                _ => return glib::Propagation::Proceed,
+            };
+            let Some(app) = weak.upgrade() else { return glib::Propagation::Proceed };
+            let text = target.text();
+            if text.is_empty() {
+                target.set_text(&last);
+                target.set_position(-1);
+            } else {
+                app.prompt_changed(&text, prefix);
+            }
+            glib::Propagation::Stop
+        });
+        entry.add_controller(keys);
+    }
+
+    fn prompt_changed(self: &Rc<Self>, text: &str, prefix: char) {
+        let effects = self.state.borrow_mut().session.prompt_changed(text, prefix, Instant::now());
+        self.apply(effects);
+        self.queue_reconcile();
     }
 
     fn answer(self: &Rc<Self>, reply: Option<&str>) {
@@ -1564,12 +1661,42 @@ impl App {
     }
 
     /// ghostty's copy_to_clipboard: the surface's selection to the
-    /// clipboard, with a toast; returns whether it had one.
+    /// clipboard; returns whether it had one.
     fn copy(&self, surface: &Surface) -> bool {
         let Some(text) = surface.selection_text() else { return false };
-        self.window.clipboard().set_text(&text);
-        self.toast("Copied to clipboard");
+        self.set_clipboard(&text);
         true
+    }
+
+    /// ghostty's clipboard write, for a copy binding or a program's OSC 52,
+    /// with its toast (app-notifications clipboard-copy).
+    fn set_clipboard(&self, text: &str) {
+        self.window.clipboard().set_text(text);
+        self.toast("Copied to clipboard");
+    }
+
+    /// tmux's paste-buffer: the buffer as it is to the pane's PTY, fenced
+    /// when `bracket` (`-p`) and the pane's program asked for bracketed paste.
+    fn paste_buffer(&self, pane: PaneId, data: &[u8], bracket: bool) {
+        let st = self.state.borrow();
+        let Some(p) = st.panes.get(&pane) else { return };
+        // window_pane_exited
+        if p.child_exited {
+            drop(st);
+            self.toast("Target pane has exited");
+            return;
+        }
+        let Some(io) = &p.io else { return };
+        let fenced = bracket && io.shared.term.lock().modes().bracketed_paste;
+        let mut bytes = Vec::with_capacity(data.len() + 12);
+        if fenced {
+            bytes.extend_from_slice(b"\x1b[200~");
+        }
+        bytes.extend_from_slice(data);
+        if fenced {
+            bytes.extend_from_slice(b"\x1b[201~");
+        }
+        io.shared.write(&bytes);
     }
 
     /// ghostty's syncActions: Copy is enabled while the surface has a
@@ -1697,6 +1824,15 @@ enum TitleTarget {
     Surface,
 }
 
+/// A session with tmux's options from the environment: mode-keys follows
+/// $VISUAL or $EDITOR, as tmux's main sets it.
+fn new_session() -> (Session, Vec<Effect>) {
+    let (mut session, effects) = Session::new();
+    let (visual, editor) = (std::env::var_os("VISUAL"), std::env::var_os("EDITOR"));
+    session.set_mode_keys(ModeKeys::from_env(visual.as_deref(), editor.as_deref()));
+    (session, effects)
+}
+
 fn collect_leaves(node: &Node, out: &mut Vec<PaneId>) {
     match node {
         Node::Leaf(p) => out.push(*p),
@@ -1719,7 +1855,15 @@ fn close_dialog(heading: &str, body: &str) -> adw::AlertDialog {
 
 /// ghostty's TitleDialog.
 fn title_dialog_widgets(heading: &str, text: &str) -> (adw::AlertDialog, gtk::Entry) {
-    let dialog = adw::AlertDialog::new(Some(heading), Some("Leave blank to restore the default title."));
+    let (dialog, entry) = prompt_dialog_widgets(heading, text);
+    dialog.set_body("Leave blank to restore the default title.");
+    (dialog, entry)
+}
+
+/// A dialog with an entry for tmux's prompts: ghostty's TitleDialog
+/// without its body.
+fn prompt_dialog_widgets(heading: &str, text: &str) -> (adw::AlertDialog, gtk::Entry) {
+    let dialog = adw::AlertDialog::new(Some(heading), None);
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("ok", "OK");
     dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);

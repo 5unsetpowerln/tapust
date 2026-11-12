@@ -4,14 +4,19 @@
 //! in pixels with a thin divider, instead of tmux's cell grid with borders.
 //!
 //! The model does no I/O. It tells the GUI what to do through [`Effect`]s
-//! (spawn a shell, resize or destroy a pane, write bytes, exit), and the GUI
-//! reads the visible panes and dividers from [`Session::view`].
+//! (spawn a shell, resize or destroy a pane, write bytes, run a copy-mode
+//! command, exit), and the GUI reads the visible panes and dividers from
+//! [`Session::view`]. Copy mode works on the pane's contents, which only
+//! the GUI has: the model keeps its key tables, prompts, repeat counts and
+//! paste buffers, and the GUI reports what each command did.
 
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+mod copy;
 mod format;
 mod keys;
+mod paste;
 mod prompt;
 mod session;
 mod split;
@@ -20,6 +25,7 @@ mod window;
 #[cfg(test)]
 mod tests;
 
+pub use copy::{CopyCommand, ModeKeys, SearchArg};
 pub use split::{f16, Node, Split};
 
 use keys::KeyState;
@@ -28,6 +34,9 @@ use window::Window;
 
 /// Pane identifier (tmux `%N`), never reused within a session.
 pub type PaneId = u32;
+
+/// The `word-separators` option.
+pub const WORD_SEPARATORS: &str = "!\"#$%&'()*+,-./:;<=>?@[\\]^`{|}~";
 
 /// A rectangle in logical pixels (GTK's widget coordinates), relative to the
 /// top-left of a window's split tree.
@@ -104,6 +113,17 @@ pub enum Effect {
     Destroy { pane: PaneId },
     /// Write bytes to the pane's PTY (e.g. `send-prefix`).
     Write { pane: PaneId, bytes: Vec<u8> },
+    /// `copy-mode`: the pane enters copy mode on a frozen copy of its
+    /// screen, with the pane's last search (`search`) to search again.
+    CopyMode { pane: PaneId, search: Option<PaneSearch> },
+    /// `send -X`: a command for the pane in copy mode, repeated `count`
+    /// times where it repeats (the mode's prefix, set by `send -N`). The GUI
+    /// reports what it did with [`Session::copy_result`].
+    CopyCommand { pane: PaneId, command: CopyCommand, count: u32 },
+    /// `paste-buffer`: write `data` to the pane's PTY, between the
+    /// bracketed paste fences when `bracket` (`-p`) and the pane asked for
+    /// bracketed paste.
+    Paste { pane: PaneId, data: Vec<u8>, bracket: bool },
     /// No windows are left; the program should exit.
     Exit,
 }
@@ -122,8 +142,13 @@ pub enum KeyResult {
 pub enum Overlay {
     /// `confirm-before`: answered with `y`; any other key cancels.
     Confirm { prompt: String, target: ConfirmTarget },
-    /// `command-prompt`: the label, the text being edited and the cursor position in characters.
-    Input { prompt: String, text: String, cursor: usize },
+    /// `command-prompt`: the label, the text being edited, the cursor
+    /// position in characters and what the text is for.
+    Input { prompt: String, text: String, cursor: usize, kind: InputKind },
+    /// `command-prompt -1` or `-N`, answered by keys alone: one key, or
+    /// digits up to the next key, which then goes on to the key tables. The
+    /// label and the text typed so far.
+    Keys { prompt: String, text: String },
     /// `display-message` or an error.
     Message(String),
 }
@@ -132,6 +157,45 @@ pub enum Overlay {
 pub enum ConfirmTarget {
     Pane,
     Window,
+}
+
+/// What the text of an input prompt is for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InputKind {
+    RenameWindow,
+    RenameSession,
+    /// A copy-mode search. An incremental one runs on every change, which
+    /// the GUI reports with [`Session::prompt_changed`]; `last` is the
+    /// pane's last search, which C-r and C-s bring back into an empty prompt.
+    Search { forward: bool, incremental: bool, last: String },
+    /// goto-line.
+    GotoLine,
+}
+
+/// A pane's last copy-mode search (tmux's `wp->searchstr` and
+/// `wp->searchregex`), which the next copy mode starts with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaneSearch {
+    pub text: String,
+    pub regex: bool,
+}
+
+/// What a copy-mode command made: a new paste buffer (paste_add), or text
+/// appended to the newest one (append-selection).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Copied {
+    New(Vec<u8>),
+    Append(Vec<u8>),
+}
+
+/// What a copy-mode command did that the model keeps.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CopyResult {
+    /// The pane left copy mode (window_pane_reset_mode).
+    pub cancel: bool,
+    pub copied: Option<Copied>,
+    /// The pane's search, when the command searched.
+    pub search: Option<PaneSearch>,
 }
 
 /// A command of the model, named after the tmux command and flags it
@@ -190,6 +254,14 @@ pub enum Command {
     RenameSession(String),
     /// `send-prefix`.
     SendPrefix,
+    /// `copy-mode`, or `copy-mode -u` (`page_up`): the active pane enters
+    /// copy mode unless it is in it, and with `-u` goes up a page.
+    CopyMode { page_up: bool },
+    /// `paste-buffer`, `-p` when `bracket`: the newest automatic buffer to
+    /// the active pane, line feeds as carriage returns.
+    PasteBuffer { bracket: bool },
+    /// `delete-buffer`: the newest automatic buffer.
+    DeleteBuffer,
 }
 
 /// Result of [`Session::command`].
@@ -243,8 +315,15 @@ pub struct Session {
     keys: KeyState,
     prompt: Option<Prompt>,
     message: Option<(String, Instant)>,
-    /// tmux's command prompt history.
-    history: Vec<String>,
+    /// tmux's prompt histories: commands, then searches.
+    history: [Vec<String>; 2],
+    /// The `mode-keys` option.
+    mode_keys: ModeKeys,
+    /// Panes in copy mode, with the mode's prefix (the count `send -N` set).
+    modes: BTreeMap<PaneId, u32>,
+    /// Each pane's last copy-mode search.
+    searches: BTreeMap<PaneId, PaneSearch>,
+    buffers: paste::Buffers,
     generation: u64,
     /// No windows are left.
     dead: bool,
@@ -325,9 +404,48 @@ impl Session {
         self.curw
     }
 
-    /// Offers a key to the key tables (prefix, repeat, prompts).
+    /// Offers a key to the key tables (prefix, repeat, prompts, copy mode).
     pub fn key(&mut self, key: Key, now: Instant) -> KeyResult {
         self.handle_key(key, now)
+    }
+
+    /// The `mode-keys` option, which tmux sets from $VISUAL or $EDITOR when
+    /// it starts ([`ModeKeys::from_env`]).
+    pub fn set_mode_keys(&mut self, keys: ModeKeys) {
+        self.mode_keys = keys;
+    }
+
+    pub fn mode_keys(&self) -> ModeKeys {
+        self.mode_keys
+    }
+
+    /// Whether the pane is in copy mode.
+    pub fn in_mode(&self, pane: PaneId) -> bool {
+        self.modes.contains_key(&pane)
+    }
+
+    /// The GUI carried out an [`Effect::CopyCommand`]: keeps the paste
+    /// buffer and the search it made, and ends the mode if it was cancelled.
+    pub fn copy_result(&mut self, pane: PaneId, result: CopyResult) {
+        if let Some(search) = result.search {
+            self.searches.insert(pane, search);
+        }
+        match result.copied {
+            Some(Copied::New(data)) => self.buffers.add(data),
+            Some(Copied::Append(data)) => self.buffers.append(data),
+            None => {}
+        }
+        if result.cancel {
+            self.modes.remove(&pane);
+        }
+        self.generation += 1;
+    }
+
+    /// The text of the incremental search prompt the GUI shows changed to
+    /// `text`: its command runs with `prefix` before it, `=` for an edit,
+    /// `+` and `-` for C-s and C-r.
+    pub fn prompt_changed(&mut self, text: &str, prefix: char, now: Instant) -> Vec<Effect> {
+        self.op(|s| s.prompt_incremental(text, prefix, now))
     }
 
     /// When the current timed state (the repeat window of a `-r` binding, or
@@ -411,10 +529,12 @@ impl Session {
         }
         let p = self.prompt.as_ref()?;
         let prompt = format::drawn_text(&self.prompt_text(p));
+        let text = p.buffer.iter().collect();
         Some(match p.kind {
             prompt::PromptKind::ConfirmKillPane { .. } => Overlay::Confirm { prompt, target: ConfirmTarget::Pane },
             prompt::PromptKind::ConfirmKillWindow { .. } => Overlay::Confirm { prompt, target: ConfirmTarget::Window },
-            _ => Overlay::Input { prompt, text: p.buffer.iter().collect(), cursor: p.index },
+            prompt::PromptKind::CopyJump(_) | prompt::PromptKind::CopyRepeat(_) => Overlay::Keys { prompt, text },
+            _ => Overlay::Input { prompt, text, cursor: p.index, kind: p.input_kind() },
         })
     }
 

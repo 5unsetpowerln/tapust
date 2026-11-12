@@ -2,7 +2,8 @@
 //! surface.blp): an Adw.Bin with a GtkScrolledWindow around an Overlay whose
 //! child is the GLArea that draws the terminal, with ghostty's progress bar,
 //! child exited banner, resize overlay, search overlay, unfocused-split veil,
-//! drag handle and drop overlay on top.
+//! drag handle and drop overlay on top. In tmux's copy mode the pane shows
+//! the mode's frozen copy of its screen, and the mouse selects on that copy.
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
@@ -11,11 +12,12 @@ use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib, graphene};
-use mux::{Direction, PaneId};
+use mux::{CopyCommand, CopyResult, Direction, ModeKeys, PaneId, PaneSearch};
 use term::{Point, Selection};
 
 use crate::bindings::{self, Binding, Scroll};
 use crate::compose;
+use crate::copy::CopyMode;
 use crate::font::Fonts;
 use crate::frame::{Frame, Grid};
 use crate::pty::Shared;
@@ -58,6 +60,9 @@ pub enum Event {
     CellSize { cell: (u32, u32) },
     /// The child exited banner's Close button: close without confirmation.
     ChildExitedClose { pane: PaneId },
+    /// The wheel in copy mode, sent as `count` presses of Up (or Down), as
+    /// ghostty's alternate scroll sends them to tmux on its alternate screen.
+    WheelKeys { pane: PaneId, up: bool, count: usize },
 }
 
 pub type Handler = Rc<dyn Fn(Event) -> bool>;
@@ -117,6 +122,12 @@ pub struct Surface {
     url_right: gtk::Label,
     search: search::Overlay,
     found: RefCell<search::Found>,
+    /// tmux's copy mode, drawn instead of the terminal while the pane is in it.
+    copy: RefCell<Option<CopyMode>>,
+    /// The copy mode's position indicator at the top right, or the prompt
+    /// answered by keys that is open (`copy_prompt`).
+    copy_label: gtk::Label,
+    copy_prompt: RefCell<Option<String>>,
     progress: gtk::ProgressBar,
     progress_timer: RefCell<Option<glib::SourceId>>,
     /// ghostty's SurfaceChildExited and its banner.
@@ -346,6 +357,20 @@ impl Surface {
         url_left.add_controller(url_motion);
         overlay.add_overlay(&url_left);
         overlay.add_overlay(&url_right);
+        // tmux's copy-mode-position-format, in a `background` box like the
+        // search overlay's.
+        let copy_label = theme::styled(
+            gtk::Label::builder()
+                .visible(false)
+                .can_focus(false)
+                .can_target(false)
+                .focusable(false)
+                .halign(gtk::Align::End)
+                .valign(gtk::Align::Start)
+                .build(),
+            &["background", "search-overlay"],
+        );
+        overlay.add_overlay(&copy_label);
         let search = search::Overlay::new();
         overlay.add_overlay(&search.bin);
 
@@ -403,6 +428,9 @@ impl Surface {
             url_right,
             search,
             found: RefCell::new(search::Found::default()),
+            copy: RefCell::new(None),
+            copy_label,
+            copy_prompt: RefCell::new(None),
             progress,
             progress_timer: RefCell::new(None),
             child_exited,
@@ -988,17 +1016,96 @@ impl Surface {
         }
     }
 
-    /// Sets the terminal's selection for the user; SelectionChanged tells
-    /// the application when one appeared or went away.
-    fn set_selection(&self, selection: Option<Selection>) {
-        let Some(shared) = self.draw.borrow().shared.clone() else { return };
+    /// Runs `f` on the terminal on screen: the copy mode's frozen copy while
+    /// the pane is in copy mode, else the live terminal.
+    fn shown<R>(&self, f: impl FnOnce(&mut term::Terminal) -> R) -> Option<R> {
+        if let Some(mode) = self.copy.borrow_mut().as_mut() {
+            return Some(f(mode.term_mut()));
+        }
+        let shared = self.draw.borrow().shared.clone()?;
         let mut term = shared.term.lock();
-        let old = term.selection();
+        Some(f(&mut term))
+    }
+
+    pub fn in_copy_mode(&self) -> bool {
+        self.copy.borrow().is_some()
+    }
+
+    /// tmux's copy-mode (window_copy_init): a frozen copy of the screen,
+    /// with the pane's last search. False while the pane has no terminal.
+    pub fn enter_copy_mode(self: &Rc<Self>, keys: ModeKeys, search: Option<PaneSearch>) -> bool {
+        let Some(shared) = self.draw.borrow().shared.clone() else { return false };
+        let snapshot = shared.term.lock().snapshot();
+        *self.copy.borrow_mut() = Some(CopyMode::new(snapshot, keys, search));
+        self.copy_changed();
+        true
+    }
+
+    /// Carries out a copy-mode command (`send -X`), which may end the mode;
+    /// `None` when the pane is not in copy mode.
+    pub fn copy_command(self: &Rc<Self>, command: &CopyCommand, count: u32) -> Option<CopyResult> {
+        let shared = self.draw.borrow().shared.clone()?;
+        let result = {
+            let mut copy = self.copy.borrow_mut();
+            let result = copy.as_mut()?.command(command, count, || shared.term.lock().snapshot());
+            if result.cancel {
+                *copy = None;
+            }
+            result
+        };
+        self.copy_changed();
+        Some(result)
+    }
+
+    /// window_copy_resize, when the pane is in copy mode.
+    pub fn resize_copy_mode(self: &Rc<Self>, cols: u16, rows: u16) {
+        let resized = self.copy.borrow_mut().as_mut().map(|mode| mode.resize(cols, rows)).is_some();
+        if resized {
+            self.copy_changed();
+        }
+    }
+
+    /// Shows a prompt answered by keys (`(jump forward)`, `(repeat) 3`) in
+    /// the copy-mode label while it is open.
+    pub fn set_copy_prompt(self: &Rc<Self>, prompt: Option<String>) {
+        if *self.copy_prompt.borrow() != prompt {
+            *self.copy_prompt.borrow_mut() = prompt;
+            self.copy_changed();
+        }
+    }
+
+    /// The copy mode changed: the label and the pane are drawn again, the
+    /// cursor blink starts over as for the output tmux would draw, and the
+    /// Copy action follows the selection.
+    fn copy_changed(self: &Rc<Self>) {
+        let prompt = self.copy_prompt.borrow().clone();
+        let text = prompt.or_else(|| self.copy.borrow().as_ref().and_then(CopyMode::position));
+        match text {
+            Some(text) => {
+                self.copy_label.set_label(&text);
+                self.copy_label.set_visible(true);
+            }
+            None => self.copy_label.set_visible(false),
+        }
+        self.draw.borrow_mut().full = true;
+        self.output();
+        self.area.queue_render();
+        (self.handler)(Event::SelectionChanged);
+    }
+
+    /// Sets the selection of the terminal on screen for the user;
+    /// SelectionChanged tells the application when one appeared or went away.
+    fn set_selection(&self, selection: Option<Selection>) {
+        let Some(old) = self.shown(|term| {
+            let old = term.selection();
+            term.set_selection(selection);
+            old
+        }) else {
+            return;
+        };
         if old == selection {
             return;
         }
-        term.set_selection(selection);
-        drop(term);
         self.area.queue_render();
         if old.is_some() != selection.is_some() {
             (self.handler)(Event::SelectionChanged);
@@ -1010,22 +1117,19 @@ impl Surface {
     }
 
     pub fn has_selection(&self) -> bool {
-        self.draw.borrow().shared.as_ref().is_some_and(|s| s.term.lock().selection().is_some())
+        self.shown(|term| term.selection().is_some()) == Some(true)
     }
 
     /// The selected text as ghostty copies it.
     pub fn selection_text(&self) -> Option<String> {
-        let shared = self.draw.borrow().shared.clone()?;
-        let term = shared.term.lock();
-        let text = selection::text(&term, &term.selection()?);
+        let text = self.shown(|term| term.selection().map(|s| selection::text(term, &s)))??;
         (!text.is_empty()).then_some(text)
     }
 
     /// ghostty's select_all, copied to the primary selection like a
     /// selection made with the mouse.
     pub fn select_all(&self) {
-        let Some(shared) = self.draw.borrow().shared.clone() else { return };
-        let all = selection::all(&shared.term.lock());
+        let all = self.shown(|term| selection::all(term)).flatten();
         if all.is_some() {
             self.set_selection(all);
             self.copy_primary();
@@ -1054,6 +1158,10 @@ impl Surface {
     /// Reports a mouse event to the program if it asked for them; returns
     /// whether it does.
     fn report(&self, button: Option<mouse::Button>, action: mouse::Action, mods: mouse::Mods) -> bool {
+        // tmux keeps the mouse from the program of a pane in copy mode.
+        if self.in_copy_mode() {
+            return false;
+        }
         let Some(shared) = self.draw.borrow().shared.clone() else { return false };
         let term = shared.term.lock();
         let modes = term.modes();
@@ -1069,7 +1177,7 @@ impl Surface {
     }
 
     fn reporting(&self) -> bool {
-        self.draw.borrow().shared.as_ref().is_some_and(|s| s.term.lock().modes().mouse_mode != term::MouseMode::None)
+        self.shown(|term| term.modes().mouse_mode != term::MouseMode::None) == Some(true)
     }
 
     /// ghostty's mouseButtonCallback for a press.
@@ -1086,7 +1194,9 @@ impl Surface {
         let Some(button) = button_of(number) else { return };
         self.buttons.set(self.buttons.get() | 1 << number);
         let mods = mods_of(state);
-        let Some(shared) = self.draw.borrow().shared.clone() else { return };
+        if self.draw.borrow().shared.is_none() {
+            return;
+        }
         // shift+click extends the last left gesture after the click interval.
         if button == mouse::Button::Left && mods.shift {
             let g = self.gesture.borrow();
@@ -1108,32 +1218,35 @@ impl Surface {
         }
         match button {
             mouse::Button::Left => {
-                let term = shared.term.lock();
-                let Some(point) = self.drag_point(&term, x, y) else { return };
                 let scale = self.font_scale.get();
                 let px = (x * scale, y * scale);
                 let cw = f64::from(self.cell_size().map_or(1, |c| c.0));
-                let mut g = self.gesture.borrow_mut();
-                let repeat = g.last_press.is_some_and(|t| t.elapsed() <= theme::CLICK_INTERVAL)
-                    && (px.0 - g.first_px.0).hypot(px.1 - g.first_px.1) <= cw;
-                g.count = if repeat { (g.count + 1).min(3) } else { 1 };
-                if !repeat {
-                    g.first_px = px;
-                }
-                g.last_press = Some(Instant::now());
-                g.click = Some(point);
-                g.left_down = true;
-                g.dragged = false;
-                g.output = g.count == 3 && mods.ctrl;
-                let selection = match g.count {
-                    1 => None,
-                    // A double click on a URL selects all of it.
-                    2 => links::url_at(&term, point.cell).map(|(sel, _)| sel).or_else(|| selection::word(&term, point.cell)),
-                    _ if g.output => selection::output(&term, point.cell),
-                    _ => selection::line(&term, point.cell, true),
+                let Some(Some(selection)) = self.shown(|term| {
+                    let point = self.drag_point(term, x, y)?;
+                    let mut g = self.gesture.borrow_mut();
+                    let repeat = g.last_press.is_some_and(|t| t.elapsed() <= theme::CLICK_INTERVAL)
+                        && (px.0 - g.first_px.0).hypot(px.1 - g.first_px.1) <= cw;
+                    g.count = if repeat { (g.count + 1).min(3) } else { 1 };
+                    if !repeat {
+                        g.first_px = px;
+                    }
+                    g.last_press = Some(Instant::now());
+                    g.click = Some(point);
+                    g.left_down = true;
+                    g.dragged = false;
+                    g.output = g.count == 3 && mods.ctrl;
+                    Some(match g.count {
+                        1 => None,
+                        // A double click on a URL selects all of it.
+                        2 => links::url_at(term, point.cell)
+                            .map(|(sel, _)| sel)
+                            .or_else(|| selection::word(term, point.cell)),
+                        _ if g.output => selection::output(term, point.cell),
+                        _ => selection::line(term, point.cell, true),
+                    })
+                }) else {
+                    return;
                 };
-                drop(g);
-                drop(term);
                 self.set_selection(selection);
             }
             mouse::Button::Middle => {
@@ -1142,12 +1255,15 @@ impl Surface {
             mouse::Button::Right => {
                 // ghostty selects the word under a right click outside the
                 // selection and copies it to the primary selection.
-                let term = shared.term.lock();
-                let Some(point) = self.drag_point(&term, x, y) else { return };
-                let inside = term.selection().is_some_and(|s| s.contains(point.cell, term.cols()));
                 let hovered = self.hover.borrow().as_ref().map(|link| link.cells);
-                if !inside && let Some(word) = hovered.or_else(|| selection::word(&term, point.cell)) {
-                    drop(term);
+                let Some(Some(word)) = self.shown(|term| {
+                    let point = self.drag_point(term, x, y)?;
+                    let inside = term.selection().is_some_and(|s| s.contains(point.cell, term.cols()));
+                    Some(if inside { None } else { hovered.or_else(|| selection::word(term, point.cell)) })
+                }) else {
+                    return;
+                };
+                if let Some(word) = word {
                     self.set_selection(Some(word));
                     self.copy_primary();
                 }
@@ -1191,7 +1307,7 @@ impl Surface {
     /// click option, the cursor at the prompt, a counted click that did not
     /// drag or select, at or below the current prompt.
     fn prompt_click(&self, x: f64, y: f64) {
-        if self.gesture.borrow().count == 0 || self.has_selection() {
+        if self.gesture.borrow().count == 0 || self.has_selection() || self.in_copy_mode() {
             return;
         }
         let Some(shared) = self.draw.borrow().shared.clone() else { return };
@@ -1265,22 +1381,22 @@ impl Surface {
         } else {
             self.stop_autoscroll();
         }
-        let Some(shared) = self.draw.borrow().shared.clone() else { return };
-        let term = shared.term.lock();
-        let Some(drag) = self.drag_point(&term, x, y) else { return };
-        let g = self.gesture.borrow();
-        let Some(click) = g.click else { return };
-        let selection = match g.count {
-            1 => {
-                let cw = self.cell_size().map_or(1, |c| c.0);
-                selection::drag_cells(&term, click, drag, mods.ctrl && mods.alt, cw)
-            }
-            2 => selection::drag_words(&term, click.cell, drag.cell),
-            _ if g.output => selection::drag_output(&term, click.cell, drag.cell),
-            _ => selection::drag_lines(&term, click.cell, drag.cell),
+        let Some(Some(selection)) = self.shown(|term| {
+            let drag = self.drag_point(term, x, y)?;
+            let g = self.gesture.borrow();
+            let click = g.click?;
+            Some(match g.count {
+                1 => {
+                    let cw = self.cell_size().map_or(1, |c| c.0);
+                    selection::drag_cells(term, click, drag, mods.ctrl && mods.alt, cw)
+                }
+                2 => selection::drag_words(term, click.cell, drag.cell),
+                _ if g.output => selection::drag_output(term, click.cell, drag.cell),
+                _ => selection::drag_lines(term, click.cell, drag.cell),
+            })
+        }) else {
+            return;
         };
-        drop(g);
-        drop(term);
         if selection.is_some() {
             self.gesture.borrow_mut().dragged = true;
         }
@@ -1297,7 +1413,10 @@ impl Surface {
         let weak = Rc::downgrade(self);
         let id = glib::timeout_add_local(theme::SELECTION_SCROLL, move || {
             let Some(s) = weak.upgrade() else { return glib::ControlFlow::Break };
-            if let Some(shared) = s.draw.borrow().shared.clone() {
+            // The copy mode's view moves only with its cursor.
+            if let Some(shared) = s.draw.borrow().shared.clone()
+                && !s.in_copy_mode()
+            {
                 shared.term.lock().scroll_view(if up { 1 } else { -1 });
             }
             s.draw.borrow_mut().full = true;
@@ -1341,11 +1460,12 @@ impl Surface {
         let wanted = m.ctrl && !m.alt && (!m.shift || reporting);
         let link = wanted
             .then(|| {
-                let shared = self.draw.borrow().shared.clone()?;
-                let term = shared.term.lock();
-                let (x, y) = self.pointer.get();
-                let point = self.drag_point(&term, x, y)?;
-                links::link_at(&term, point.cell)
+                self.shown(|term| {
+                    let (x, y) = self.pointer.get();
+                    let point = self.drag_point(term, x, y)?;
+                    links::link_at(term, point.cell)
+                })
+                .flatten()
             })
             .flatten();
         if *self.hover.borrow() == link {
@@ -1398,10 +1518,10 @@ impl Surface {
     /// reports the mouse), overridden by modifiers (keyToMouseShape):
     /// shift shows text, and the rectangle-select chord a crosshair.
     pub fn update_cursor(&self) {
-        let Some(shared) = self.draw.borrow().shared.clone() else { return };
-        let (shape, reporting) = {
-            let term = shared.term.lock();
-            (term.mouse_shape(), term.modes().mouse_mode != term::MouseMode::None)
+        let Some((shape, reporting)) =
+            self.shown(|term| (term.mouse_shape(), term.modes().mouse_mode != term::MouseMode::None))
+        else {
+            return;
         };
         let m = self.mods.get();
         let rectangle = m.ctrl && m.alt;
@@ -1585,6 +1705,10 @@ impl Surface {
         let amount = pending / cell;
         self.pending_scroll.set(pending - amount * cell);
         let delta = amount.trunc() as isize;
+        if self.in_copy_mode() {
+            (self.handler)(Event::WheelKeys { pane: self.pane, up: delta > 0, count: delta.unsigned_abs() });
+            return;
+        }
         let mut term = shared.term.lock();
         let modes = term.modes();
         let mut bytes = Vec::new();
@@ -1819,7 +1943,24 @@ impl Surface {
         let Some(renderer) = d.renderer.as_mut() else { return };
         let Some(grid) = d.frame.grids.first_mut() else { return };
         d.frame.cursors.clear();
-        if let Some(shared) = &d.shared {
+        let focused = self.focused.get();
+        if let Some(shared) = &d.shared
+            && let Some(mode) = self.copy.borrow_mut().as_mut()
+        {
+            // The I/O thread wakes the application again once this is clear.
+            shared.dirty.store(false, std::sync::atomic::Ordering::Release);
+            let (marks, current) = mode.marks();
+            let (x, y) = mode.cursor();
+            let term = mode.term_mut();
+            let selection = term.selection();
+            compose::copy_pane(grid, term, d.full, &marks, current, selection.as_ref());
+            if let Some(link) = self.hover.borrow().as_ref() {
+                compose::underline(grid, term, link);
+            }
+            if !focused || d.blink_on {
+                d.frame.cursors.extend(compose::copy_cursor(term, 0, x, y, focused));
+            }
+        } else if let Some(shared) = &d.shared {
             use std::sync::atomic::Ordering;
             shared.dirty.store(false, Ordering::Release);
             shared.want_lock.store(true, Ordering::Release);
@@ -1831,7 +1972,6 @@ impl Surface {
             if let Some(link) = self.hover.borrow().as_ref() {
                 compose::underline(grid, &term, link);
             }
-            let focused = self.focused.get();
             let preedit = self.preedit.borrow();
             let cursor = if let Some(text) = preedit.as_deref().filter(|t| !t.is_empty()) {
                 // ghostty draws the preedit over the cursor's row and no cursor.

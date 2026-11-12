@@ -123,7 +123,7 @@ fn meta(code: KeyCode) -> Key {
 fn overlay_text(s: &Session) -> String {
     match s.overlay() {
         Some(Overlay::Confirm { prompt, .. }) => prompt,
-        Some(Overlay::Input { prompt, text, .. }) => prompt + &text,
+        Some(Overlay::Input { prompt, text, .. } | Overlay::Keys { prompt, text }) => prompt + &text,
         Some(Overlay::Message(text)) => text,
         None => String::new(),
     }
@@ -365,7 +365,7 @@ fn unbound_key_after_prefix_is_swallowed() {
 fn unimplemented_default_binding_is_consumed() {
     let t = Instant::now();
     let mut s = new_session();
-    for k in [ch('d'), ch('['), ch('?'), ch(' '), meta(KeyCode::Char('1')), key(KeyCode::PageUp)] {
+    for k in [ch('d'), ch('#'), ch('='), ch('?'), ch(' '), meta(KeyCode::Char('1'))] {
         s.key(ctrl('b'), t);
         assert_eq!(s.key(k, t), KeyResult::Handled(vec![]), "{k:?}");
     }
@@ -500,7 +500,14 @@ fn rename_window_editing() {
     s.set_auto_name(0, "bash");
     s.key(ctrl('b'), t);
     s.key(ch(','), t);
-    let input = |text: &str, cursor| Some(Overlay::Input { prompt: "(rename-window) ".to_owned(), text: text.to_owned(), cursor });
+    let input = |text: &str, cursor| {
+        Some(Overlay::Input {
+            prompt: "(rename-window) ".to_owned(),
+            text: text.to_owned(),
+            cursor,
+            kind: InputKind::RenameWindow,
+        })
+    };
     assert_eq!(s.overlay(), input("bash", 4));
     s.key(key(KeyCode::Backspace), t);
     s.key(key(KeyCode::Home), t);
@@ -697,4 +704,254 @@ fn kill_window_by_id_leaves_the_current_window() {
     let ids: Vec<u32> = s.windows().iter().map(|w| w.id).collect();
     assert_eq!(ids, vec![0, 2]);
     assert_eq!(s.windows().iter().find(|w| w.active).map(|w| w.id), Some(2));
+}
+
+// --- Copy mode and paste buffers -------------------------------------------------
+
+fn handled(result: KeyResult) -> Vec<Effect> {
+    match result {
+        KeyResult::Handled(effects) => effects,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn copy(command: CopyCommand, count: u32) -> Vec<Effect> {
+    vec![Effect::CopyCommand { pane: 0, command, count }]
+}
+
+/// A session whose pane 0 is in copy mode with `keys`.
+fn in_copy_mode(keys: ModeKeys) -> Session {
+    let t = Instant::now();
+    let mut s = new_session();
+    s.set_mode_keys(keys);
+    s.key(ctrl('b'), t);
+    assert_eq!(handled(s.key(ch('['), t)), vec![Effect::CopyMode { pane: 0, search: None }]);
+    assert!(s.in_mode(0));
+    s
+}
+
+#[test]
+fn mode_keys_follow_visual_then_editor() {
+    use std::ffi::OsStr;
+    let keys = |visual: Option<&str>, editor: Option<&str>| {
+        ModeKeys::from_env(visual.map(OsStr::new), editor.map(OsStr::new))
+    };
+    assert_eq!(keys(None, None), ModeKeys::Emacs);
+    assert_eq!(keys(Some("vim"), None), ModeKeys::Vi);
+    assert_eq!(keys(None, Some("/usr/bin/nvim")), ModeKeys::Vi);
+    assert_eq!(keys(None, Some("emacs -nw")), ModeKeys::Emacs);
+    // $VISUAL wins whenever it is set, even empty.
+    assert_eq!(keys(Some("nano"), Some("vi")), ModeKeys::Emacs);
+    assert_eq!(keys(Some(""), Some("vi")), ModeKeys::Emacs);
+    // Only the part after the last slash counts.
+    assert_eq!(keys(None, Some("/opt/vi/nano")), ModeKeys::Emacs);
+}
+
+#[test]
+fn copy_mode_takes_keys_with_its_table() {
+    let t = Instant::now();
+    let mut s = in_copy_mode(ModeKeys::Vi);
+    assert_eq!(handled(s.key(ch('k'), t)), copy(CopyCommand::CursorUp, 1));
+    assert_eq!(handled(s.key(ch(' '), t)), copy(CopyCommand::BeginSelection, 1));
+    assert_eq!(handled(s.key(key(KeyCode::Enter), t)), copy(CopyCommand::CopyPipeAndCancel, 1));
+    // C-[ is Escape and C-m Enter, as tmux reads them.
+    assert_eq!(handled(s.key(ctrl('['), t)), copy(CopyCommand::ClearSelection, 1));
+    assert_eq!(handled(s.key(ctrl('m'), t)), copy(CopyCommand::CopyPipeAndCancel, 1));
+    assert_eq!(handled(s.key(ch('*'), t)), copy(CopyCommand::SearchForward(SearchArg::CursorWord), 1));
+    // Keys the table does not bind are swallowed.
+    assert_eq!(handled(s.key(ch('Y'), t)), vec![]);
+    // The prefix table still comes first.
+    s.key(ctrl('b'), t);
+    let effects = handled(s.key(ch('c'), t));
+    assert!(matches!(effects[0], Effect::Spawn { pane: 1, .. }));
+    // The new pane is not in copy mode, so its keys go to it.
+    assert_eq!(s.key(ch('k'), t), KeyResult::Forward(1));
+    s.key(ctrl('b'), t);
+    s.key(ch('p'), t);
+    assert_eq!(handled(s.key(ch('j'), t)), copy(CopyCommand::CursorDown, 1));
+}
+
+#[test]
+fn emacs_table_and_entering_twice() {
+    let t = Instant::now();
+    let mut s = in_copy_mode(ModeKeys::Emacs);
+    assert_eq!(handled(s.key(ctrl('p'), t)), copy(CopyCommand::CursorUp, 1));
+    assert_eq!(handled(s.key(ctrl(' '), t)), copy(CopyCommand::BeginSelection, 1));
+    assert_eq!(handled(s.key(meta(KeyCode::Char('w')), t)), copy(CopyCommand::CopyPipeAndCancel, 1));
+    let ctrl_meta = Key { code: KeyCode::Char('f'), mods: Mods { ctrl: true, meta: true, shift: false } };
+    assert_eq!(handled(s.key(ctrl_meta, t)), copy(CopyCommand::NextMatchingBracket, 1));
+    assert_eq!(handled(s.key(key(KeyCode::Escape), t)), copy(CopyCommand::Cancel, 1));
+    // copy-mode -u on a pane already in copy mode only goes up a page.
+    s.key(ctrl('b'), t);
+    assert_eq!(handled(s.key(key(KeyCode::PageUp), t)), copy(CopyCommand::PageUp, 1));
+    s.copy_result(0, CopyResult { cancel: true, ..CopyResult::default() });
+    assert!(!s.in_mode(0));
+    assert_eq!(s.key(ctrl('p'), t), KeyResult::Forward(0));
+    s.key(ctrl('b'), t);
+    assert_eq!(
+        handled(s.key(key(KeyCode::PageUp), t)),
+        vec![
+            Effect::CopyMode { pane: 0, search: None },
+            Effect::CopyCommand { pane: 0, command: CopyCommand::PageUp, count: 1 }
+        ]
+    );
+}
+
+#[test]
+fn repeat_counts_come_from_a_numeric_prompt() {
+    let t = Instant::now();
+    let mut s = in_copy_mode(ModeKeys::Vi);
+    assert_eq!(handled(s.key(ch('1'), t)), vec![]);
+    s.key(ch('2'), t);
+    assert_eq!(s.overlay(), Some(Overlay::Keys { prompt: "(repeat) ".to_owned(), text: "12".to_owned() }));
+    // The key that ends the prompt goes on to the table with the count.
+    assert_eq!(handled(s.key(ch('j'), t)), copy(CopyCommand::CursorDown, 12));
+    assert_eq!(s.overlay(), None);
+    assert_eq!(handled(s.key(ch('j'), t)), copy(CopyCommand::CursorDown, 1));
+    let mut s = in_copy_mode(ModeKeys::Emacs);
+    s.key(meta(KeyCode::Char('3')), t);
+    assert_eq!(handled(s.key(ctrl('n'), t)), copy(CopyCommand::CursorDown, 3));
+    s.key(meta(KeyCode::Char('9')), t);
+    for _ in 0..10 {
+        s.key(ch('9'), t);
+    }
+    s.key(ctrl('n'), t);
+    assert_eq!(overlay_text(&s), "Repeat count too large");
+}
+
+#[test]
+fn jumps_take_the_next_key() {
+    let t = Instant::now();
+    let mut s = in_copy_mode(ModeKeys::Vi);
+    s.key(ch('3'), t);
+    assert_eq!(handled(s.key(ch('t'), t)), vec![]);
+    assert_eq!(s.overlay(), Some(Overlay::Keys { prompt: "(jump to forward) ".to_owned(), text: String::new() }));
+    assert_eq!(handled(s.key(ch('x'), t)), copy(CopyCommand::JumpToForward("x".to_owned()), 3));
+    assert_eq!(handled(s.key(ch(';'), t)), copy(CopyCommand::JumpAgain, 1));
+}
+
+#[test]
+fn search_and_goto_prompts_send_their_text() {
+    let t = Instant::now();
+    let mut s = in_copy_mode(ModeKeys::Vi);
+    s.key(ch('/'), t);
+    let kind = InputKind::Search { forward: true, incremental: false, last: String::new() };
+    assert_eq!(
+        s.overlay(),
+        Some(Overlay::Input { prompt: "(search down) ".to_owned(), text: String::new(), cursor: 0, kind })
+    );
+    assert_eq!(s.answer(Some("foo"), t), copy(CopyCommand::SearchForward(SearchArg::Text("foo".to_owned())), 1));
+    s.key(ch('?'), t);
+    s.key(ch('a'), t);
+    let up = CopyCommand::SearchBackward(SearchArg::Text("a".to_owned()));
+    assert_eq!(handled(s.key(key(KeyCode::Enter), t)), copy(up, 1));
+    s.key(ch(':'), t);
+    assert!(matches!(s.overlay(), Some(Overlay::Input { kind: InputKind::GotoLine, .. })));
+    assert_eq!(s.answer(Some("40"), t), copy(CopyCommand::GotoLine("40".to_owned()), 1));
+    // The pane left copy mode before the answer came.
+    s.key(ch(':'), t);
+    s.copy_result(0, CopyResult { cancel: true, ..CopyResult::default() });
+    assert_eq!(s.answer(Some("1"), t), vec![]);
+    assert_eq!(overlay_text(&s), "Not in a mode");
+}
+
+#[test]
+fn incremental_search_runs_on_every_change() {
+    let t = Instant::now();
+    let mut s = in_copy_mode(ModeKeys::Emacs);
+    let inc = |text: &str| copy(CopyCommand::SearchForwardIncremental(text.to_owned()), 1);
+    assert_eq!(handled(s.key(ctrl('s'), t)), inc("="));
+    assert_eq!(handled(s.key(ch('a'), t)), inc("=a"));
+    assert_eq!(handled(s.key(ctrl('s'), t)), inc("+a"));
+    assert_eq!(
+        handled(s.key(ctrl('r'), t)),
+        copy(CopyCommand::SearchForwardIncremental("-a".to_owned()), 1)
+    );
+    assert_eq!(handled(s.key(key(KeyCode::Left), t)), vec![]);
+    assert_eq!(s.prompt_changed("ab", '=', t), inc("=ab"));
+    // Accepting or cancelling runs nothing more.
+    assert_eq!(handled(s.key(key(KeyCode::Enter), t)), vec![]);
+    let search = PaneSearch { text: "foo".to_owned(), regex: false };
+    s.copy_result(0, CopyResult { search: Some(search), ..CopyResult::default() });
+    // C-s in an empty prompt brings the pane's last search back.
+    s.key(ctrl('r'), t);
+    let kind = InputKind::Search { forward: false, incremental: true, last: "foo".to_owned() };
+    assert!(matches!(s.overlay(), Some(Overlay::Input { kind: k, .. }) if k == kind));
+    assert_eq!(
+        handled(s.key(ctrl('s'), t)),
+        copy(CopyCommand::SearchBackwardIncremental("=foo".to_owned()), 1)
+    );
+    assert_eq!(handled(s.key(key(KeyCode::Escape), t)), vec![]);
+    assert_eq!(s.overlay(), None);
+}
+
+#[test]
+fn the_next_copy_mode_starts_with_the_panes_search() {
+    let t = Instant::now();
+    let mut s = in_copy_mode(ModeKeys::Vi);
+    let search = PaneSearch { text: "x.*y".to_owned(), regex: true };
+    s.copy_result(0, CopyResult { cancel: true, copied: None, search: Some(search.clone()) });
+    s.key(ctrl('b'), t);
+    assert_eq!(handled(s.key(ch('['), t)), vec![Effect::CopyMode { pane: 0, search: Some(search) }]);
+}
+
+#[test]
+fn copies_fill_buffers_up_to_the_limit() {
+    let t = Instant::now();
+    let mut s = new_session();
+    for i in 0..paste::BUFFER_LIMIT + 2 {
+        let copied = Some(Copied::New(format!("{i}").into_bytes()));
+        s.copy_result(0, CopyResult { copied, ..CopyResult::default() });
+    }
+    let names = s.buffers.names();
+    assert_eq!(names.len(), paste::BUFFER_LIMIT);
+    assert_eq!((names[0], names[names.len() - 1]), ("buffer2", "buffer51"));
+    // Empty copies make no buffer.
+    s.copy_result(0, CopyResult { copied: Some(Copied::New(Vec::new())), ..CopyResult::default() });
+    assert_eq!(s.buffers.names().len(), paste::BUFFER_LIMIT);
+    s.key(ctrl('b'), t);
+    assert_eq!(handled(s.key(ch(']'), t)), vec![Effect::Paste { pane: 0, data: b"51".to_vec(), bracket: true }]);
+    ok(&mut s, Command::DeleteBuffer);
+    s.key(ctrl('b'), t);
+    assert_eq!(handled(s.key(ch(']'), t)), vec![Effect::Paste { pane: 0, data: b"50".to_vec(), bracket: true }]);
+}
+
+#[test]
+fn paste_buffer_sends_line_feeds_as_carriage_returns() {
+    let mut s = new_session();
+    assert_eq!(ok(&mut s, Command::PasteBuffer { bracket: true }), vec![]);
+    assert_eq!(run(&mut s, Command::DeleteBuffer).error.as_deref(), Some("no buffer"));
+    s.copy_result(0, CopyResult { copied: Some(Copied::New(b"a\nb\n\nc".to_vec())), ..CopyResult::default() });
+    assert_eq!(
+        ok(&mut s, Command::PasteBuffer { bracket: false }),
+        vec![Effect::Paste { pane: 0, data: b"a\rb\r\rc".to_vec(), bracket: false }]
+    );
+}
+
+#[test]
+fn append_selection_names_the_newest_buffer() {
+    let mut s = new_session();
+    s.copy_result(0, CopyResult { copied: Some(Copied::Append(b"one".to_vec())), ..CopyResult::default() });
+    s.copy_result(0, CopyResult { copied: Some(Copied::New(b"two".to_vec())), ..CopyResult::default() });
+    s.copy_result(0, CopyResult { copied: Some(Copied::Append(b"+".to_vec())), ..CopyResult::default() });
+    // paste_set keeps buffer1's name but makes it a named buffer, which
+    // paste-buffer and delete-buffer pass over.
+    assert_eq!(s.buffers.names(), ["buffer0", "buffer1"]);
+    assert_eq!(
+        ok(&mut s, Command::PasteBuffer { bracket: false }),
+        vec![Effect::Paste { pane: 0, data: b"one".to_vec(), bracket: false }]
+    );
+    ok(&mut s, Command::DeleteBuffer);
+    assert_eq!(s.buffers.names(), ["buffer1"]);
+    assert_eq!(run(&mut s, Command::DeleteBuffer).error.as_deref(), Some("no buffer"));
+}
+
+#[test]
+fn a_pane_that_exits_leaves_copy_mode() {
+    let t = Instant::now();
+    let mut s = in_copy_mode(ModeKeys::Vi);
+    s.key(ctrl('b'), t);
+    s.key(ch('%'), t);
+    s.pane_exited(0);
+    assert!(!s.in_mode(0));
 }
