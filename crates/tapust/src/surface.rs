@@ -270,6 +270,12 @@ fn padding(scale: f64) -> u32 {
     (theme::PADDING_POINTS * 96.0 / 72.0 * scale).floor() as u32
 }
 
+/// The grid `width` x `height` device pixels hold inside the padding.
+fn fit(width: u32, height: u32, (cw, ch): (u32, u32), pad: u32) -> (u16, u16) {
+    let fit = |size: u32, cell: u32| (size.saturating_sub(2 * pad) / cell.max(1)).max(1) as u16;
+    (fit(width, cw), fit(height, ch))
+}
+
 /// ghostty's calcDropDirection: the side nearest to (`x`, `y`), compared
 /// left, right, top, bottom.
 fn drop_direction(x: f64, y: f64, w: f64, h: f64) -> Direction {
@@ -860,8 +866,7 @@ impl Surface {
             renderer.resize(width as u32, height as u32);
             let (cw, ch) = renderer.cell_size();
             let pad = padding(scale);
-            let fit = |size: i32, cell: u32| ((size.max(0) as u32).saturating_sub(2 * pad) / cell.max(1)).max(1) as u16;
-            let (cols, rows) = (fit(width, cw), fit(height, ch));
+            let (cols, rows) = fit(width.max(0) as u32, height.max(0) as u32, (cw, ch), pad);
             let bg = d.term_bg;
             d.frame.grids = vec![Grid::new(self.pane, (0, 0, width as u32, height as u32), (pad as i32, pad as i32), (cols, rows), bg)];
             d.full = true;
@@ -1935,6 +1940,14 @@ impl Surface {
 
     pub fn cell_size(&self) -> Option<(u32, u32)> {
         self.draw.borrow().renderer.as_ref().map(|r| r.cell_size())
+    }
+
+    /// The grid this surface's fonts would fit in `width` x `height`
+    /// logical pixels.
+    pub fn grid(&self, width: u32, height: u32) -> Option<(u16, u16)> {
+        let scale = self.font_scale.get();
+        let device = |px: u32| (f64::from(px) * scale).round() as u32;
+        Some(fit(device(width), device(height), self.cell_size()?, padding(scale)))
     }
 
     fn render(&self) {

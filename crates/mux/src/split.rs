@@ -1,9 +1,12 @@
 //! The panes of a window as ghostty's split tree (`src/datastruct/split_tree.zig`):
 //! a binary tree whose splits keep an orientation and a ratio. GTK lays the
-//! tree out (nested GtkPaned widgets); this module only keeps the data model
-//! and its arithmetic, which ghostty does in `f16`.
+//! tree out (nested GtkPaned widgets); this module keeps the data model, its
+//! arithmetic, which ghostty does in `f16`, and GtkPaned's division of the
+//! space, on which tmux's layouts are computed (layout.rs).
 
-use crate::PaneId;
+use std::collections::BTreeMap;
+
+use crate::{PaneId, Rect};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Node {
@@ -55,13 +58,28 @@ pub fn f16(x: f64) -> f64 {
     rounded.copysign(x)
 }
 
+impl Split {
+    /// GtkPaned's allocation of `r` with a one-unit divider: the first child
+    /// gets round((size - 1) * ratio), the second the rest.
+    pub fn divide(&self, r: Rect) -> (Rect, Rect) {
+        let total = if self.horizontal { r.w } else { r.h };
+        let pos = (f64::from(total.saturating_sub(1)) * self.ratio).round() as u32;
+        let rest = total.saturating_sub(pos + 1);
+        if self.horizontal {
+            (Rect { w: pos, ..r }, Rect { x: r.x + pos + 1, w: rest, ..r })
+        } else {
+            (Rect { h: pos, ..r }, Rect { y: r.y + pos + 1, h: rest, ..r })
+        }
+    }
+}
+
 impl Node {
     fn split_node(horizontal: bool, first: Node, second: Node) -> Node {
         Node::Split(Box::new(Split { horizontal, ratio: 0.5, first, second }))
     }
 
     /// The panes in order: left to right and top to bottom within every split.
-    pub(crate) fn leaves(&self, out: &mut Vec<PaneId>) {
+    pub fn leaves(&self, out: &mut Vec<PaneId>) {
         match self {
             Node::Leaf(wp) => out.push(*wp),
             Node::Split(s) => {
@@ -110,42 +128,62 @@ impl Node {
         true
     }
 
-    /// Exchanges the places of panes `a` and `b`.
-    pub(crate) fn swap(&mut self, a: PaneId, b: PaneId) {
+    /// Puts pane `map(p)` in the place of every pane `p`, keeping the shape
+    /// and ratios.
+    pub(crate) fn relabel(&mut self, map: &impl Fn(PaneId) -> PaneId) {
         match self {
-            Node::Leaf(p) if *p == a => *p = b,
-            Node::Leaf(p) if *p == b => *p = a,
-            Node::Leaf(_) => {}
+            Node::Leaf(p) => *p = map(*p),
             Node::Split(s) => {
-                s.first.swap(a, b);
-                s.second.swap(a, b);
+                s.first.relabel(map);
+                s.second.relabel(map);
             }
         }
     }
 
-    /// Puts `order` into the leaves, keeping the shape and ratios.
-    pub(crate) fn assign(&mut self, order: &mut impl Iterator<Item = PaneId>) {
+    /// The panes' rectangles when every split divides `r` as GtkPaned does.
+    pub fn layout(&self, r: Rect, out: &mut Vec<(PaneId, Rect)>) {
         match self {
-            Node::Leaf(p) => *p = order.next().expect("one pane per leaf"),
+            Node::Leaf(p) => out.push((*p, r)),
             Node::Split(s) => {
-                s.first.assign(order);
-                s.second.assign(order);
+                let (a, b) = s.divide(r);
+                s.first.layout(a, out);
+                s.second.layout(b, out);
             }
         }
     }
 
-    /// ghostty's equalize: every split's ratio becomes its first child's
-    /// share of the leaves counted along the split.
-    pub(crate) fn equalize(&mut self) {
-        if let Node::Split(s) = self {
-            let first = s.first.weight(s.horizontal);
-            let second = s.second.weight(s.horizontal);
-            s.ratio = f16(f64::from(first) / f64::from(first + second));
-            s.first.equalize();
-            s.second.equalize();
+    /// Sets the ratios so that [`Node::layout`] gives the panes `rects`
+    /// (which divide the node's rectangle as its splits do). Of the ratios
+    /// that give them, a split takes the one nearest to its first child's
+    /// share of the cells along it, leaving out the dividers between the
+    /// panes of a row or column: in pixels a divider is far thinner than a
+    /// cell, and the dividers' space then goes to all the panes alike. With
+    /// `keep`, a ratio that already gives the rectangles stays. Returns the
+    /// node's rectangle.
+    pub(crate) fn fit(&mut self, rects: &BTreeMap<PaneId, Rect>, keep: bool) -> Rect {
+        let s = match self {
+            Node::Leaf(p) => return rects[p],
+            Node::Split(s) => s,
+        };
+        let (a, b) = (s.first.fit(rects, keep), s.second.fit(rects, keep));
+        let (first, second) = if s.horizontal { (a.w, b.w) } else { (a.h, b.h) };
+        let total = f64::from(first + second);
+        if !keep || (total * s.ratio).round() as u32 != first {
+            let cells = |n: &Node, size: u32| f64::from(size + 1 - n.weight(s.horizontal));
+            let (cf, cs) = (cells(&s.first, first), cells(&s.second, second));
+            // round(total * ratio) is `first` from (first - 0.5) / total up to
+            // (first + 0.5) / total; the margin keeps f16's rounding inside,
+            // which leaves room below 1024 cells.
+            let margin = 2f64.powi(-11);
+            let low = (f64::from(first) - 0.5) / total + margin;
+            let high = (f64::from(first) + 0.5) / total - margin;
+            s.ratio = f16((cf / (cf + cs)).max(low).min(high));
         }
+        Rect { x: a.x, y: a.y, w: b.x + b.w - a.x, h: b.y + b.h - a.y }
     }
 
+    /// ghostty's weight for equalize: the panes or splits of the other
+    /// orientation side by side along `horizontal` (one for those).
     fn weight(&self, horizontal: bool) -> u32 {
         match self {
             Node::Split(s) if s.horizontal == horizontal => s.first.weight(horizontal) + s.second.weight(horizontal),
@@ -303,28 +341,61 @@ mod tests {
     }
 
     #[test]
-    fn equalize_weighs_leaves_along_the_split() {
+    fn layout_divides_like_gtk_paned_and_fit_keeps_ratios_that_fit() {
+        // [0 | [1 / 2]] in 80x24: 79 * 0.5 rounds up to 40.
         let mut tree = Node::Leaf(0);
         tree.split(1, RIGHT);
-        tree.find_mut(1).unwrap().split(2, RIGHT);
-        tree.equalize();
+        tree.find_mut(1).unwrap().split(2, DOWN);
+        let mut out = Vec::new();
+        tree.layout(Rect { x: 0, y: 0, w: 80, h: 24 }, &mut out);
+        let at = |x, y, w, h| Rect { x, y, w, h };
+        assert_eq!(out, [(0, at(0, 0, 40, 24)), (1, at(41, 0, 39, 12)), (2, at(41, 13, 39, 11))]);
+        let rects = BTreeMap::from([(0, at(0, 0, 20, 24)), (1, at(21, 0, 59, 12)), (2, at(21, 13, 59, 11))]);
+        let mut kept = tree.clone();
+        assert_eq!(kept.fit(&rects, true), at(0, 0, 80, 24));
+        let Node::Split(root) = &kept else { panic!() };
+        assert_eq!(root.ratio, f16(20.0 / 79.0));
+        let Node::Split(inner) = &root.second else { panic!() };
+        assert_eq!(inner.ratio, 0.5);
+        // Without `keep`, 0.5 gives 12 rows of 23 but 12 / 23 is nearer.
+        tree.fit(&rects, false);
         let Node::Split(root) = &tree else { panic!() };
-        assert_eq!(root.ratio, f16(1.0 / 3.0));
+        let Node::Split(inner) = &root.second else { panic!() };
+        assert_eq!(inner.ratio, f16(12.0 / 23.0));
     }
 
     #[test]
-    fn leaves_follow_the_tree_and_swap_and_assign_keep_the_shape() {
+    fn fit_shares_out_the_dividers_of_a_row() {
+        // [0 | [1 | [2 | 3]]] of 19, 19, 19 and 20 columns in 80: the
+        // dividers between the four panes are no one's cells, so the root
+        // gives pane 0 19 of 77 cells, not of 79 (which 19.5 / 79 bounds).
+        let mut tree = Node::Leaf(0);
+        tree.split(1, RIGHT);
+        tree.find_mut(1).unwrap().split(2, RIGHT);
+        tree.find_mut(2).unwrap().split(3, RIGHT);
+        let at = |x, w| Rect { x, y: 0, w, h: 24 };
+        let rects = BTreeMap::from([(0, at(0, 19)), (1, at(20, 19)), (2, at(40, 19)), (3, at(60, 20))]);
+        tree.fit(&rects, false);
+        let mut out = Vec::new();
+        tree.layout(at(0, 80), &mut out);
+        assert_eq!(out, rects.into_iter().collect::<Vec<_>>());
+        let Node::Split(root) = &tree else { panic!() };
+        assert_eq!(root.ratio, f16(19.5 / 79.0 - 2f64.powi(-11)));
+        assert!(root.ratio < 19.0 / 77.0);
+    }
+
+    #[test]
+    fn leaves_follow_the_tree_and_relabel_keeps_the_shape() {
         let mut tree = Node::Leaf(0);
         tree.split(1, Side { horizontal: true, before: true });
         tree.find_mut(0).unwrap().split(2, DOWN);
         let mut order = Vec::new();
         tree.leaves(&mut order);
         assert_eq!(order, vec![1, 0, 2]);
-        tree.swap(1, 2);
-        tree.assign(&mut [5, 6, 7].into_iter());
+        tree.relabel(&|p| p + 5);
         order.clear();
         tree.leaves(&mut order);
-        assert_eq!(order, vec![5, 6, 7]);
+        assert_eq!(order, vec![6, 5, 7]);
         assert_eq!(tree.split_at(1).map(|s| s.horizontal), Some(false));
     }
 }

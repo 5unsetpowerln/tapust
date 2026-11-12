@@ -2,6 +2,8 @@
 //! tables, reproducing tmux 3.6 defaults with the tmux-pain-control bindings
 //! on top. Panes are split as ghostty splits them: a tree of ratios laid out
 //! in pixels with a thin divider, instead of tmux's cell grid with borders.
+//! tmux's layout presets and `select-layout -E` are computed on that grid,
+//! at the window's size in cells, and given to the tree as ratios.
 //!
 //! The model does no I/O. It tells the GUI what to do through [`Effect`]s
 //! (spawn a shell, resize or destroy a pane, write bytes, run a copy-mode
@@ -16,6 +18,7 @@ use std::time::Instant;
 mod copy;
 mod format;
 mod keys;
+mod layout;
 mod paste;
 mod prompt;
 mod session;
@@ -26,6 +29,7 @@ mod window;
 mod tests;
 
 pub use copy::{CopyCommand, ModeKeys, SearchArg};
+pub use layout::Layout;
 pub use split::{f16, Node, Split};
 
 use keys::KeyState;
@@ -246,8 +250,14 @@ pub enum Command {
     LastWindow,
     /// `swap-window -d -t -N` (negative) or `-t +N` (positive).
     SwapWindow(i32),
-    /// `select-layout -E`, carried out as ghostty's equalize_splits.
-    Equalize,
+    /// `select-layout name`.
+    SelectLayout(Layout),
+    /// `next-layout`.
+    NextLayout,
+    /// `previous-layout`.
+    PreviousLayout,
+    /// `select-layout -E`: spreads out the cells around the active pane.
+    SpreadOut,
     /// `rename-window name` (the name is format-expanded as tmux does).
     RenameWindow(String),
     /// `rename-session name`.
@@ -349,12 +359,14 @@ impl Session {
         Some((&w.tree, w.zoomed.then_some(w.active), w.active))
     }
 
-    /// GTK allocated the split tree of the window at `index`: its size, and
-    /// for each pane the rectangle and the grid it holds (tmux's directional
-    /// selection and formats read them).
-    pub fn set_geometry(&mut self, index: u32, area: Rect, panes: &[(PaneId, Rect, u16, u16)]) {
+    /// GTK allocated the split tree of the window at `index`: its size, the
+    /// grid it holds in the active pane's cells (tmux's window size, which
+    /// the layouts divide), and for each pane the rectangle and the grid it
+    /// holds (tmux's directional selection and formats read them).
+    pub fn set_geometry(&mut self, index: u32, area: Rect, grid: (u16, u16), panes: &[(PaneId, Rect, u16, u16)]) {
         let Some(w) = self.winlinks.get_mut(&index) else { return };
         w.area = area;
+        w.size = (u32::from(grid.0), u32::from(grid.1));
         for &(wp, rect, cols, rows) in panes {
             if let Some(p) = w.pane_mut_opt(wp) {
                 (p.rect, p.cols, p.rows) = (rect, cols, rows);

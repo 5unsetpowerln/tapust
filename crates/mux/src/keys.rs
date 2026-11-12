@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::copy::{self, ModeAction};
 use crate::prompt::PromptKind;
-use crate::{Command, Direction, Key, KeyCode, KeyResult, Session};
+use crate::{Command, Direction, Key, KeyCode, KeyResult, Layout, Session};
 
 /// The `repeat-time` option.
 pub(crate) const REPEAT_TIME: Duration = Duration::from_millis(500);
@@ -104,7 +104,7 @@ pub(crate) fn prefix_binding(key: Key) -> Option<Binding> {
             ';' => run(Command::LastPane),
             '<' => bind(true, Action::Run(Command::SwapWindow(-1))),
             '>' => bind(true, Action::Run(Command::SwapWindow(1))),
-            'E' => run(Command::Equalize),
+            'E' => run(Command::SpreadOut),
             'H' => bind(true, Action::Run(Command::ResizePane(Left, 5))),
             'J' => bind(true, Action::Run(Command::ResizePane(Down, 5))),
             'K' => bind(true, Action::Run(Command::ResizePane(Up, 5))),
@@ -122,7 +122,8 @@ pub(crate) fn prefix_binding(key: Key) -> Option<Binding> {
             '}' => run(Command::SwapPane { up: false }),
             '[' => run(Command::CopyMode { page_up: false }),
             ']' => run(Command::PasteBuffer { bracket: true }),
-            ' ' | '#' | '\'' | '(' | ')' | '.' | '/' | ':' | '=' | '?' | 'C' | 'D' | 'M' | 'd' | 'f' | 'i'
+            ' ' => run(Command::NextLayout),
+            '#' | '\'' | '(' | ')' | '.' | '/' | ':' | '=' | '?' | 'C' | 'D' | 'M' | 'd' | 'f' | 'i'
             | 'm' | 'q' | 'r' | 's' | 't' | 'w' | '~' => bind(false, Unsupported),
             _ => None,
         },
@@ -137,7 +138,13 @@ pub(crate) fn prefix_binding(key: Key) -> Option<Binding> {
             _ => None,
         },
         KeyCode::Char(c) if m.meta && !m.ctrl => match c {
-            '1'..='7' => bind(false, Unsupported),
+            '1' => run(Command::SelectLayout(Layout::EvenHorizontal)),
+            '2' => run(Command::SelectLayout(Layout::EvenVertical)),
+            '3' => run(Command::SelectLayout(Layout::MainHorizontal)),
+            '4' => run(Command::SelectLayout(Layout::MainVertical)),
+            '5' => run(Command::SelectLayout(Layout::Tiled)),
+            '6' => run(Command::SelectLayout(Layout::MainHorizontalMirrored)),
+            '7' => run(Command::SelectLayout(Layout::MainVerticalMirrored)),
             'n' => bind(false, Action::AlertWindow { next: true }),
             'p' => bind(false, Action::AlertWindow { next: false }),
             'o' => run(Command::RotateWindow { down: true }),

@@ -1,6 +1,7 @@
 //! Windows and panes: tmux 3.6's `window.c` bookkeeping (pane order, the
 //! last-pane stack, zoom, directional selection) over ghostty's split tree.
 
+use crate::layout::{self, Layout};
 use crate::split::{Node, Side};
 use crate::{PaneId, Rect};
 
@@ -39,7 +40,14 @@ pub(crate) struct Window {
     pub id: u32,
     /// The size GTK gives the window's split tree, in logical pixels.
     pub area: Rect,
-    /// `w->panes`, kept in the tree's order; a pane's index is its position.
+    /// tmux's window size (`w->sx`, `w->sy`), which the layouts divide: the
+    /// grid the tree's area holds in the active pane's cells, tmux's
+    /// default-size until GTK reports one.
+    pub size: (u32, u32),
+    /// `w->lastlayout`.
+    pub last_layout: Option<Layout>,
+    /// `w->panes`; a pane's index is its position. Splits keep it in the
+    /// tree's order, but the mirrored layouts and rotate-window do not.
     pub panes: Vec<Pane>,
     /// `w->last_panes`, most recent first.
     pub last_panes: Vec<PaneId>,
@@ -57,6 +65,8 @@ impl Window {
         Window {
             id,
             area: Rect::default(),
+            size: (80, 24),
+            last_layout: None,
             panes: vec![pane],
             last_panes: Vec::new(),
             active,
@@ -106,55 +116,69 @@ impl Window {
         pos.checked_sub(1).map(|i| self.panes[i].id)
     }
 
-    /// After every change of the tree `panes` goes back to the tree's order.
-    fn tree_changed(&mut self) {
-        let mut order = Vec::with_capacity(self.panes.len());
-        self.tree.leaves(&mut order);
-        self.panes.sort_by_key(|p| order.iter().position(|&wp| wp == p.id));
-    }
-
     /// window_add_pane and layout_split_pane: `pane` splits `at` (or the
     /// whole window when `full`) on `side`.
     pub(crate) fn add_pane(&mut self, pane: Pane, at: PaneId, side: Side, full: bool) {
         let new = pane.id;
-        self.panes.push(pane);
+        let pos = match (full, side.before) {
+            (true, true) => 0,
+            (true, false) => self.panes.len(),
+            (false, before) => self.pos(at).expect("pane in window") + usize::from(!before),
+        };
+        self.panes.insert(pos, pane);
         let node = if full { &mut self.tree } else { self.tree.find_mut(at).expect("pane in tree") };
         node.split(new, side);
-        self.tree_changed();
     }
 
     /// Exchanges the places of two panes, in the tree and in the order.
     pub(crate) fn swap_panes(&mut self, a: PaneId, b: PaneId) {
-        self.tree.swap(a, b);
-        self.tree_changed();
+        self.tree.relabel(&|p| if p == a { b } else if p == b { a } else { p });
+        let (i, j) = (self.pos(a).expect("pane in window"), self.pos(b).expect("pane in window"));
+        self.panes.swap(i, j);
     }
 
-    /// Gives the tree's places to the panes in their current order (rotate-window).
-    pub(crate) fn place_in_order(&mut self) {
+    /// rotate-window: the panes move one place along the order, up (to the
+    /// end for the first) or `down`, and each takes the place in the tree
+    /// of the pane that had its position in the order.
+    pub(crate) fn rotate(&mut self, down: bool) {
+        let old: Vec<PaneId> = self.panes.iter().map(|p| p.id).collect();
+        if down {
+            self.panes.rotate_right(1);
+        } else {
+            self.panes.rotate_left(1);
+        }
+        let new: Vec<PaneId> = self.panes.iter().map(|p| p.id).collect();
+        self.tree.relabel(&|p| new[old.iter().position(|&q| q == p).expect("pane in window")]);
+    }
+
+    /// layout_set_select: the preset for the panes in their order.
+    pub(crate) fn select_layout(&mut self, layout: Layout) {
         let order: Vec<PaneId> = self.panes.iter().map(|p| p.id).collect();
-        self.tree.assign(&mut order.into_iter());
-        self.tree_changed();
+        if let Some(tree) = layout.arrange(&order, self.size) {
+            self.tree = tree;
+        }
+        self.last_layout = Some(layout);
     }
 
-    /// ghostty's equalize_splits.
-    pub(crate) fn equalize(&mut self) {
-        self.tree.equalize();
-        self.tree_changed();
+    /// layout_spread_out for the active pane.
+    pub(crate) fn spread_out(&mut self) -> Result<(), String> {
+        layout::spread_out(&mut self.tree, self.active, self.size)
     }
 
     /// ghostty's resize_split for pane `wp`, by `delta` of the tree's extent.
     pub(crate) fn resize_split(&mut self, wp: PaneId, horizontal: bool, delta: f64) -> bool {
-        let moved = self.tree.resize(wp, horizontal, delta);
-        self.tree_changed();
-        moved
+        self.tree.resize(wp, horizontal, delta)
     }
 
     /// ghostty's moveSplit: `source` leaves its place (its sibling takes it)
-    /// and splits `target` on `side` with the ratio 0.5.
+    /// and splits `target` on `side` with the ratio 0.5. In the order it
+    /// goes next to `target`, as join-pane puts it.
     pub(crate) fn move_pane(&mut self, source: PaneId, target: PaneId, side: Side) {
         self.tree.remove(source);
         self.tree.find_mut(target).expect("pane in tree").split(source, side);
-        self.tree_changed();
+        let pane = self.panes.remove(self.pos(source).expect("pane in window"));
+        let pos = self.pos(target).expect("pane in window") + usize::from(!side.before);
+        self.panes.insert(pos, pane);
     }
 
     /// window_pane_stack_remove
@@ -201,9 +225,7 @@ impl Window {
         self.lost_pane(wp, prev, next);
         self.tree.remove(wp);
         let pos = self.pos(wp).expect("pane in window");
-        let pane = self.panes.remove(pos);
-        self.tree_changed();
-        pane
+        self.panes.remove(pos)
     }
 
     /// window_zoom

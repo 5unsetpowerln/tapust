@@ -5,6 +5,7 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::keys::KeyState;
+use crate::layout::Layout;
 use crate::split::Side;
 use crate::window::{Pane, Window};
 use crate::{format, paste, Command, CopyCommand, Direction, Effect, ModeKeys, PaneId, Session};
@@ -316,9 +317,22 @@ impl Session {
                 self.swap_window(offset);
                 Ok(())
             }
-            Command::Equalize => {
-                self.cur_mut().equalize();
+            Command::SelectLayout(layout) => {
+                self.select_layout(|_| layout);
                 Ok(())
+            }
+            Command::NextLayout => {
+                self.select_layout(Layout::next);
+                Ok(())
+            }
+            Command::PreviousLayout => {
+                self.select_layout(Layout::previous);
+                Ok(())
+            }
+            Command::SpreadOut => {
+                let w = self.cur_mut();
+                w.unzoom();
+                w.spread_out()
             }
             Command::RenameWindow(ref name) => {
                 let id = self.cur().id;
@@ -494,19 +508,21 @@ impl Session {
         w.pop_zoom(point);
     }
 
+    /// cmd_select_layout_exec for a preset, chosen from the last one.
+    fn select_layout(&mut self, choose: impl FnOnce(Option<Layout>) -> Layout) {
+        let w = self.cur_mut();
+        w.unzoom();
+        w.select_layout(choose(w.last_layout));
+    }
+
     /// cmd_rotate_window_exec
     fn rotate_window(&mut self, down: bool) {
         let (w, point) = self.cur_point();
         w.push_zoom(false, false);
-        let n = w.panes.len();
-        // The panes move one place along the order; the places stay.
+        w.rotate(down);
         let new_active = if down {
-            w.panes.rotate_right(1);
-            w.place_in_order();
-            w.prev_of(w.active).unwrap_or(w.panes[n - 1].id)
+            w.prev_of(w.active).unwrap_or(w.panes[w.panes.len() - 1].id)
         } else {
-            w.panes.rotate_left(1);
-            w.place_in_order();
             w.next_of(w.active).unwrap_or(w.panes[0].id)
         };
         w.set_active(new_active, point);

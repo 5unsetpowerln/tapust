@@ -1207,6 +1207,9 @@ impl App {
         let Some(tab) = st.tabs.get(&info.id) else { return };
         let tree_bin = tab.tree_bin.clone();
         let area = Rect { x: 0, y: 0, w: tree_bin.width().max(0) as u32, h: tree_bin.height().max(0) as u32 };
+        let active = info.panes.iter().find(|p| p.active).and_then(|p| st.panes.get(&p.pane));
+        // The pane gets its fonts when GTK first sizes it, which reports again.
+        let Some(grid) = active.and_then(|p| p.surface.grid(area.w, area.h)) else { return };
         let mut panes = Vec::new();
         for p in &info.panes {
             let Some(pane) = st.panes.get(&p.pane) else { continue };
@@ -1221,7 +1224,7 @@ impl App {
             });
             panes.push((p.pane, rect, cols, rows));
         }
-        st.session.set_geometry(index, area, &panes);
+        st.session.set_geometry(index, area, grid, &panes);
     }
 
     /// Makes GTK show the model: one tab per window in index order, each with
@@ -1307,7 +1310,7 @@ impl App {
         };
         let split = matches!(tree, Node::Split(_));
         let mut leaves = Vec::new();
-        collect_leaves(&tree, &mut leaves);
+        tree.leaves(&mut leaves);
         let mut st = self.state.borrow_mut();
         for pane in &leaves {
             if let Some(p) = st.panes.get(pane) {
@@ -1831,16 +1834,6 @@ fn new_session() -> (Session, Vec<Effect>) {
     let (visual, editor) = (std::env::var_os("VISUAL"), std::env::var_os("EDITOR"));
     session.set_mode_keys(ModeKeys::from_env(visual.as_deref(), editor.as_deref()));
     (session, effects)
-}
-
-fn collect_leaves(node: &Node, out: &mut Vec<PaneId>) {
-    match node {
-        Node::Leaf(p) => out.push(*p),
-        Node::Split(s) => {
-            collect_leaves(&s.first, out);
-            collect_leaves(&s.second, out);
-        }
-    }
 }
 
 /// ghostty's CloseConfirmationDialog.

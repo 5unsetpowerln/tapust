@@ -53,35 +53,30 @@ fn ids(s: &Session) -> Vec<PaneId> {
     w.panes.iter().map(|p| p.pane).collect()
 }
 
-/// Lays the current window out as GtkPaned would (first child
-/// round((size - 1) * ratio)) and reports the geometry, as the GUI does.
-fn lay(s: &mut Session) {
-    fn place(n: &Node, r: Rect, out: &mut Vec<(PaneId, Rect, u16, u16)>) {
-        match n {
-            Node::Leaf(p) => out.push((*p, r, 0, 0)),
-            Node::Split(sp) => {
-                let total = if sp.horizontal { r.w } else { r.h };
-                let pos = (f64::from(total - 1) * sp.ratio).round() as u32;
-                let rest = total - pos - 1;
-                let (a, b) = if sp.horizontal {
-                    (Rect { w: pos, ..r }, Rect { x: r.x + pos + 1, w: rest, ..r })
-                } else {
-                    (Rect { h: pos, ..r }, Rect { y: r.y + pos + 1, h: rest, ..r })
-                };
-                place(&sp.first, a, out);
-                place(&sp.second, b, out);
-            }
-        }
-    }
-    let area = Rect { x: 0, y: 0, w: 1276, h: 796 };
+/// Lays the current window out in a `w` x `h` area as GtkPaned would and
+/// reports the geometry with the area as the grid, as the GUI does.
+fn lay_in(s: &mut Session, w: u32, h: u32) {
+    let area = Rect { x: 0, y: 0, w, h };
     let idx = s.current();
     let (tree, zoomed, _) = s.tree(idx).unwrap();
-    let mut out = Vec::new();
+    let mut rects = Vec::new();
     match zoomed {
-        Some(p) => out.push((p, area, 0, 0)),
-        None => place(tree, area, &mut out),
+        Some(p) => rects.push((p, area)),
+        None => tree.layout(area, &mut rects),
     }
-    s.set_geometry(idx, area, &out);
+    let panes: Vec<_> = rects.into_iter().map(|(p, r)| (p, r, 0, 0)).collect();
+    s.set_geometry(idx, area, (w as u16, h as u16), &panes);
+}
+
+fn lay(s: &mut Session) {
+    lay_in(s, 1276, 796);
+}
+
+/// The current window's panes in index order as `id:x,y,wxh` on the grid
+/// `lay_in` reported.
+fn cells(s: &Session) -> Vec<String> {
+    let w = s.windows().into_iter().find(|w| w.active).unwrap();
+    w.panes.iter().map(|p| format!("{}:{},{},{}x{}", p.pane, p.rect.x, p.rect.y, p.rect.w, p.rect.h)).collect()
 }
 
 fn active_index(s: &Session) -> usize {
@@ -208,12 +203,93 @@ fn set_ratio_writes_back_as_f16_without_a_rebuild() {
 }
 
 #[test]
-fn equalize_evens_out() {
+fn spread_out_evens_the_active_panes_parent_cell() {
+    // [0 | [1 | 2]] in 80 columns: 40 | 19 | 19 becomes 26 | 26 | 26.
     let mut s = new_session();
     ok(&mut s, split(true));
     ok(&mut s, split(true));
-    ok(&mut s, Command::Equalize);
+    lay_in(&mut s, 80, 24);
+    ok(&mut s, Command::SpreadOut);
+    lay_in(&mut s, 80, 24);
+    assert_eq!(cells(&s), ["0:0,0,26x24", "1:27,0,26x24", "2:54,0,26x24"]);
+    // A third of the panes' cells, as ghostty's equalize gives three panes.
     assert_eq!(root_ratio(&s), f16(1.0 / 3.0));
+    // Even already: nothing changes, nor does an even ancestor.
+    ok(&mut s, Command::SpreadOut);
+    assert_eq!(root_ratio(&s), f16(1.0 / 3.0));
+}
+
+#[test]
+fn spread_out_is_refused_where_tmux_would_hang() {
+    // [0 | [1 | [2 / [3 | 4]]]] in 7 columns: spreading the root to 2, 2
+    // and 1 columns shrinks [3 | 4], whose panes have one column each, and
+    // tmux 3.6 loops forever on this layout.
+    let mut s = new_session();
+    ok(&mut s, split(true));
+    ok(&mut s, split(true));
+    ok(&mut s, split(false));
+    ok(&mut s, split(true));
+    s.set_ratio(0, 0, 1.0 / 6.0);
+    s.set_ratio(0, 1, 1.0 / 4.0);
+    lay_in(&mut s, 7, 10);
+    assert_eq!(cells(&s), ["0:0,0,1x10", "1:2,0,1x10", "2:4,0,3x5", "3:4,6,1x4", "4:6,6,1x4"]);
+    select_index(&mut s, 0);
+    let tree = s.tree(0).unwrap().0.clone();
+    assert_eq!(run(&mut s, Command::SpreadOut).error.as_deref(), Some("can't spread out the layout"));
+    assert_eq!(s.tree(0).unwrap().0, &tree);
+}
+
+#[test]
+fn presets_follow_the_pane_order_and_cycle() {
+    let mut s = new_session();
+    for _ in 0..3 {
+        ok(&mut s, split(true));
+    }
+    lay_in(&mut s, 80, 24);
+    ok(&mut s, Command::SelectLayout(Layout::MainVerticalMirrored));
+    lay_in(&mut s, 80, 24);
+    // The main pane (the first in the order) goes right; the order stays.
+    assert_eq!(shape(&s), "[[1 / [2 / 3]] | 0]");
+    assert_eq!(cells(&s), ["0:2,0,78x24", "1:0,0,1x8", "2:0,9,1x7", "3:0,17,1x7"]);
+    lay_in(&mut s, 120, 40);
+    ok(&mut s, Command::NextLayout);
+    lay_in(&mut s, 120, 40);
+    assert_eq!(shape(&s), "[[0 | 1] / [2 | 3]]");
+    assert_eq!(cells(&s), ["0:0,0,59x19", "1:60,0,60x19", "2:0,20,59x20", "3:60,20,60x20"]);
+    ok(&mut s, Command::NextLayout);
+    assert_eq!(shape(&s), "[0 | [1 | [2 | 3]]]");
+    ok(&mut s, Command::PreviousLayout);
+    ok(&mut s, Command::PreviousLayout);
+    lay_in(&mut s, 120, 40);
+    assert_eq!(shape(&s), "[[1 / [2 / 3]] | 0]");
+    assert_eq!(cells(&s), ["0:40,0,80x40", "1:0,0,39x13", "2:0,14,39x13", "3:0,28,39x12"]);
+}
+
+#[test]
+fn rotate_moves_panes_along_the_order_into_the_places_of_the_others() {
+    let mut s = new_session();
+    ok(&mut s, split(true));
+    ok(&mut s, split(true));
+    ok(&mut s, Command::SelectLayout(Layout::MainVerticalMirrored));
+    assert_eq!(shape(&s), "[[1 / 2] | 0]");
+    ok(&mut s, Command::RotateWindow { down: false });
+    assert_eq!(ids(&s), [1, 2, 0]);
+    assert_eq!(shape(&s), "[[2 / 0] | 1]");
+    ok(&mut s, Command::SwapPane { up: true });
+    assert_eq!(ids(&s), [1, 0, 2]);
+    assert_eq!(shape(&s), "[[0 / 2] | 1]");
+}
+
+#[test]
+fn layouts_unzoom_first_and_one_pane_keeps_its_tree() {
+    let mut s = new_session();
+    ok(&mut s, Command::NextLayout);
+    assert_eq!(shape(&s), "0");
+    ok(&mut s, split(false));
+    ok(&mut s, Command::ZoomPane);
+    ok(&mut s, Command::NextLayout);
+    assert!(!s.windows()[0].zoomed);
+    assert_eq!(shape(&s), "[0 / 1]");
 }
 
 #[test]
@@ -365,7 +441,7 @@ fn unbound_key_after_prefix_is_swallowed() {
 fn unimplemented_default_binding_is_consumed() {
     let t = Instant::now();
     let mut s = new_session();
-    for k in [ch('d'), ch('#'), ch('='), ch('?'), ch(' '), meta(KeyCode::Char('1'))] {
+    for k in [ch('d'), ch('#'), ch('='), ch('?'), ch('w'), ch('t')] {
         s.key(ctrl('b'), t);
         assert_eq!(s.key(k, t), KeyResult::Handled(vec![]), "{k:?}");
     }
@@ -641,6 +717,38 @@ fn swap_and_rotate_bindings() {
     s.key(ctrl('o'), t);
     assert_eq!(ids(&s), [2, 1, 0]);
     assert_eq!(shape(&s), "[2 | [1 / 0]]");
+}
+
+#[test]
+fn layout_bindings() {
+    let t = Instant::now();
+    let mut s = new_session();
+    ok(&mut s, split(true));
+    ok(&mut s, split(true));
+    lay_in(&mut s, 80, 24);
+    let presets = [
+        ('1', "[0 | [1 | 2]]"),
+        ('2', "[0 / [1 / 2]]"),
+        ('3', "[0 / [1 | 2]]"),
+        ('4', "[0 | [1 / 2]]"),
+        ('5', "[[0 | 1] / 2]"),
+        ('6', "[[1 | 2] / 0]"),
+        ('7', "[[1 / 2] | 0]"),
+    ];
+    for (key, expected) in presets {
+        s.key(ctrl('b'), t);
+        s.key(meta(KeyCode::Char(key)), t);
+        assert_eq!(shape(&s), expected, "M-{key}");
+    }
+    // main-vertical-mirrored is followed by tiled.
+    s.key(ctrl('b'), t);
+    s.key(ch(' '), t);
+    lay_in(&mut s, 80, 24);
+    assert_eq!(cells(&s), ["0:0,0,39x11", "1:40,0,40x11", "2:0,12,80x12"]);
+    s.key(ctrl('b'), t);
+    s.key(ch('E'), t);
+    lay_in(&mut s, 80, 24);
+    assert_eq!(cells(&s), ["0:0,0,39x12", "1:40,0,40x12", "2:0,13,80x11"]);
 }
 
 #[test]
