@@ -10,6 +10,9 @@ term = { package = "tapust-term", path = "../term" }
 mux = { package = "tapust-mux", path = "../mux" }
 gtk = { package = "gtk4", version = "0.10", features = ["v4_20"] }
 adw = { package = "libadwaita", version = "0.8", features = ["v1_8"] }
+gdk-wayland = { package = "gdk4-wayland", version = "0.10", features = ["wayland_crate"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 glow = "0.16"
 crossfont = "0.8"
 libc = "0.2"

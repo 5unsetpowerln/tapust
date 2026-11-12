@@ -1,3 +1,4 @@
+mod attention;
 mod bindings;
 mod compose;
 mod copy;

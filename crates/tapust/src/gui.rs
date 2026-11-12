@@ -18,6 +18,7 @@ use mux::{
     Server, Session,
 };
 
+use crate::attention::Attention;
 use crate::bindings::{self, Binding, Scroll};
 use crate::compose;
 use crate::input;
@@ -88,6 +89,7 @@ pub struct App {
     /// When the last desktop notification was shown and its hash (ghostty's
     /// last_notification_time and last_notification_digest).
     last_notification: Cell<Option<(Instant, u64)>>,
+    attention: Rc<Attention>,
 }
 
 /// A GTK window (ghostty's Window) showing one tmux session; it is the
@@ -383,6 +385,7 @@ impl App {
             palette,
             term_bg,
             last_notification: Cell::new(None),
+            attention: Attention::new(&gdk::Display::default().expect("display")),
         });
         APP.with(|a| *a.borrow_mut() = Some(app.clone()));
         app.add_actions();
@@ -606,6 +609,15 @@ impl Window {
         window.set_icon_name(Some(theme::ICON));
         // ghostty's headerbar-visible: never shown while fullscreen.
         window.connect_fullscreened_notify(move |w| header.set_visible(!w.is_fullscreen()));
+        // ghostty's handleActiveState: an active window needs no attention.
+        let attention = app.attention.clone();
+        window.connect_is_active_notify(move |w| {
+            if w.is_active() {
+                attention.cancel(w);
+            }
+        });
+        let attention = app.attention.clone();
+        window.connect_unrealize(move |w| attention.cancel(w));
 
         let win = Rc::new(Window {
             app: app.clone(),
@@ -944,8 +956,9 @@ impl Window {
     }
 
     /// ghostty's ringBell with the default bell-features (attention, title):
-    /// the tab of an unselected window needs attention, and the surface
-    /// rings unless it has focus.
+    /// the tab of an unselected window needs attention, a window that is not
+    /// active asks the compositor for attention, and the surface rings unless
+    /// it has focus.
     fn ring_bell(self: &Rc<Self>, pane: PaneId, surface: &Surface) {
         let page = {
             let st = self.state.borrow();
@@ -956,6 +969,9 @@ impl Window {
             && !page.is_selected()
         {
             page.set_needs_attention(true);
+        }
+        if !self.window.is_active() {
+            self.app.attention.request(&self.window);
         }
         surface.set_bell_ringing(true);
     }
