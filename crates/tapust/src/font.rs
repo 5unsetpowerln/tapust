@@ -75,7 +75,8 @@ pub struct Fonts {
     pub cell_height: u32,
     /// Distance from the cell top to the baseline.
     pub baseline: i32,
-    /// Underline top, relative to the cell top.
+    /// Underline top, relative to the cell top; the underline shapes keep
+    /// it within a quarter cell below the cell.
     pub underline_y: i32,
     pub underline_thickness: i32,
     pub strike_y: i32,
@@ -109,7 +110,7 @@ impl Fonts {
             cell_width,
             cell_height,
             baseline,
-            underline_y: underline_y.min(cell_height as i32 - underline_thickness),
+            underline_y,
             underline_thickness,
             strike_y,
         })

@@ -1,8 +1,8 @@
 //! Copies terminal rows into pane grids, resolving styles to colors.
 
-use term::{Attrs, Cell, Color, CursorShape, Palette, Rgb, Selection, Style, Terminal, Underline, Width};
+use term::{Attrs, Cell, Color, CursorShape, Palette, Rgb, Selection, Style, StyleId, Terminal, Underline, Width};
 
-use crate::frame::{BOLD, CursorStyle, FrameCell, FrameCursor, Grid, ITALIC, STRIKE, UNDERLINE, WIDE};
+use crate::frame::{BOLD, CursorStyle, FrameCell, FrameCursor, Grid, ITALIC, STRIKE, WIDE};
 use crate::theme;
 
 fn rgba(c: Rgb) -> [u8; 4] {
@@ -17,6 +17,14 @@ pub fn resolve(color: Color, palette: &Palette, default: Rgb) -> [u8; 4] {
     }
 }
 
+/// Halfway from `c` towards `bg`: faint (SGR 2), like most terminals.
+fn dim(mut c: [u8; 4], bg: [u8; 4]) -> [u8; 4] {
+    for i in 0..3 {
+        c[i] = ((c[i] as u16 + bg[i] as u16) / 2) as u8;
+    }
+    c
+}
+
 fn style_colors(style: &Style, palette: &Palette, reverse_video: bool) -> ([u8; 4], [u8; 4]) {
     let mut fg = resolve(style.fg, palette, palette.foreground);
     let mut bg = resolve(style.bg, palette, palette.background);
@@ -24,10 +32,7 @@ fn style_colors(style: &Style, palette: &Palette, reverse_video: bool) -> ([u8; 
         std::mem::swap(&mut fg, &mut bg);
     }
     if style.attrs.contains(Attrs::DIM) {
-        // Halfway towards the background, like most terminals.
-        for i in 0..3 {
-            fg[i] = ((fg[i] as u16 + bg[i] as u16) / 2) as u8;
-        }
+        fg = dim(fg, bg);
     }
     if style.attrs.contains(Attrs::HIDDEN) {
         fg = bg;
@@ -35,10 +40,18 @@ fn style_colors(style: &Style, palette: &Palette, reverse_video: bool) -> ([u8; 
     (fg, bg)
 }
 
-fn frame_cell(cell: Cell, term: &Terminal, palette: &Palette, reverse_video: bool) -> FrameCell {
-    let style = term.style(cell.style());
+/// A cell in `style` without its character, which `frame_cell` adds.
+fn styled(style: &Style, palette: &Palette, reverse_video: bool) -> FrameCell {
     let (fg, bg) = style_colors(style, palette, reverse_video);
     let attrs = style.attrs;
+    // ghostty's underline color stays when the colors are inverted or selected.
+    let underline_color = match style.underline_color {
+        Color::Default => None,
+        c if attrs.contains(Attrs::DIM) => Some(dim(resolve(c, palette, palette.foreground), bg)),
+        c => Some(resolve(c, palette, palette.foreground)),
+    };
+    // Like xterm and ghostty, hidden text has no decorations.
+    let underline = if attrs.contains(Attrs::HIDDEN) { Underline::None } else { style.underline };
     let mut flags = 0;
     if attrs.contains(Attrs::BOLD) {
         flags |= BOLD;
@@ -46,21 +59,18 @@ fn frame_cell(cell: Cell, term: &Terminal, palette: &Palette, reverse_video: boo
     if attrs.contains(Attrs::ITALIC) {
         flags |= ITALIC;
     }
-    if style.underline != Underline::None {
-        flags |= UNDERLINE;
-    }
     if attrs.contains(Attrs::STRIKE) {
         flags |= STRIKE;
     }
-    let ch = match cell.width() {
-        Width::Narrow => cell.codepoint(),
-        Width::Wide => {
-            flags |= WIDE;
-            cell.codepoint()
-        }
-        Width::SpacerTail | Width::SpacerHead => 0,
-    };
-    FrameCell { ch, fg, bg, flags }
+    FrameCell { ch: 0, fg, bg, underline_color, underline, flags }
+}
+
+fn frame_cell(cell: Cell, styled: FrameCell) -> FrameCell {
+    match cell.width() {
+        Width::Narrow => FrameCell { ch: cell.codepoint(), ..styled },
+        Width::Wide => FrameCell { ch: cell.codepoint(), flags: styled.flags | WIDE, ..styled },
+        Width::SpacerTail | Width::SpacerHead => styled,
+    }
 }
 
 /// Gives the cells of `sel` on `line` the colors (`fg`, `bg`).
@@ -96,6 +106,8 @@ pub fn copy_pane(
     let colors = |(fg, bg): (Rgb, Rgb)| (rgba(fg), rgba(bg));
     let (fg, bg) = style_colors(&Style::DEFAULT, palette, false);
     let selected = (bg, fg);
+    // Cells in a row mostly share their style: resolve it once per run.
+    let mut run = (StyleId::DEFAULT, styled(&Style::DEFAULT, palette, reverse_video));
     for y in 0..grid.rows() {
         if !full && (y >= rows || !term.dirty().is_dirty(y)) {
             continue;
@@ -106,7 +118,14 @@ pub fn copy_pane(
             continue;
         }
         for (dst, &cell) in out.iter_mut().zip(&term.row(y)[..cols]) {
-            *dst = if cell == Cell::EMPTY && !reverse_video { blank } else { frame_cell(cell, term, palette, reverse_video) };
+            if cell == Cell::EMPTY && !reverse_video {
+                *dst = blank;
+                continue;
+            }
+            if cell.style() != run.0 {
+                run = (cell.style(), styled(term.style(cell.style()), palette, reverse_video));
+            }
+            *dst = frame_cell(cell, run.1);
         }
         out[cols..].fill(blank);
         let line = term.view_top() + u64::from(y);
@@ -123,13 +142,22 @@ pub fn copy_pane(
     term.clear_dirty();
 }
 
-/// Underlines the visible cells of a hovered link, as ghostty does.
+/// Underlines the visible cells of a hovered link, as ghostty does: with a
+/// single underline, or a double one where the text has a single underline.
+/// The kind comes from the terminal, so underlining again changes nothing.
 pub fn underline(grid: &mut Grid, term: &Terminal, link: &Selection) {
     let top = term.view_top();
-    for y in 0..grid.rows() {
-        if let Some((left, right)) = link.columns(top + u64::from(y), grid.cols()) {
-            for cell in &mut grid.row_mut(y)[left as usize..=right as usize] {
-                cell.flags |= UNDERLINE;
+    let (rows, cols) = (term.rows().min(grid.rows()), term.cols().min(grid.cols()));
+    for y in 0..rows {
+        if let Some((left, right)) = link.columns(top + u64::from(y), cols)
+            && let Some(cells) = term.row(y).get(left as usize..=(right as usize).min(cols as usize - 1))
+        {
+            for (dst, cell) in grid.row_mut(y)[left as usize..].iter_mut().zip(cells) {
+                let style = term.style(cell.style());
+                if !style.attrs.contains(Attrs::HIDDEN) {
+                    let single = style.underline == Underline::Single;
+                    dst.underline = if single { Underline::Double } else { Underline::Single };
+                }
             }
         }
     }
@@ -162,13 +190,14 @@ pub fn preedit(grid: &mut Grid, term: &Terminal, text: &str) {
     let end = if width > 0 { start + width - 1 } else { start };
     let mut x = start.saturating_sub(end.saturating_sub(max));
     let row = grid.row_mut(cursor.y);
+    let blank = FrameCell { fg, underline: Underline::Single, ..FrameCell::blank(bg) };
     for &(c, w) in &chars[offset..] {
         if x + w > row.len() {
             break;
         }
-        row[x] = FrameCell { ch: c as u32, fg, bg, flags: UNDERLINE | if w == 2 { WIDE } else { 0 } };
+        row[x] = FrameCell { ch: c as u32, flags: if w == 2 { WIDE } else { 0 }, ..blank };
         if w == 2 {
-            row[x + 1] = FrameCell { ch: 0, fg, bg, flags: UNDERLINE };
+            row[x + 1] = blank;
         }
         x += w;
     }
@@ -242,5 +271,58 @@ mod tests {
         assert_eq!(colors(&grid, 0, 11), current);
         assert_eq!(colors(&grid, 1, 1), current);
         assert_eq!(colors(&grid, 1, 2), colors(&plain, 1, 2));
+    }
+
+    fn new_grid() -> Grid {
+        Grid::new(0, (0, 0, 120, 40), (0, 0), (12, 2), [0; 4])
+    }
+
+    #[test]
+    fn cells_carry_the_underline_kind_and_color() {
+        let mut t = Terminal::new(12, 2, 10);
+        // Curly in palette color 1, dotted in the foreground, faint and
+        // hidden ones, and a wide character with a double underline.
+        t.feed(b"\x1b[4:3;58;5;1ma\x1b[0m\x1b[4:4mb\x1b[0m\x1b[2;4;58:2::200:100:0mc\x1b[0m\x1b[8;4;58;5;2md");
+        t.feed("\x1b[0m\x1b[21;7;58;5;3m\u{4e00}".as_bytes());
+        let mut grid = new_grid();
+        copy_pane(&mut grid, &mut t, true, &[], None, None);
+        let palette = t.palette();
+        let (fg, bg) = (rgba(palette.foreground), rgba(palette.background));
+        let row = grid.row(0);
+        let kinds = |cells: &[FrameCell]| cells.iter().map(|c| (c.underline, c.underline_color)).collect::<Vec<_>>();
+        assert_eq!(
+            kinds(&row[..6]),
+            [
+                (Underline::Curly, Some(rgba(palette.indexed[1]))),
+                (Underline::Dotted, None),
+                (Underline::Single, Some(dim([200, 100, 0, 0xff], bg))),
+                (Underline::None, Some(rgba(palette.indexed[2]))),
+                (Underline::Double, Some(rgba(palette.indexed[3]))),
+                (Underline::Double, Some(rgba(palette.indexed[3]))),
+            ]
+        );
+        // Inverse swaps the text colors but keeps the underline color.
+        assert_eq!((row[4].fg, row[4].bg, row[4].flags & WIDE), (bg, fg, WIDE));
+    }
+
+    #[test]
+    fn hovered_links_get_a_single_or_a_double_underline() {
+        let mut t = Terminal::new(12, 2, 10);
+        t.feed(b"ab\x1b[4mcd\x1b[4:3mef\x1b[8mg");
+        let top = t.view_top();
+        let link = Selection { start: Point { line: top, col: 0 }, end: Point { line: top, col: 6 }, rect: false };
+        let mut grid = new_grid();
+        copy_pane(&mut grid, &mut t, true, &[], None, None);
+        let kinds = |grid: &Grid| grid.row(0)[..8].iter().map(|c| c.underline).collect::<Vec<_>>();
+        let (none, single, double) = (Underline::None, Underline::Single, Underline::Double);
+        // Plain text and other kinds get a single underline, a single one
+        // becomes double, hidden text stays bare; again, nothing changes.
+        let hovered = [single, single, double, double, single, single, none, none];
+        for _ in 0..2 {
+            underline(&mut grid, &t, &link);
+            assert_eq!(kinds(&grid), hovered);
+        }
+        copy_pane(&mut grid, &mut t, true, &[], None, None);
+        assert_eq!(kinds(&grid)[..6], [none, none, single, single, Underline::Curly, Underline::Curly]);
     }
 }

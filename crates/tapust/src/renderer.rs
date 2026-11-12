@@ -5,17 +5,19 @@
 //!    under each pixel in the pane's `cols x rows` RGBA texture, and shows
 //!    the pane's background around the cells.
 //! 2. Foreground: one instanced draw of quads in window pixels for glyphs
-//!    (from one RGBA atlas) and rectangles (cursors, underlines, box-drawing
-//!    lines).
+//!    and underlines (from one RGBA atlas) and rectangles (cursors,
+//!    strikethroughs, box-drawing lines).
 //!
 //! Only dirty grid rows rebuild their background texels and instances.
 
 use std::collections::HashMap;
 
 use glow::HasContext;
+use term::Underline;
 
 use crate::font::{Face, Fonts, face_for};
-use crate::frame::{BOLD, CursorStyle, Frame, FrameCell, Grid, ITALIC, STRIKE, UNDERLINE, WIDE};
+use crate::frame::{BOLD, CursorStyle, Frame, FrameCell, Grid, ITALIC, STRIKE, WIDE};
+use crate::underline;
 
 const ATLAS_SIZE: i32 = 2048;
 const FLAG_COLORED: u32 = 1;
@@ -100,6 +102,10 @@ pub struct Renderer {
     atlas: Atlas,
     ascii: Box<[[Option<Glyph>; 128]; 4]>,
     glyphs: HashMap<(u32, Face), Option<Glyph>>,
+    /// The instance of each underline kind (by `Underline as usize`) for a
+    /// cell at (0, 0) in color 0, measured from `fonts`; empty until the
+    /// first frame drawn with these fonts.
+    underlines: Vec<Instance>,
     upload: Vec<Instance>,
     viewport: (u32, u32),
 }
@@ -311,6 +317,7 @@ impl Renderer {
                 atlas: Atlas { texture: atlas_texture, x: 0, y: 0, shelf_height: 0 },
                 ascii: Box::new([[None; 128]; 4]),
                 glyphs: HashMap::new(),
+                underlines: Vec::new(),
                 upload: Vec::new(),
                 viewport: (1, 1),
             }
@@ -323,6 +330,7 @@ impl Renderer {
         self.fonts = fonts;
         *self.ascii = [[None; 128]; 4];
         self.glyphs.clear();
+        self.underlines.clear();
         self.grids.clear();
         self.atlas.x = 0;
         self.atlas.y = 0;
@@ -362,7 +370,18 @@ impl Renderer {
             // Blank glyphs are cached as empty, not as None, so they are not rasterized again.
             return Some(Glyph { uv: [0, 0], size: [0, 0], offset: [0, 0], colored: false });
         }
-        let (x, y) = self.atlas.reserve(bitmap.width as i32, bitmap.height as i32)?;
+        Some(Glyph {
+            uv: self.add_to_atlas(bitmap.width, bitmap.height, &bitmap.rgba)?,
+            size: [bitmap.width as u16, bitmap.height as u16],
+            offset: [bitmap.left as i16, (self.fonts.baseline - bitmap.top) as i16],
+            colored: bitmap.colored,
+        })
+    }
+
+    /// Copies a `width x height` RGBA bitmap into the atlas; returns its
+    /// position there, or None when the atlas is full.
+    fn add_to_atlas(&mut self, width: u32, height: u32, rgba: &[u8]) -> Option<[u16; 2]> {
+        let (x, y) = self.atlas.reserve(width as i32, height as i32)?;
         unsafe {
             self.gl.active_texture(glow::TEXTURE1);
             self.gl.bind_texture(glow::TEXTURE_2D, Some(self.atlas.texture));
@@ -371,19 +390,35 @@ impl Renderer {
                 0,
                 x,
                 y,
-                bitmap.width as i32,
-                bitmap.height as i32,
+                width as i32,
+                height as i32,
                 glow::RGBA,
                 glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(&bitmap.rgba)),
+                glow::PixelUnpackData::Slice(Some(rgba)),
             );
         }
-        Some(Glyph {
-            uv: [x as u16, y as u16],
-            size: [bitmap.width as u16, bitmap.height as u16],
-            offset: [bitmap.left as i16, (self.fonts.baseline - bitmap.top) as i16],
-            colored: bitmap.colored,
-        })
+        Some([x as u16, y as u16])
+    }
+
+    /// Draws the underline kinds for the current fonts into the atlas, as
+    /// coverage like glyphs.
+    fn build_underlines(&mut self) -> Vec<Instance> {
+        let metrics = underline::Metrics {
+            cell_width: self.fonts.cell_width,
+            cell_height: self.fonts.cell_height,
+            position: self.fonts.underline_y,
+            thickness: self.fonts.underline_thickness as u32,
+        };
+        let mut underlines = vec![Instance::default(); Underline::Dashed as usize + 1];
+        for kind in [Underline::Single, Underline::Double, Underline::Curly, Underline::Dotted, Underline::Dashed] {
+            let s = underline::sprite(kind, metrics);
+            let rgba: Vec<u8> = s.alpha.iter().flat_map(|&a| [255, 255, 255, a]).collect();
+            // The atlas was emptied with the fonts the sprites are measured from.
+            let uv = self.add_to_atlas(s.width, s.height, &rgba).expect("atlas space for the underlines");
+            let (pos, size) = ([s.left as i16, s.top as i16], [s.width as u16, s.height as u16]);
+            underlines[kind as usize] = Instance { pos, size, uv, color: [0; 4], flags: 0 };
+        }
+        underlines
     }
 
     fn rect(x: i32, y: i32, w: i32, h: i32, color: [u8; 4]) -> Instance {
@@ -396,9 +431,18 @@ impl Renderer {
         }
     }
 
-    /// The instances of `cell` with its top-left corner at (`px`, `py`).
-    fn push_cell(&mut self, out: &mut Vec<Instance>, px: i32, py: i32, cell: &FrameCell, fg: [u8; 4]) {
+    /// The instances of `cell` with its top-left corner at (`px`, `py`), in
+    /// the cell's colors or all in `over`.
+    fn push_cell(&mut self, out: &mut Vec<Instance>, px: i32, py: i32, cell: &FrameCell, over: Option<[u8; 4]>) {
         let (cw, chh) = (self.fonts.cell_width as i32, self.fonts.cell_height as i32);
+        let fg = over.unwrap_or(cell.fg);
+        // ghostty draws underlines under the glyphs, so that a colored one
+        // does not cover the descenders.
+        if cell.underline != Underline::None {
+            let sprite = self.underlines[cell.underline as usize];
+            let pos = [(px + sprite.pos[0] as i32) as i16, (py + sprite.pos[1] as i32) as i16];
+            out.push(Instance { pos, color: over.or(cell.underline_color).unwrap_or(cell.fg), ..sprite });
+        }
         if let Some([left, right, up, down]) = box_arms(cell.ch) {
             let t = (chh / 16).max(1);
             let (mx, my) = ((cw - t) / 2, (chh - t) / 2);
@@ -426,11 +470,8 @@ impl Renderer {
                 });
             }
         }
-        let width = if cell.flags & WIDE != 0 { 2 * cw } else { cw };
-        if cell.flags & UNDERLINE != 0 {
-            out.push(Self::rect(px, py + self.fonts.underline_y, width, self.fonts.underline_thickness, fg));
-        }
         if cell.flags & STRIKE != 0 {
+            let width = if cell.flags & WIDE != 0 { 2 * cw } else { cw };
             out.push(Self::rect(px, py + self.fonts.strike_y, width, self.fonts.underline_thickness, fg));
         }
     }
@@ -441,8 +482,8 @@ impl Renderer {
         out.clear();
         let py = grid.y + y as i32 * ch;
         for (x, cell) in grid.row(y).iter().enumerate() {
-            if cell.ch != 0 || cell.flags & (UNDERLINE | STRIKE) != 0 {
-                self.push_cell(&mut out, grid.x + x as i32 * cw, py, cell, cell.fg);
+            if cell.ch != 0 || cell.underline != Underline::None || cell.flags & STRIKE != 0 {
+                self.push_cell(&mut out, grid.x + x as i32 * cw, py, cell, None);
             }
         }
         cache.rows[y as usize] = out;
@@ -516,6 +557,9 @@ impl Renderer {
         for grid in &mut frame.grids {
             self.upload_background(grid);
         }
+        if self.underlines.is_empty() {
+            self.underlines = self.build_underlines();
+        }
         let mut upload = std::mem::take(&mut self.upload);
         upload.clear();
         for grid in &mut frame.grids {
@@ -539,16 +583,19 @@ impl Renderer {
             match cursor.style {
                 CursorStyle::Block => {
                     upload.push(Self::rect(x, y, width, ch, cursor.color));
-                    let cell = grid.row(cursor.y)[cursor.x as usize];
-                    self.push_cell(&mut upload, x, y, &cell, cursor.text_color);
+                    // Both cells of a wide character, as each draws its own underline.
+                    let cells = grid.row(cursor.y)[cursor.x as usize..].iter().take(1 + cursor.wide as usize);
+                    for (i, cell) in cells.enumerate() {
+                        self.push_cell(&mut upload, x + i as i32 * cw, y, cell, Some(cursor.text_color));
+                    }
                 }
                 CursorStyle::Underline => upload.push(Self::rect(x, y + ch - 2, width, 2, cursor.color)),
                 CursorStyle::Bar => upload.push(Self::rect(x, y, 2, ch, cursor.color)),
                 CursorStyle::Lock => {
                     // ghostty renders U+F023 (the Nerd Font lock) in the
                     // cursor color in place of a cursor shape.
-                    let lock = FrameCell { ch: 0xF023, fg: cursor.color, bg: [0; 4], flags: 0 };
-                    self.push_cell(&mut upload, x, y, &lock, cursor.color);
+                    let lock = FrameCell { ch: 0xF023, fg: cursor.color, ..FrameCell::blank([0; 4]) };
+                    self.push_cell(&mut upload, x, y, &lock, None);
                 }
                 CursorStyle::Hollow => {
                     // A 1px outline, like ghostty's block_hollow with cursor_thickness 1.

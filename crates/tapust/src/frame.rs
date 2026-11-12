@@ -2,12 +2,13 @@
 //! the pane's pixel origin, then the cursors. Colors are already resolved, so
 //! the renderer knows nothing about palettes, styles or the multiplexer.
 
+use term::Underline;
+
 pub const BOLD: u16 = 1 << 0;
 pub const ITALIC: u16 = 1 << 1;
-pub const UNDERLINE: u16 = 1 << 2;
-pub const STRIKE: u16 = 1 << 3;
+pub const STRIKE: u16 = 1 << 2;
 /// The cell holds the left half of a double-width glyph.
-pub const WIDE: u16 = 1 << 4;
+pub const WIDE: u16 = 1 << 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
@@ -16,12 +17,15 @@ pub struct FrameCell {
     pub ch: u32,
     pub fg: [u8; 4],
     pub bg: [u8; 4],
+    /// The underline's own color (SGR 58); without one it takes `fg`.
+    pub underline_color: Option<[u8; 4]>,
+    pub underline: Underline,
     pub flags: u16,
 }
 
 impl FrameCell {
     pub const fn blank(bg: [u8; 4]) -> FrameCell {
-        FrameCell { ch: 0, fg: [0; 4], bg, flags: 0 }
+        FrameCell { ch: 0, fg: [0; 4], bg, underline_color: None, underline: Underline::None, flags: 0 }
     }
 }
 

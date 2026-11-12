@@ -15,6 +15,7 @@ mod selection;
 mod shell;
 mod surface;
 mod theme;
+mod underline;
 
 use std::error::Error;
 use std::ffi::OsString;
