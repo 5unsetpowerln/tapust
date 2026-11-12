@@ -325,13 +325,15 @@ impl Renderer {
     }
 
     /// Switches to fonts of another scale: every cached glyph and grid is
-    /// drawn again.
+    /// drawn again. Needs the GL context current.
     pub fn set_fonts(&mut self, fonts: Fonts) {
         self.fonts = fonts;
         *self.ascii = [[None; 128]; 4];
         self.glyphs.clear();
         self.underlines.clear();
-        self.grids.clear();
+        for (_, cache) in self.grids.drain() {
+            unsafe { self.gl.delete_texture(cache.texture) };
+        }
         self.atlas.x = 0;
         self.atlas.y = 0;
         self.atlas.shelf_height = 0;
