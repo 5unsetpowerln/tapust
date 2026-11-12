@@ -1493,6 +1493,10 @@ impl Term {
             (0, 0, b'b') => self.repeat(p.count(0)),
             (0, 0, b'c') if p.get(0) == 0 => self.replies.extend_from_slice(b"\x1b[?62;22c"),
             (b'>', 0, b'c') if p.get(0) == 0 => self.replies.extend_from_slice(b"\x1b[>1;10;0c"),
+            // XTVERSION: the terminal's name and version.
+            (b'>', 0, b'q') if p.get(0) == 0 => {
+                let _ = write!(self.replies, "\x1bP>|tapust {}\x1b\\", env!("CARGO_PKG_VERSION"));
+            }
             (0, 0, b'g') => match p.get(0) {
                 0 => self.tabs[self.x] = false,
                 3 => self.tabs.fill(false),
@@ -1556,6 +1560,31 @@ impl Term {
                 _ => {}
             },
             _ => {}
+        }
+    }
+
+    /// XTGETTCAP: answers each hex-encoded terminfo capability name with its
+    /// value, or as unknown, one reply per name.
+    pub fn xtgettcap(&mut self, data: &[u8]) {
+        for hex in data.split(|&b| b == b';') {
+            let name = decode_hex(hex);
+            match name.as_deref().and_then(capability) {
+                Some(value) => {
+                    self.replies.extend_from_slice(b"\x1bP1+r");
+                    self.replies.extend_from_slice(hex);
+                    if let Some(value) = value {
+                        self.replies.push(b'=');
+                        for b in value.bytes() {
+                            let _ = write!(self.replies, "{b:02X}");
+                        }
+                    }
+                }
+                None => {
+                    self.replies.extend_from_slice(b"\x1bP0+r");
+                    self.replies.extend_from_slice(hex);
+                }
+            }
+            self.replies.extend_from_slice(b"\x1b\\");
         }
     }
 
@@ -1878,4 +1907,29 @@ fn local_hostname() -> &'static str {
     NAME.get_or_init(|| {
         std::fs::read_to_string("/proc/sys/kernel/hostname").map(|s| s.trim_end().to_owned()).unwrap_or_default()
     })
+}
+
+/// The terminfo capabilities tapust reports through XTGETTCAP, so that
+/// programs learn about features xterm-256color's entry lacks: the value of a
+/// string or number, or None for a boolean.
+fn capability(name: &[u8]) -> Option<Option<&'static str>> {
+    Some(match name {
+        b"TN" | b"name" => Some("xterm-256color"),
+        b"Co" | b"colors" => Some("256"),
+        b"RGB" | b"Tc" => None,
+        b"setrgbf" => Some("\x1b[38;2;%p1%d;%p2%d;%p3%dm"),
+        b"setrgbb" => Some("\x1b[48;2;%p1%d;%p2%d;%p3%dm"),
+        b"Ss" => Some("\x1b[%p1%d q"),
+        b"Se" => Some("\x1b[0 q"),
+        b"Sync" => Some("\x1b[?2026%?%p1%{1}%-%tl%eh%;"),
+        _ => return None,
+    })
+}
+
+/// Hex digits to bytes, or None if they are not pairs of hex digits.
+fn decode_hex(hex: &[u8]) -> Option<Vec<u8>> {
+    if hex.is_empty() || !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    hex.chunks(2).map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()).collect()
 }

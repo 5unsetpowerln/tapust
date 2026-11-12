@@ -83,6 +83,8 @@ enum State {
     /// DCS passthrough, DCS ignore and SOS/PM/APC strings: skipped until ST.
     StringIgnore,
     Osc,
+    /// The data of an XTGETTCAP request (DCS + q), collected until ST.
+    Xtgettcap,
 }
 
 pub(crate) struct Parser {
@@ -449,6 +451,8 @@ impl Parser {
                 ESC => {
                     if self.state == State::Osc {
                         self.osc_end(t, false);
+                    } else if self.state == State::Xtgettcap && !self.osc_overflow {
+                        t.xtgettcap(&self.osc);
                     }
                     self.state = State::Escape;
                     self.n_inter = 0;
@@ -471,7 +475,10 @@ impl Parser {
                         self.osc_overflow = false;
                         self.state = State::Osc;
                     }
-                    b'P' => self.state = State::DcsEntry,
+                    b'P' => {
+                        self.n_inter = 0;
+                        self.state = State::DcsEntry;
+                    }
                     b'X' | b'^' | b'_' => self.state = State::StringIgnore,
                     0x30..=0x7E => {
                         self.state = State::Ground;
@@ -542,14 +549,27 @@ impl Parser {
                     _ => {}
                 },
                 State::DcsEntry | State::DcsParam | State::DcsInter => match b {
-                    0x20..=0x2F => self.state = State::DcsInter,
+                    0x20..=0x2F => {
+                        self.inter = b;
+                        self.n_inter += 1;
+                        self.state = State::DcsInter;
+                    }
                     0x30..=0x3B if self.state != State::DcsInter => self.state = State::DcsParam,
                     0x3C..=0x3F if self.state == State::DcsEntry => self.state = State::DcsParam,
                     0x30..=0x3F => self.state = State::StringIgnore,
+                    b'q' if self.state == State::DcsInter && self.n_inter == 1 && self.inter == b'+' => {
+                        self.osc.clear();
+                        self.osc_overflow = false;
+                        self.state = State::Xtgettcap;
+                    }
                     0x40..=0x7E => self.state = State::StringIgnore,
                     _ => {}
                 },
                 State::StringIgnore => i += string_end(&bytes[i..]),
+                State::Xtgettcap => match b {
+                    0x00..=0x1F => {}
+                    _ => self.osc_put(&[b]),
+                },
                 State::Osc => match b {
                     0x07 => {
                         self.state = State::Ground;

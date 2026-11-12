@@ -1529,3 +1529,24 @@ fn alternate_screen_scrolls_keep_the_selection_on_its_text() {
     t.feed(b"\x1b[2S");
     assert_eq!(t.selection(), None);
 }
+
+#[test]
+fn xtversion_and_xtgettcap_replies() {
+    let mut t = Terminal::new(10, 2, 0);
+    t.feed(b"\x1b[>q");
+    assert_eq!(t.take_replies(), Some(format!("\x1bP>|tapust {}\x1b\\", env!("CARGO_PKG_VERSION")).into_bytes()));
+    // "Tc" is a boolean, "Co" a number, "Ss" a string; "zz" is unknown.
+    t.feed(b"\x1bP+q5463;436F;5373;7A7A\x1b\\");
+    let hex = |s: &str| s.bytes().map(|b| format!("{b:02X}")).collect::<String>();
+    let expected = format!(
+        "\x1bP1+r5463\x1b\\\x1bP1+r436F={}\x1b\\\x1bP1+r5373={}\x1b\\\x1bP0+r7A7A\x1b\\",
+        hex("256"),
+        hex("\x1b[%p1%d q")
+    );
+    assert_eq!(String::from_utf8(t.take_replies().unwrap()).unwrap(), expected);
+    // Other DCS strings are still ignored, and printing goes on after ST.
+    t.feed(b"\x1bP1$qm\x1b\\ok");
+    assert_eq!(t.take_replies(), None);
+    assert_eq!(t.line(t.view_top()).unwrap()[0].char(), Some('o'));
+}
+
