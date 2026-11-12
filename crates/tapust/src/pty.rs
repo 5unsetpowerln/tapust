@@ -67,6 +67,29 @@ fn login_shell() -> io::Result<PathBuf> {
     Ok(PathBuf::from(OsStr::from_bytes(shell.to_bytes())))
 }
 
+/// Variables that identify another terminal or multiplexer to its programs.
+const OTHER_TERMINALS: [&str; 19] = [
+    "TMUX",
+    "TMUX_PANE",
+    "STY",
+    "VTE_VERSION",
+    "KITTY_WINDOW_ID",
+    "KITTY_PID",
+    "KITTY_PUBLIC_KEY",
+    "WEZTERM_PANE",
+    "WEZTERM_UNIX_SOCKET",
+    "WEZTERM_EXECUTABLE",
+    "GHOSTTY_RESOURCES_DIR",
+    "GHOSTTY_BIN_DIR",
+    "GHOSTTY_SHELL_FEATURES",
+    "ALACRITTY_SOCKET",
+    "ALACRITTY_WINDOW_ID",
+    "KONSOLE_VERSION",
+    "LC_TERMINAL",
+    "LC_TERMINAL_VERSION",
+    "WINDOWID",
+];
+
 /// The controlling side of a PTY with a process on the other side.
 pub struct Pty {
     master: OwnedFd,
@@ -122,8 +145,13 @@ impl Pty {
             .current_dir(cwd)
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
-            .env("PWD", cwd)
-            .env_remove("TMUX");
+            .env("TERM_PROGRAM", "tapust")
+            .env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"))
+            .env("PWD", cwd);
+        // Programs must not mistake tapust for the terminal tapust was started from.
+        for var in OTHER_TERMINALS {
+            command.env_remove(var);
+        }
         unsafe {
             command.pre_exec(|| {
                 // A new session with the PTY as its controlling terminal.
