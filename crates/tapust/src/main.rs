@@ -10,6 +10,7 @@ mod notifications;
 mod pty;
 mod renderer;
 mod scroll;
+mod search;
 mod selection;
 mod shell;
 mod surface;

@@ -1,13 +1,13 @@
 //! A pane's widgets, as ghostty builds them (surface-scrolled-window.blp and
 //! surface.blp): an Adw.Bin with a GtkScrolledWindow around an Overlay whose
 //! child is the GLArea that draws the terminal, with ghostty's progress bar,
-//! child exited banner, resize overlay, unfocused-split veil, drag handle
-//! and drop overlay on top.
+//! child exited banner, resize overlay, search overlay, unfocused-split veil,
+//! drag handle and drop overlay on top.
 
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib, graphene};
@@ -23,6 +23,7 @@ use crate::scroll::SurfaceBin;
 use crate::links;
 use crate::mouse;
 use crate::notifications::DesktopNotifications;
+use crate::search;
 use crate::selection::{self, DragPoint};
 use crate::theme;
 
@@ -113,6 +114,8 @@ pub struct Surface {
     resize_bin: adw::Bin,
     url_left: gtk::Label,
     url_right: gtk::Label,
+    search: search::Overlay,
+    found: RefCell<search::Found>,
     progress: gtk::ProgressBar,
     progress_timer: RefCell<Option<glib::SourceId>>,
     /// ghostty's SurfaceChildExited and its banner.
@@ -339,6 +342,8 @@ impl Surface {
         url_left.add_controller(url_motion);
         overlay.add_overlay(&url_left);
         overlay.add_overlay(&url_right);
+        let search = search::Overlay::new();
+        overlay.add_overlay(&search.bin);
 
         let veil = gtk::Revealer::builder().transition_duration(0).can_focus(false).can_target(false).focusable(false).build();
         veil.set_child(Some(&theme::styled(gtk::DrawingArea::builder().build(), &["unfocused-split"])));
@@ -392,6 +397,8 @@ impl Surface {
             resize_bin,
             url_left,
             url_right,
+            search,
+            found: RefCell::new(search::Found::default()),
             progress,
             progress_timer: RefCell::new(None),
             child_exited,
@@ -446,6 +453,7 @@ impl Surface {
     }
 
     fn connect(self: &Rc<Self>, handler: Handler) {
+        self.connect_search(handler.clone());
         let weak = Rc::downgrade(self);
         self.area.connect_realize(move |area| {
             let Some(s) = weak.upgrade() else { return };
@@ -503,6 +511,7 @@ impl Surface {
                 s.schedule_resize_overlay();
             }
             h(Event::Resized { pane: s.pane, cols, rows, cell });
+            s.refresh_search();
         });
         let weak = Rc::downgrade(self);
         self.area.connect_render(move |_, _| {
@@ -541,6 +550,7 @@ impl Surface {
         let (weak, h) = (Rc::downgrade(self), handler.clone());
         focus.connect_enter(move |_| {
             if let Some(s) = weak.upgrade() {
+                s.found.borrow_mut().focused = false;
                 s.im.focus_in();
                 s.set_focused(true);
                 h(Event::Focused { pane: s.pane });
@@ -732,6 +742,60 @@ impl Surface {
         self.overlay.add_controller(target);
     }
 
+    /// Wires the search overlay as ghostty's surface does: up and Enter go to
+    /// older matches (ghostty's next-match), down and Shift+Enter to newer
+    /// ones, Escape and the close button end the search.
+    fn connect_search(self: &Rc<Self>, handler: Handler) {
+        /// A signal handler that runs `f` on the surface while it lives.
+        fn on<W: 'static>(weak: &Weak<Surface>, f: fn(&Surface)) -> impl Fn(&W) + 'static {
+            let weak = weak.clone();
+            move |_| {
+                if let Some(s) = weak.upgrade() {
+                    f(&s);
+                }
+            }
+        }
+        let weak = Rc::downgrade(self);
+        let entry = &self.search.entry;
+        entry.connect_search_changed(on(&weak, |s| {
+            if s.search.is_open() {
+                s.run_search(&s.search.entry.text());
+            }
+        }));
+        entry.connect_activate(on(&weak, |s| s.navigate_search(true)));
+        entry.connect_next_match(on(&weak, |s| s.navigate_search(true)));
+        entry.connect_previous_match(on(&weak, |s| s.navigate_search(false)));
+        entry.connect_stop_search(on(&weak, Surface::end_search));
+        self.search.up.connect_clicked(on(&weak, |s| s.navigate_search(true)));
+        self.search.down.connect_clicked(on(&weak, |s| s.navigate_search(false)));
+        self.search.close.connect_clicked(on(&weak, Surface::end_search));
+        // Ahead of the entry: Shift+Enter, which does not activate it, and the
+        // binding that opens the search, which selects the query again.
+        let keys = gtk::EventControllerKey::builder().propagation_phase(gtk::PropagationPhase::Capture).build();
+        let w = weak.clone();
+        keys.connect_key_pressed(move |_, keyval, _, state| {
+            let Some(s) = w.upgrade() else { return glib::Propagation::Proceed };
+            let enter = matches!(keyval, gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::ISO_Enter);
+            if enter && state.contains(gdk::ModifierType::SHIFT_MASK) {
+                s.navigate_search(false);
+            } else if search::is_start_search(keyval, state) {
+                s.start_search();
+            } else {
+                return glib::Propagation::Proceed;
+            }
+            glib::Propagation::Stop
+        });
+        entry.add_controller(keys);
+        let focus = gtk::EventControllerFocus::new();
+        focus.connect_enter(move |_| {
+            if let Some(s) = weak.upgrade() {
+                s.found.borrow_mut().focused = true;
+                handler(Event::Focused { pane: s.pane });
+            }
+        });
+        entry.add_controller(focus);
+    }
+
     fn direction(&self, x: f64, y: f64) -> Direction {
         let w = self.overlay.width() as f64;
         let h = self.overlay.height() as f64;
@@ -813,7 +877,7 @@ impl Surface {
                 shared.write(if focused { b"\x1b[I" } else { b"\x1b[O" });
             }
         }
-        self.veil.set_reveal_child(self.split.get() && !focused);
+        self.sync_veil();
         if focused {
             // ghostty's updateFocus: focus clears the bell and the notifications.
             self.set_bell_ringing(false);
@@ -833,7 +897,13 @@ impl Surface {
     pub fn set_split(&self, split: bool) {
         self.split.set(split);
         self.drag_handle.set_visible(split);
-        self.veil.set_reveal_child(split && !self.focused.get());
+        self.sync_veil();
+    }
+
+    /// ghostty's unfocused-split veil: over an unfocused split while no
+    /// search is open.
+    fn sync_veil(&self) {
+        self.veil.set_reveal_child(self.split.get() && !self.focused.get() && !self.search.is_open());
     }
 
     pub fn attach(&self, shared: Arc<Shared<term::Terminal>>) {
@@ -1344,6 +1414,101 @@ impl Surface {
         self.area.queue_render();
     }
 
+    /// ghostty's start_search: shows the search overlay and focuses its entry
+    /// with the query selected. Opening it searches anew for the query the
+    /// entry kept from the last search, as for a changed query.
+    pub fn start_search(&self) {
+        if !self.search.is_open() {
+            self.search.bin.set_visible(true);
+            self.sync_veil();
+            self.run_search(&self.search.entry.text());
+        }
+        self.search.entry.grab_focus();
+        self.search.entry.select_region(0, -1);
+    }
+
+    /// ghostty's end_search: hides the overlay, forgets the matches and their
+    /// highlights (the entry keeps the query), and gives the terminal the focus.
+    fn end_search(&self) {
+        self.search.bin.set_visible(false);
+        if let Some(timer) = std::mem::take(&mut *self.found.borrow_mut()).timer {
+            timer.remove();
+        }
+        self.search.count.set_label("");
+        self.sync_veil();
+        self.draw.borrow_mut().full = true;
+        self.area.queue_render();
+        self.area.grab_focus();
+    }
+
+    /// Searches the terminal for `query`: anew when it changed (ghostty's
+    /// search action), showing the current match, or again for new output.
+    fn run_search(&self, query: &str) {
+        let Some(shared) = self.draw.borrow().shared.clone() else { return };
+        let mut term = shared.term.lock();
+        let matches = term.search(query);
+        let bottom = term.view_top() + u64::from(term.rows()) - 1;
+        let mut found = self.found.borrow_mut();
+        found.ran = Some(Instant::now());
+        let changed = found.update(query, matches, bottom);
+        let scrolled = changed && found.current_match().is_some_and(|m| search::reveal(&mut term, m));
+        drop(term);
+        let label = found.label();
+        drop(found);
+        self.show_found(&label, scrolled);
+    }
+
+    /// ghostty's navigate_search: the next older match (up) or newer one,
+    /// wrapping around, scrolled into view.
+    fn navigate_search(&self, older: bool) {
+        let Some(shared) = self.draw.borrow().shared.clone() else { return };
+        let mut found = self.found.borrow_mut();
+        found.step(older);
+        let scrolled = found.current_match().is_some_and(|m| search::reveal(&mut shared.term.lock(), m));
+        let label = found.label();
+        drop(found);
+        self.show_found(&label, scrolled);
+    }
+
+    fn show_found(&self, label: &str, scrolled: bool) {
+        self.search.count.set_label(label);
+        self.draw.borrow_mut().full = true;
+        self.area.queue_render();
+        if scrolled {
+            self.sync_scrollbar();
+        }
+    }
+
+    /// New output or a new size runs an open search again, at most every
+    /// SEARCH_REFRESH; nothing happens while nothing is searched for.
+    pub fn refresh_search(self: &Rc<Self>) {
+        let mut found = self.found.borrow_mut();
+        if found.query.is_empty() || found.timer.is_some() {
+            return;
+        }
+        let wait = found.ran.map_or(Duration::ZERO, |ran| theme::SEARCH_REFRESH.saturating_sub(ran.elapsed()));
+        let weak = Rc::downgrade(self);
+        found.timer = Some(glib::timeout_add_local_once(wait, move || {
+            let Some(s) = weak.upgrade() else { return };
+            let query = {
+                let mut found = s.found.borrow_mut();
+                found.timer = None;
+                found.query.clone()
+            };
+            s.run_search(&query);
+        }));
+    }
+
+    /// Gives the surface the focus where the user left it: the search entry,
+    /// keeping its selection, if it had the focus last, else the terminal.
+    pub fn grab_focus(&self) {
+        let entry = self.search.is_open() && self.found.borrow().focused;
+        match entry.then(|| self.search.entry.delegate()).flatten().and_downcast::<gtk::Text>() {
+            Some(text) => text.grab_focus_without_selecting(),
+            None => self.area.grab_focus(),
+        };
+    }
+
     /// ghostty's scrollCallback for the vertical wheel: rows from the wheel
     /// (three per detent, scaled; touchpad deltas times ten), sent as cursor
     /// keys on the alternate screen of a program that wants no mouse, as
@@ -1610,7 +1775,8 @@ impl Surface {
             let mut term = shared.term.lock();
             shared.want_lock.store(false, Ordering::Release);
             let selection = term.selection();
-            compose::copy_pane(grid, &mut term, d.full, selection.as_ref());
+            let found = self.found.borrow();
+            compose::copy_pane(grid, &mut term, d.full, &found.matches, found.current, selection.as_ref());
             if let Some((link, _)) = self.hover.borrow().as_ref() {
                 compose::underline(grid, &term, link);
             }

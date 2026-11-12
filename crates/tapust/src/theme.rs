@@ -81,6 +81,13 @@ pub const CLICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// How often ghostty scrolls while a selection is dragged past the edge.
 pub const SELECTION_SCROLL: std::time::Duration = std::time::Duration::from_millis(15);
 
+/// ghostty's search-foreground and search-background for the matches of a
+/// search, and search-selected-foreground and -background for the current one.
+pub const SEARCH_MATCH: (Rgb, Rgb) = (rgb(0x000000), rgb(0xFFE082));
+pub const SEARCH_CURRENT: (Rgb, Rgb) = (rgb(0x000000), rgb(0xF2A57E));
+/// New output runs an open search again at most this often.
+pub const SEARCH_REFRESH: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// ghostty's gtk-horizontal-tab-scroll: touchpad units to a tab switch, and
 /// how long the movement is remembered.
 pub const SWIPE_TAB: f64 = 120.0;

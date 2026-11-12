@@ -17,6 +17,7 @@ use crate::compose;
 use crate::input;
 use crate::notifications;
 use crate::pty::{ChildExit, PaneIo, Pty};
+use crate::search;
 use crate::surface::{Event, Surface};
 use crate::theme;
 
@@ -534,8 +535,8 @@ impl App {
             let id = glib::timeout_add_local_once(theme::OVERVIEW_FOCUS, move || {
                 if let Some(app) = weak.upgrade() {
                     app.overview_focus.take();
-                    if let Some(area) = app.active_area() {
-                        area.grab_focus();
+                    if let Some(surface) = app.active_surface() {
+                        surface.grab_focus();
                     }
                 }
             });
@@ -741,8 +742,8 @@ impl App {
                     glib::idle_add_local_once(move || {
                         if let Some(app) = weak.upgrade() {
                             app.restore_focus_pending.set(false);
-                            if let Some(area) = app.active_area().filter(|a| a.is_mapped()) {
-                                area.grab_focus();
+                            if let Some(surface) = app.active_surface().filter(|s| s.area.is_mapped()) {
+                                surface.grab_focus();
                             }
                         }
                     });
@@ -775,6 +776,14 @@ impl App {
     /// A key press; `commit` is the input method's text for it, which is
     /// typed as it is (a dead key or a direct input method).
     fn key(self: &Rc<Self>, pane: PaneId, keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType, commit: Option<String>) -> bool {
+        // ghostty's start_search binding comes before the tmux key tables.
+        if search::is_start_search(keyval, state) {
+            let surface = self.state.borrow().panes.get(&pane).map(|p| p.surface.clone());
+            if let Some(surface) = surface {
+                surface.start_search();
+            }
+            return true;
+        }
         let (key, text) = match commit {
             Some(text) => {
                 for c in text.chars() {
@@ -893,6 +902,7 @@ impl App {
         };
         p.child_exited |= exit.is_some();
         p.surface.output();
+        p.surface.refresh_search();
         p.surface.area.queue_render();
         p.surface.sync_scrollbar();
         p.surface.update_cursor();
@@ -983,7 +993,7 @@ impl App {
         // A pane hidden by a zoomed split is not in the window.
         let Some((surface, page)) = found.filter(|(s, _)| s.outer.is_ancestor(&self.window)) else { return };
         self.tab_view.set_selected_page(&page);
-        surface.area.grab_focus();
+        surface.grab_focus();
         self.window.present();
     }
 
@@ -1220,18 +1230,13 @@ impl App {
         // Replacing split widgets makes GTK move the focus to a focusable
         // ancestor after the next paint unless it is grabbed again
         // (ghostty's onRebuild grabs the last focused surface).
-        if let Some(area) = self.active_area() {
-            area.grab_focus();
+        if let Some(surface) = self.active_surface() {
+            surface.grab_focus();
         }
         self.syncing.set(false);
         self.show_overlay();
         self.sync_copy_action();
         self.queue_geometry();
-    }
-
-    fn active_area(&self) -> Option<gtk::GLArea> {
-        let st = self.state.borrow();
-        st.panes.get(&st.session.active_pane()).map(|p| p.surface.area.clone())
     }
 
     /// Builds the tab's widgets again when its tree changed (ghostty's
@@ -1647,6 +1652,7 @@ impl App {
         self.active_io(|io| io.shared.term.lock().full_reset());
         self.sync_copy_action();
         if let Some(surface) = self.active_surface() {
+            surface.refresh_search();
             surface.area.queue_render();
         }
     }

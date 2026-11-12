@@ -3,6 +3,7 @@
 use term::{Attrs, Cell, Color, CursorShape, Palette, Rgb, Selection, Style, Terminal, Underline, Width};
 
 use crate::frame::{BOLD, CursorStyle, FrameCell, FrameCursor, Grid, ITALIC, STRIKE, UNDERLINE, WIDE};
+use crate::theme;
 
 fn rgba(c: Rgb) -> [u8; 4] {
     [c.r, c.g, c.b, 0xff]
@@ -62,17 +63,39 @@ fn frame_cell(cell: Cell, term: &Terminal, palette: &Palette, reverse_video: boo
     FrameCell { ch, fg, bg, flags }
 }
 
-/// Copies the terminal's dirty rows (all rows when `full`) into its pane's
-/// grid and clears the terminal's dirty marks. Rows and columns the terminal
-/// does not have yet (it is resized after the grid) are blank.
+/// Gives the cells of `sel` on `line` the colors (`fg`, `bg`).
+fn paint(out: &mut [FrameCell], sel: &Selection, line: u64, cols: usize, (fg, bg): ([u8; 4], [u8; 4])) {
+    if let Some((left, right)) = sel.columns(line, cols as u16)
+        && let Some(cells) = out.get_mut(left as usize..=(right as usize).min(cols - 1))
+    {
+        for cell in cells {
+            (cell.fg, cell.bg) = (fg, bg);
+        }
+    }
+}
+
 /// Copies the terminal's dirty viewport rows (all of them when `full`) into
-/// `grid`, drawing the cells of `selection` with ghostty's default selection
-/// colors: the terminal's default foreground and background swapped.
-pub fn copy_pane(grid: &mut Grid, term: &mut Terminal, full: bool, selection: Option<&Selection>) {
+/// `grid` and clears the terminal's dirty marks. Rows and columns the
+/// terminal does not have yet (it is resized after the grid) are blank.
+/// The search's `matches` (ordered and not overlapping) get ghostty's search
+/// colors, the `current` one its selected-match colors, and the cells of
+/// `selection` over them ghostty's default selection colors: the terminal's
+/// default foreground and background swapped.
+pub fn copy_pane(
+    grid: &mut Grid,
+    term: &mut Terminal,
+    full: bool,
+    matches: &[Selection],
+    current: Option<usize>,
+    selection: Option<&Selection>,
+) {
     let (rows, cols) = (term.rows().min(grid.rows()), term.cols().min(grid.cols()) as usize);
     let palette = term.palette();
     let reverse_video = term.modes().reverse_video;
     let blank = FrameCell::blank(style_colors(&Style::DEFAULT, palette, reverse_video).1);
+    let colors = |(fg, bg): (Rgb, Rgb)| (rgba(fg), rgba(bg));
+    let (fg, bg) = style_colors(&Style::DEFAULT, palette, false);
+    let selected = (bg, fg);
     for y in 0..grid.rows() {
         if !full && (y >= rows || !term.dirty().is_dirty(y)) {
             continue;
@@ -86,11 +109,15 @@ pub fn copy_pane(grid: &mut Grid, term: &mut Terminal, full: bool, selection: Op
             *dst = if cell == Cell::EMPTY && !reverse_video { blank } else { frame_cell(cell, term, palette, reverse_video) };
         }
         out[cols..].fill(blank);
-        if let Some((left, right)) = selection.and_then(|s| s.columns(term.view_top() + u64::from(y), cols as u16)) {
-            let (fg, bg) = style_colors(&Style::DEFAULT, palette, false);
-            for cell in &mut out[left as usize..=(right as usize).min(cols - 1)] {
-                (cell.fg, cell.bg) = (bg, fg);
-            }
+        let line = term.view_top() + u64::from(y);
+        // Ordered matches that do not overlap end in order too.
+        let first = matches.partition_point(|m| m.end.line < line);
+        for (i, m) in matches.iter().enumerate().skip(first).take_while(|(_, m)| m.start.line <= line) {
+            let pair = if Some(i) == current { theme::SEARCH_CURRENT } else { theme::SEARCH_MATCH };
+            paint(out, m, line, cols, colors(pair));
+        }
+        if let Some(sel) = selection {
+            paint(out, sel, line, cols, selected);
         }
     }
     term.clear_dirty();
@@ -183,5 +210,37 @@ fn cursor_at(term: &Terminal, grid: usize, style: CursorStyle) -> FrameCursor {
         color: palette.cursor.map(rgba).unwrap_or(fg),
         text_color: bg,
         wide: cell.width() == Width::Wide,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use term::Point;
+
+    #[test]
+    fn search_matches_are_highlighted_under_the_selection() {
+        let mut t = Terminal::new(12, 2, 10);
+        t.feed(b"abc abc abcabc");
+        let matches = t.search("abc");
+        assert_eq!(matches.len(), 4);
+        let top = t.view_top();
+        let selection = Selection { start: Point { line: top, col: 5 }, end: Point { line: top, col: 5 }, rect: false };
+        let new_grid = || Grid::new(0, (0, 0, 120, 40), (0, 0), (12, 2), [0; 4]);
+        let (mut plain, mut grid) = (new_grid(), new_grid());
+        copy_pane(&mut plain, &mut t, true, &[], None, None);
+        copy_pane(&mut grid, &mut t, true, &matches, Some(3), Some(&selection));
+        let colors = |grid: &Grid, y: u16, x: usize| (grid.row(y)[x].fg, grid.row(y)[x].bg);
+        let pair = |(fg, bg): (Rgb, Rgb)| (rgba(fg), rgba(bg));
+        let (found, current) = (pair(theme::SEARCH_MATCH), pair(theme::SEARCH_CURRENT));
+        let palette = t.palette();
+        assert_eq!(colors(&grid, 0, 0), found);
+        assert_eq!(colors(&grid, 0, 3), colors(&plain, 0, 3));
+        assert_eq!(colors(&grid, 0, 5), (rgba(palette.background), rgba(palette.foreground)));
+        assert_eq!(colors(&grid, 0, 6), found);
+        // The last match wrapped: columns 11 and 0-1.
+        assert_eq!(colors(&grid, 0, 11), current);
+        assert_eq!(colors(&grid, 1, 1), current);
+        assert_eq!(colors(&grid, 1, 2), colors(&plain, 1, 2));
     }
 }
