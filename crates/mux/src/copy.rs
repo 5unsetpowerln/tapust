@@ -309,7 +309,7 @@ impl Session {
     /// count, which goes back to 1 (window_copy_command).
     pub(crate) fn send_copy(&mut self, command: CopyCommand) -> Result<(), String> {
         let pane = self.cur().active;
-        let Some(prefix) = self.modes.get_mut(&pane) else { return Err("not in a mode".to_owned()) };
+        let Some(prefix) = self.cur_mut().pane_mut(pane).mode.as_mut() else { return Err("not in a mode".to_owned()) };
         let count = std::mem::replace(prefix, 1);
         self.writes.push(Effect::CopyCommand { pane, command, count });
         Ok(())
@@ -328,7 +328,7 @@ impl Session {
             Err(_) => return Err("repeat count invalid".to_owned()),
         };
         let pane = self.cur().active;
-        if let Some(prefix) = self.modes.get_mut(&pane) {
+        if let Some(prefix) = self.cur_mut().pane_mut(pane).mode.as_mut() {
             *prefix = count;
         }
         Ok(())
@@ -336,6 +336,6 @@ impl Session {
 
     /// `#{pane_search_string}`.
     pub(crate) fn search_string(&self, pane: PaneId) -> String {
-        self.searches.get(&pane).map(|s| s.text.clone()).unwrap_or_default()
+        self.find_pane(pane).and_then(|p| p.search.as_ref()).map(|s| s.text.clone()).unwrap_or_default()
     }
 }

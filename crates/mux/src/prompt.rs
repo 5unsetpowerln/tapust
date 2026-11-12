@@ -318,7 +318,7 @@ impl Session {
 
         let size = p.buffer.len();
         let types = p.history_type();
-        let history = &self.history[types];
+        let history = self.server.history(types);
         // The incremental prompt's command runs again on `goto changed`,
         // with this prefix before the text.
         let mut prefix = '=';
@@ -429,13 +429,7 @@ impl Session {
             PKey::Enter => {
                 let p = self.prompt.take().expect("prompt");
                 let line: String = p.buffer.iter().collect();
-                let history = &mut self.history[types];
-                if !line.is_empty() && history.last() != Some(&line) {
-                    history.push(line.clone());
-                    if history.len() > HISTORY_LIMIT {
-                        history.remove(0);
-                    }
-                }
+                self.server.add_history(types, &line, HISTORY_LIMIT);
                 self.prompt_accept(p.kind, &line, now);
                 return false;
             }

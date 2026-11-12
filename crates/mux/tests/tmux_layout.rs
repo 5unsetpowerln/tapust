@@ -201,7 +201,7 @@ fn tmux_run(socket: &Path, (w, h): (u16, u16), n: usize, steps: &[Step]) -> Resu
 
 /// The same from the model.
 fn model_run((w, h): (u16, u16), n: usize, steps: &[Step]) -> Vec<Vec<String>> {
-    let (mut s, _) = Session::new();
+    let (mut s, _) = Session::new(&mux::Server::new(), None);
     for i in 1..n {
         s.command(&split(i % 2 == 1));
     }

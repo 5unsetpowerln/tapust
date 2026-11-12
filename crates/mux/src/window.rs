@@ -1,9 +1,11 @@
 //! Windows and panes: tmux 3.6's `window.c` bookkeeping (pane order, the
 //! last-pane stack, zoom, directional selection) over ghostty's split tree.
 
+use std::cell::Cell;
+
 use crate::layout::{self, Layout};
 use crate::split::{Node, Side};
-use crate::{PaneId, Rect};
+use crate::{PaneId, PaneSearch, Rect};
 
 #[derive(Clone, Debug)]
 pub(crate) struct Pane {
@@ -18,6 +20,10 @@ pub(crate) struct Pane {
     pub title: String,
     /// The foreground process name reported by the GUI (automatic-rename).
     pub auto_name: String,
+    /// In copy mode, with the mode's prefix (the count `send -N` set).
+    pub mode: Option<u32>,
+    /// The last copy-mode search (`wp->searchstr`).
+    pub search: Option<PaneSearch>,
 }
 
 impl Pane {
@@ -30,13 +36,15 @@ impl Pane {
             active_point: 0,
             title: String::new(),
             auto_name: String::new(),
+            mode: None,
+            search: None,
         }
     }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct Window {
-    /// tmux `@N`, never reused within a session.
+    /// tmux `@N`, never reused within a server.
     pub id: u32,
     /// The size GTK gives the window's split tree, in logical pixels.
     pub area: Rect,
@@ -193,7 +201,7 @@ impl Window {
     }
 
     /// window_set_active_pane; `next_point` is tmux's global `next_active_point`.
-    pub(crate) fn set_active(&mut self, wp: PaneId, next_point: &mut u32) -> bool {
+    pub(crate) fn set_active(&mut self, wp: PaneId, next_point: &Cell<u32>) -> bool {
         if wp == self.active {
             return false;
         }
@@ -203,8 +211,8 @@ impl Window {
             self.stack_push(last);
         }
         self.active = wp;
-        self.pane_mut(wp).active_point = *next_point;
-        *next_point = next_point.wrapping_add(1);
+        self.pane_mut(wp).active_point = next_point.get();
+        next_point.set(next_point.get().wrapping_add(1));
         true
     }
 
@@ -229,7 +237,7 @@ impl Window {
     }
 
     /// window_zoom
-    pub(crate) fn zoom(&mut self, wp: PaneId, next_point: &mut u32) -> bool {
+    pub(crate) fn zoom(&mut self, wp: PaneId, next_point: &Cell<u32>) -> bool {
         if self.zoomed || self.panes.len() == 1 {
             return false;
         }
@@ -256,7 +264,7 @@ impl Window {
     }
 
     /// window_pop_zoom
-    pub(crate) fn pop_zoom(&mut self, next_point: &mut u32) -> bool {
+    pub(crate) fn pop_zoom(&mut self, next_point: &Cell<u32>) -> bool {
         if self.was_zoomed {
             let active = self.active;
             return self.zoom(active, next_point);

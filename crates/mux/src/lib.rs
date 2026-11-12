@@ -1,9 +1,12 @@
-//! A tmux-compatible model of one session: windows, panes and the key
-//! tables, reproducing tmux 3.6 defaults with the tmux-pain-control bindings
-//! on top. Panes are split as ghostty splits them: a tree of ratios laid out
-//! in pixels with a thin divider, instead of tmux's cell grid with borders.
-//! tmux's layout presets and `select-layout -E` are computed on that grid,
-//! at the window's size in cells, and given to the tree as ratios.
+//! A tmux-compatible model of sessions: windows, panes and the key tables,
+//! reproducing tmux 3.6 defaults with the tmux-pain-control bindings on
+//! top. The sessions of one process share a [`Server`], which numbers them
+//! and their windows and panes and holds the paste buffers, and windows
+//! move between them as with move-window. Panes are split as ghostty splits
+//! them: a tree of ratios laid out in pixels with a thin divider, instead
+//! of tmux's cell grid with borders. tmux's layout presets and
+//! `select-layout -E` are computed on that grid, at the window's size in
+//! cells, and given to the tree as ratios.
 //!
 //! The model does no I/O. It tells the GUI what to do through [`Effect`]s
 //! (spawn a shell, resize or destroy a pane, write bytes, run a copy-mode
@@ -21,6 +24,7 @@ mod keys;
 mod layout;
 mod paste;
 mod prompt;
+mod server;
 mod session;
 mod split;
 mod window;
@@ -30,13 +34,14 @@ mod tests;
 
 pub use copy::{CopyCommand, ModeKeys, SearchArg};
 pub use layout::Layout;
+pub use server::Server;
 pub use split::{f16, Node, Split};
 
 use keys::KeyState;
 use prompt::Prompt;
 use window::Window;
 
-/// Pane identifier (tmux `%N`), never reused within a session.
+/// Pane identifier (tmux `%N`), never reused within a server.
 pub type PaneId = u32;
 
 /// The `word-separators` option.
@@ -103,11 +108,12 @@ pub struct Mods {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     /// A new pane: make its surface, and start a shell once GTK gives it a
-    /// size. `parent` is the pane it was made from (the split pane, or the
-    /// active pane of the window current at new-window), whose font size it
-    /// takes (ghostty's window-inherit-font-size); with `inherit_cwd`
-    /// (`-c "#{pane_current_path}"`) it starts in the parent's current
-    /// directory, else in the session's default directory.
+    /// size. `parent` is the pane it was made from (the split pane, the
+    /// active pane of the window current at new-window, or the pane a new
+    /// session was asked for from), which may be in another session; it
+    /// takes the parent's font size (ghostty's window-inherit-font-size).
+    /// With `inherit_cwd` (`-c "#{pane_current_path}"`) it starts in the
+    /// parent's current directory, else in the session's default directory.
     Spawn { pane: PaneId, parent: Option<PaneId>, inherit_cwd: bool },
     /// `resize-pane`: move the divider nearest to `pane` with that
     /// orientation by `cells` cells (negative is left or up), as ghostty's
@@ -128,7 +134,8 @@ pub enum Effect {
     /// bracketed paste fences when `bracket` (`-p`) and the pane asked for
     /// bracketed paste.
     Paste { pane: PaneId, data: Vec<u8>, bracket: bool },
-    /// No windows are left; the program should exit.
+    /// No windows are left: the session is destroyed, and its GUI window
+    /// should close.
     Exit,
 }
 
@@ -297,7 +304,8 @@ pub struct PaneInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowInfo {
     pub index: u32,
-    /// tmux `@N`, which stays with the window when its index changes.
+    /// tmux `@N`, which stays with the window when its index or its
+    /// session changes.
     pub id: u32,
     pub name: String,
     /// The name was set with rename-window, which turns automatic-rename off.
@@ -310,30 +318,20 @@ pub struct WindowInfo {
     pub panes: Vec<PaneInfo>,
 }
 
-/// One tmux session shown in one GUI window.
+/// One tmux session shown in one GUI window, which is its client.
 pub struct Session {
+    server: Server,
+    /// tmux `$N`.
+    id: u32,
     name: String,
     /// Winlinks by index; a winlink is identified by its index.
     winlinks: BTreeMap<u32, Window>,
     curw: u32,
     /// `s->lastw`, most recent first.
     lastw: Vec<u32>,
-    next_pane_id: PaneId,
-    next_window_id: u32,
-    /// tmux's global `next_active_point`.
-    next_active_point: u32,
     keys: KeyState,
     prompt: Option<Prompt>,
     message: Option<(String, Instant)>,
-    /// tmux's prompt histories: commands, then searches.
-    history: [Vec<String>; 2],
-    /// The `mode-keys` option.
-    mode_keys: ModeKeys,
-    /// Panes in copy mode, with the mode's prefix (the count `send -N` set).
-    modes: BTreeMap<PaneId, u32>,
-    /// Each pane's last copy-mode search.
-    searches: BTreeMap<PaneId, PaneSearch>,
-    buffers: paste::Buffers,
     generation: u64,
     /// No windows are left.
     dead: bool,
@@ -346,10 +344,47 @@ pub struct Session {
 }
 
 impl Session {
-    /// A session with one window and one pane. Returns the first pane's
-    /// `Spawn` effect.
-    pub fn new() -> (Session, Vec<Effect>) {
-        session::new_session()
+    /// new-session: a session of `server` with one window and one pane,
+    /// asked for from pane `parent` (whose directory and font size the
+    /// first pane takes) or from outside. Returns the first pane's `Spawn`
+    /// effect.
+    pub fn new(server: &Server, parent: Option<PaneId>) -> (Session, Vec<Effect>) {
+        session::new_session(server, parent)
+    }
+
+    /// move-window -s @`id` -t `dst`: the window, its panes as they are,
+    /// leaves this session for `dst`, where it goes at `position` among the
+    /// windows in index order (`-b` before the window there, or `-a` after
+    /// the last one) and becomes the current window. A dead `dst` takes
+    /// nothing. Returns this session's effects: `Exit` when the window was
+    /// its last, since tmux destroys an empty session.
+    pub fn move_window(&mut self, id: u32, dst: &mut Session, position: usize) -> Vec<Effect> {
+        let Some(idx) = self.window_by_id(id).filter(|_| !dst.dead) else { return Vec::new() };
+        let moved = self.winlinks[&idx].panes.iter().map(|p| p.id).collect();
+        let mut window = None;
+        let effects = self.op_keeping(&moved, |s| window = Some(s.unlink_window(idx)));
+        let window = window.expect("unlinked window");
+        dst.op(|d| d.link_window(window, position));
+        effects
+    }
+
+    /// new-session followed by move-window -s @`id`: a new session of the
+    /// same server whose only window is this session's window `id`.
+    /// Returns it with this session's effects, or `None` without the window.
+    pub fn move_window_new(&mut self, id: u32) -> Option<(Session, Vec<Effect>)> {
+        self.window_by_id(id)?;
+        let mut dst = session::blank(&self.server);
+        let effects = self.move_window(id, &mut dst, 0);
+        Some((dst, effects))
+    }
+
+    /// kill-session: every window and pane goes, then the session.
+    pub fn kill(&mut self) -> Vec<Effect> {
+        self.op(|s| {
+            s.winlinks.clear();
+            s.lastw.clear();
+            s.dead = true;
+        })
     }
 
     /// The split tree of the window at `index`, with its zoomed pane (GTK
@@ -421,34 +456,26 @@ impl Session {
         self.handle_key(key, now)
     }
 
-    /// The `mode-keys` option, which tmux sets from $VISUAL or $EDITOR when
-    /// it starts ([`ModeKeys::from_env`]).
-    pub fn set_mode_keys(&mut self, keys: ModeKeys) {
-        self.mode_keys = keys;
-    }
-
-    pub fn mode_keys(&self) -> ModeKeys {
-        self.mode_keys
-    }
-
     /// Whether the pane is in copy mode.
     pub fn in_mode(&self, pane: PaneId) -> bool {
-        self.modes.contains_key(&pane)
+        self.find_pane(pane).is_some_and(|p| p.mode.is_some())
     }
 
     /// The GUI carried out an [`Effect::CopyCommand`]: keeps the paste
     /// buffer and the search it made, and ends the mode if it was cancelled.
     pub fn copy_result(&mut self, pane: PaneId, result: CopyResult) {
-        if let Some(search) = result.search {
-            self.searches.insert(pane, search);
-        }
         match result.copied {
-            Some(Copied::New(data)) => self.buffers.add(data),
-            Some(Copied::Append(data)) => self.buffers.append(data),
+            Some(Copied::New(data)) => self.server.buffers().add(data),
+            Some(Copied::Append(data)) => self.server.buffers().append(data),
             None => {}
         }
-        if result.cancel {
-            self.modes.remove(&pane);
+        if let Some(p) = self.find_pane_mut(pane) {
+            if let Some(search) = result.search {
+                p.search = Some(search);
+            }
+            if result.cancel {
+                p.mode = None;
+            }
         }
         self.generation += 1;
     }

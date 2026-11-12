@@ -94,8 +94,8 @@ impl Buffers {
     }
 
     #[cfg(test)]
-    pub fn names(&self) -> Vec<&str> {
-        self.list.iter().map(|b| b.name.as_str()).collect()
+    pub fn names(&self) -> Vec<String> {
+        self.list.iter().map(|b| b.name.clone()).collect()
     }
 }
 

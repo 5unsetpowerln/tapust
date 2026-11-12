@@ -1,6 +1,8 @@
-//! The application window as ghostty builds it with GTK and libadwaita
+//! The application windows as ghostty builds them with GTK and libadwaita
 //! (window.blp, tab.blp, split_tree.zig), driven by the tmux model of the
-//! `mux` crate: every tmux window is a tab, every tab holds the split tree.
+//! `mux` crate: every GTK window shows one tmux session, every tmux window
+//! of it is a tab, every tab holds the split tree. Tabs dragged between
+//! windows move their tmux windows between the sessions.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -13,7 +15,7 @@ use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use mux::{
     Command, ConfirmTarget, Copied, CopyResult, Effect, InputKind, KeyResult, ModeKeys, Node, Overlay, PaneId, Rect,
-    Session,
+    Server, Session,
 };
 
 use crate::bindings::{self, Binding, Scroll};
@@ -55,6 +57,9 @@ struct Tab {
     /// The tree and zoomed pane the widgets were built from.
     built: Option<(Node, Option<PaneId>)>,
     splits: Vec<Rc<SplitWidget>>,
+    /// libadwaita took the page out of the tab view for a drag, and has
+    /// not attached it to a tab view again yet.
+    detached: bool,
 }
 
 struct State {
@@ -62,18 +67,33 @@ struct State {
     panes: HashMap<PaneId, Pane>,
     /// Tabs by tmux window id.
     tabs: HashMap<u32, Tab>,
-    cwd: PathBuf,
-    /// Program for the first pane (`-e`); later panes run the login shell.
-    command: Option<Vec<OsString>>,
-    palette: term::Palette,
-    term_bg: [u8; 4],
     /// The prompt or message on screen, as a dialog or a toast.
     shown: Option<Overlay>,
     window_title_override: Option<String>,
     tick: Option<glib::SourceId>,
 }
 
+/// The application: tmux's server, with one window per session.
 pub struct App {
+    application: adw::Application,
+    server: Server,
+    windows: RefCell<Vec<Rc<Window>>>,
+    /// The window showing each pane, which gets the pane's events.
+    owners: RefCell<HashMap<PaneId, Weak<Window>>>,
+    cwd: PathBuf,
+    /// Program for the first pane (`-e`); later panes run the login shell.
+    command: RefCell<Option<Vec<OsString>>>,
+    palette: term::Palette,
+    term_bg: [u8; 4],
+    /// When the last desktop notification was shown and its hash (ghostty's
+    /// last_notification_time and last_notification_digest).
+    last_notification: Cell<Option<(Instant, u64)>>,
+}
+
+/// A GTK window (ghostty's Window) showing one tmux session; it is the
+/// session's client.
+struct Window {
+    app: Rc<App>,
     state: RefCell<State>,
     window: adw::ApplicationWindow,
     tab_view: adw::TabView,
@@ -90,12 +110,11 @@ pub struct App {
     context_page: RefCell<Option<adw::TabPage>>,
     overview: adw::TabOverview,
     overview_focus: RefCell<Option<glib::SourceId>>,
-    /// The last window closed while the tab overview was open: the window
+    /// The session ended while the tab overview was open: the window
     /// stays (ghostty's tabViewNPages) and the next new tab starts a session.
     session_ended: Cell<bool>,
-    /// When the last desktop notification was shown and its hash (ghostty's
-    /// last_notification_time and last_notification_digest).
-    last_notification: Cell<Option<(Instant, u64)>>,
+    /// The window is going away: GTK no longer shows the model in it.
+    closing: Cell<bool>,
 }
 
 /// ghostty's SplitTreeSplit: Adw.Bin > Adw.Bin > GtkPaned, keeping the
@@ -339,6 +358,190 @@ fn main_menu() -> gio::Menu {
 
 impl App {
     pub fn build(application: &adw::Application, command: Option<Vec<OsString>>) -> Rc<App> {
+        let palette = theme::palette();
+        let term_bg = compose::resolve(term::Color::Default, &palette, palette.background);
+        // ghostty's window-theme = auto: the scheme follows how light the
+        // terminal background is (perceived luminance).
+        let [r, g, b, _] = term_bg.map(|c| f64::from(c) / 255.0);
+        let luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+        application.style_manager().set_color_scheme(if luminance > 0.5 {
+            adw::ColorScheme::PreferLight
+        } else {
+            adw::ColorScheme::PreferDark
+        });
+        // tmux's main sets mode-keys from $VISUAL or $EDITOR.
+        let server = Server::new();
+        let (visual, editor) = (std::env::var_os("VISUAL"), std::env::var_os("EDITOR"));
+        server.set_mode_keys(ModeKeys::from_env(visual.as_deref(), editor.as_deref()));
+        let app = Rc::new(App {
+            application: application.clone(),
+            server,
+            windows: RefCell::new(Vec::new()),
+            owners: RefCell::new(HashMap::new()),
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            command: RefCell::new(command),
+            palette,
+            term_bg,
+            last_notification: Cell::new(None),
+        });
+        APP.with(|a| *a.borrow_mut() = Some(app.clone()));
+        app.add_actions();
+        app.new_window(None);
+        app
+    }
+
+    /// new-session in a new window (ghostty's new_window): the first pane
+    /// takes the directory and font size of `parent`.
+    fn new_window(self: &Rc<Self>, parent: Option<PaneId>) {
+        let (session, effects) = Session::new(&self.server, parent);
+        let window = self.add_window(session);
+        window.apply(effects);
+        window.reconcile();
+        window.window.present();
+    }
+
+    fn add_window(self: &Rc<Self>, session: Session) -> Rc<Window> {
+        let window = Window::build(self, session);
+        let (weak, gone) = (Rc::downgrade(self), Rc::downgrade(&window));
+        window.window.connect_destroy(move |_| {
+            if let Some(app) = weak.upgrade() {
+                app.windows.borrow_mut().retain(|w| Rc::as_ptr(w) != gone.as_ptr());
+            }
+        });
+        self.windows.borrow_mut().push(window.clone());
+        window
+    }
+
+    fn add_actions(self: &Rc<Self>) {
+        let present = gio::SimpleAction::new("present-surface", Some(glib::VariantTy::UINT64));
+        let weak = Rc::downgrade(self);
+        present.connect_activate(move |_, parameter| {
+            if let (Some(app), Some(id)) = (weak.upgrade(), parameter.and_then(|p| p.get::<u64>())) {
+                app.present_surface(id);
+            }
+        });
+        self.application.add_action(&present);
+        let quit = gio::SimpleAction::new("quit", None);
+        let weak = Rc::downgrade(self);
+        quit.connect_activate(move |_, _| {
+            if let Some(app) = weak.upgrade() {
+                app.quit();
+            }
+        });
+        self.application.add_action(&quit);
+    }
+
+    fn windows(&self) -> Vec<Rc<Window>> {
+        self.windows.borrow().clone()
+    }
+
+    fn owner(&self, pane: PaneId) -> Option<Rc<Window>> {
+        self.owners.borrow().get(&pane).and_then(Weak::upgrade)
+    }
+
+    fn set_owner(&self, pane: PaneId, window: &Rc<Window>) {
+        self.owners.borrow_mut().insert(pane, Rc::downgrade(window));
+    }
+
+    /// A surface's event goes to the window that shows its pane.
+    fn handle(&self, pane: PaneId, event: Event) -> bool {
+        self.owner(pane).is_some_and(|window| window.handle(event))
+    }
+
+    fn wake(&self, pane: PaneId) {
+        if let Some(window) = self.owner(pane) {
+            window.wake(pane);
+        }
+    }
+
+    /// What a new pane takes from the pane it was made from, in whichever
+    /// window that is: the font size, and with `inherit_cwd` the directory
+    /// of its foreground process; else the defaults.
+    fn origin(&self, parent: Option<PaneId>, inherit_cwd: bool) -> (f32, PathBuf) {
+        let window = parent.and_then(|p| self.owner(p));
+        let st = window.as_ref().map(|w| w.state.borrow());
+        let parent = st.as_ref().zip(parent).and_then(|(st, p)| st.panes.get(&p));
+        let points = parent.map_or(theme::FONT_POINTS, |p| p.surface.font_points());
+        let cwd = parent
+            .filter(|_| inherit_cwd)
+            .and_then(|p| p.io.as_ref())
+            .and_then(|io| io.pty.foreground_cwd())
+            .unwrap_or_else(|| self.cwd.clone());
+        (points, cwd)
+    }
+
+    /// A split widget of tmux window `window` writes its ratio back, to the
+    /// window that shows it now.
+    fn set_ratio(&self, window: u32, index: usize, ratio: f64) {
+        for w in self.windows() {
+            w.set_ratio(window, index, ratio);
+        }
+    }
+
+    /// The window whose state has the tab of `page`, and the tab's tmux window.
+    fn tab_owner(&self, page: &adw::TabPage) -> Option<(Rc<Window>, u32)> {
+        self.windows().into_iter().find_map(|w| {
+            let id = w.tab_of(page)?;
+            Some((w, id))
+        })
+    }
+
+    /// ghostty's Surface.showDesktopNotification: across surfaces, at most
+    /// one notification a second and the same one at most every 5 seconds.
+    fn desktop_notification(&self, surface: &Surface, title: &str, body: &str) {
+        let now = Instant::now();
+        let digest = notifications::hash(title, body);
+        if let Some((last, last_digest)) = self.last_notification.get() {
+            let since = now - last;
+            if since < Duration::from_secs(1) || (last_digest == digest && since < Duration::from_secs(5)) {
+                return;
+            }
+        }
+        self.last_notification.set(Some((now, digest)));
+        surface.send_desktop_notification(title, body);
+    }
+
+    /// ghostty's app.present-surface: the window with the notification's
+    /// surface presents it.
+    fn present_surface(&self, id: u64) {
+        if id == 0 {
+            return;
+        }
+        let window = self.windows().into_iter().find(|w| w.state.borrow().panes.values().any(|p| p.surface.id == id));
+        if let Some(window) = window {
+            window.present_surface(id);
+        }
+    }
+
+    /// ghostty's Application.quit, asking once when a pane of any window
+    /// needs it: every window closes with its session (kill-server), and
+    /// the application ends with the last one.
+    fn quit(self: &Rc<Self>) {
+        if !self.windows().iter().any(|w| w.needs_confirm()) {
+            self.close_all();
+            return;
+        }
+        let dialog = close_dialog("Quit tapust?", "All terminal sessions will be terminated.");
+        let weak = Rc::downgrade(self);
+        dialog.connect_response(None, move |_, response| {
+            if let Some(app) = weak.upgrade()
+                && response == "close"
+            {
+                app.close_all();
+            }
+        });
+        dialog.present(self.application.active_window().as_ref());
+    }
+
+    fn close_all(&self) {
+        for window in self.windows() {
+            window.close();
+        }
+    }
+}
+
+impl Window {
+    fn build(app: &Rc<App>, session: Session) -> Rc<Window> {
         let tab_view = adw::TabView::builder().shortcuts(adw::TabViewShortcuts::empty()).build();
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&tab_view));
@@ -382,7 +585,7 @@ impl App {
         overview.bind_property("open", &overview_toggle, "active").bidirectional().sync_create().build();
 
         let window = adw::ApplicationWindow::builder()
-            .application(application)
+            .application(&app.application)
             .default_width(800)
             .default_height(600)
             .content(&overview)
@@ -393,27 +596,12 @@ impl App {
         // ghostty's headerbar-visible: never shown while fullscreen.
         window.connect_fullscreened_notify(move |w| header.set_visible(!w.is_fullscreen()));
 
-        let palette = theme::palette();
-        let term_bg = compose::resolve(term::Color::Default, &palette, palette.background);
-        // ghostty's window-theme = auto: the scheme follows how light the
-        // terminal background is (perceived luminance).
-        let [r, g, b, _] = term_bg.map(|c| f64::from(c) / 255.0);
-        let luminance = 0.299 * r + 0.587 * g + 0.114 * b;
-        application.style_manager().set_color_scheme(if luminance > 0.5 {
-            adw::ColorScheme::PreferLight
-        } else {
-            adw::ColorScheme::PreferDark
-        });
-        let (session, effects) = new_session();
-        let app = Rc::new(App {
+        let win = Rc::new(Window {
+            app: app.clone(),
             state: RefCell::new(State {
                 session,
                 panes: HashMap::new(),
                 tabs: HashMap::new(),
-                cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-                command,
-                palette,
-                term_bg,
                 shown: None,
                 window_title_override: None,
                 tick: None,
@@ -430,26 +618,22 @@ impl App {
             overview: overview.clone(),
             overview_focus: RefCell::new(None),
             session_ended: Cell::new(false),
-            last_notification: Cell::new(None),
+            closing: Cell::new(false),
         });
-        APP.with(|a| *a.borrow_mut() = Some(app.clone()));
 
-        let weak = Rc::downgrade(&app);
+        let weak = Rc::downgrade(&win);
         new_tab.connect_clicked(move |_| {
-            if let Some(app) = weak.upgrade() {
-                app.command(Command::NewWindow { cwd_of_active: true, after: true });
+            if let Some(win) = weak.upgrade() {
+                win.command(Command::NewWindow { cwd_of_active: true, after: true });
             }
         });
-        app.connect_tabs(&overview);
-        app.connect_overview();
-        let weak = Rc::downgrade(&app);
-        app.window.connect_close_request(move |_| weak.upgrade().map_or(glib::Propagation::Proceed, |app| app.window_close_request()));
-        app.add_actions(application);
-        app.apply(effects);
-        app.reconcile();
-        app.start_timers();
-        app.window.present();
-        app
+        win.connect_tabs(&overview);
+        win.connect_overview();
+        let weak = Rc::downgrade(&win);
+        win.window.connect_close_request(move |_| weak.upgrade().map_or(glib::Propagation::Proceed, |win| win.close_request()));
+        win.add_actions();
+        win.start_timers();
+        win
     }
 
     fn connect_tabs(self: &Rc<Self>, overview: &adw::TabOverview) {
@@ -458,67 +642,171 @@ impl App {
         self.tab_view.set_menu_model(Some(&menu));
         let weak = Rc::downgrade(self);
         self.tab_view.connect_setup_menu(move |_, page| {
-            if let Some(app) = weak.upgrade() {
-                *app.context_page.borrow_mut() = page.cloned();
+            if let Some(win) = weak.upgrade() {
+                *win.context_page.borrow_mut() = page.cloned();
             }
         });
         let weak = Rc::downgrade(self);
         self.tab_view.connect_close_page(move |view, page| {
-            let Some(app) = weak.upgrade() else { return glib::Propagation::Proceed };
-            if app.syncing.get() {
+            let Some(win) = weak.upgrade() else { return glib::Propagation::Proceed };
+            if win.syncing.get() {
                 return glib::Propagation::Proceed;
             }
             // The tab goes away when its window does (reconcile).
             view.close_page_finish(page, false);
-            let id = app.state.borrow().tabs.iter().find(|(_, t)| &t.page == page).map(|(&id, _)| id);
-            if let Some(id) = id {
-                app.close_tab(id);
+            if let Some(id) = win.tab_of(page) {
+                win.close_tab(id);
             }
             glib::Propagation::Stop
         });
         let weak = Rc::downgrade(self);
         self.tab_view.connect_selected_page_notify(move |view| {
-            let Some(app) = weak.upgrade() else { return };
+            let Some(win) = weak.upgrade() else { return };
             let Some(page) = view.selected_page() else { return };
             // ghostty unmarks a tab that needed attention once selected,
             // however it got selected.
             page.set_needs_attention(false);
-            if app.syncing.get() {
+            if win.syncing.get() {
                 return;
             }
-            if let Some(index) = app.window_of_page(&page) {
-                app.command(Command::SelectWindow(index));
+            if let Some(index) = win.window_of_page(&page) {
+                win.command(Command::SelectWindow(index));
             }
         });
         let weak = Rc::downgrade(self);
         self.tab_view.connect_page_reordered(move |_, page, position| {
-            let Some(app) = weak.upgrade() else { return };
-            if app.syncing.get() {
+            let Some(win) = weak.upgrade() else { return };
+            if win.syncing.get() {
                 return;
             }
-            // tmux moves a window one place at a time (swap-window -d -t +1 or -1).
-            let Some(index) = app.window_of_page(page) else { return };
-            let from = app.state.borrow().session.windows().iter().position(|w| w.index == index).unwrap_or(0) as i32;
-            app.command(Command::SelectWindow(index));
-            let step = if position > from { 1 } else { -1 };
-            for _ in 0..(position - from).abs() {
-                app.command(Command::SwapWindow(step));
+            if let Some(id) = win.tab_of(page) {
+                win.place_window(id, position as usize);
             }
         });
-        self.tab_view.connect_create_window(|_| None);
+        // A tab dragged out of the tab bar leaves the tab view until it is
+        // dropped (libadwaita's AdwTabBox begin_drag).
+        let weak = Rc::downgrade(self);
+        self.tab_view.connect_page_detached(move |_, page, _| {
+            let Some(win) = weak.upgrade() else { return };
+            if win.syncing.get() {
+                return;
+            }
+            if let Some(tab) = win.state.borrow_mut().tabs.values_mut().find(|t| &t.page == page) {
+                tab.detached = true;
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.tab_view.connect_page_attached(move |_, page, position| {
+            let Some(win) = weak.upgrade() else { return };
+            if !win.syncing.get() {
+                win.page_attached(page, position as usize);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.tab_view.connect_create_window(move |_| weak.upgrade().and_then(|win| win.create_window()));
         let weak = Rc::downgrade(self);
         overview.connect_create_tab(move |_| {
-            let app = weak.upgrade().expect("app");
-            if app.session_ended.replace(false) {
-                let (session, effects) = new_session();
-                app.state.borrow_mut().session = session;
-                app.apply(effects);
+            let win = weak.upgrade().expect("window");
+            if win.session_ended.replace(false) {
+                let (session, effects) = Session::new(&win.app.server, None);
+                win.state.borrow_mut().session = session;
+                win.apply(effects);
             } else {
-                app.command(Command::NewWindow { cwd_of_active: true, after: true });
+                win.command(Command::NewWindow { cwd_of_active: true, after: true });
             }
-            app.reconcile();
-            app.tab_view.selected_page().expect("new tab")
+            win.reconcile();
+            win.tab_view.selected_page().expect("new tab")
         });
+    }
+
+    /// The tmux window of the tab of `page`, if this window has the tab.
+    fn tab_of(&self, page: &adw::TabPage) -> Option<u32> {
+        self.state.borrow().tabs.iter().find(|(_, t)| &t.page == page).map(|(&id, _)| id)
+    }
+
+    /// Puts tmux window `id` where its tab is now: tmux moves a window one
+    /// place at a time (swap-window -d -t +1 or -1).
+    fn place_window(self: &Rc<Self>, id: u32, position: usize) {
+        let windows = self.state.borrow().session.windows();
+        let Some(from) = windows.iter().position(|w| w.id == id) else { return };
+        self.command(Command::SelectWindow(windows[from].index));
+        let step = if position > from { 1 } else { -1 };
+        for _ in 0..position.abs_diff(from) {
+            self.command(Command::SwapWindow(step));
+        }
+    }
+
+    /// libadwaita attached a dragged tab to this window's tab view at
+    /// `position`: back where it came from, or from another window, whose
+    /// session moves the tmux window to this one (move-window).
+    fn page_attached(self: &Rc<Self>, page: &adw::TabPage, position: usize) {
+        let Some((owner, id)) = self.app.tab_owner(page) else { return };
+        if !Rc::ptr_eq(&owner, self) {
+            let effects = owner.move_window(id, self, position);
+            owner.apply(effects);
+            owner.queue_reconcile();
+        }
+        if let Some(tab) = self.state.borrow_mut().tabs.get_mut(&id) {
+            tab.detached = false;
+        }
+        self.place_window(id, position);
+        self.queue_reconcile();
+    }
+
+    /// ghostty's tabViewCreateWindow for the tab dropped outside every tab
+    /// bar: its tmux window moves to a new session in a new window.
+    fn create_window(self: &Rc<Self>) -> Option<adw::TabView> {
+        let id = self.state.borrow().tabs.iter().find(|(_, t)| t.detached).map(|(&id, _)| id)?;
+        let (session, effects) = self.state.borrow_mut().session.move_window_new(id)?;
+        let window = self.app.add_window(session);
+        self.hand_over(id, &window);
+        self.apply(effects);
+        self.queue_reconcile();
+        window.window.present();
+        Some(window.tab_view.clone())
+    }
+
+    /// move-window of tmux window `id` from this window's session to the
+    /// session of `dst`, at `position`; a session that ended in `dst`
+    /// gives way to a new one. Returns this session's effects.
+    fn move_window(self: &Rc<Self>, id: u32, dst: &Rc<Window>, position: usize) -> Vec<Effect> {
+        let effects = {
+            let mut st = self.state.borrow_mut();
+            if !dst.session_ended.get() {
+                st.session.move_window(id, &mut dst.state.borrow_mut().session, position)
+            } else if let Some((session, effects)) = st.session.move_window_new(id) {
+                dst.session_ended.set(false);
+                dst.state.borrow_mut().session = session;
+                effects
+            } else {
+                Vec::new()
+            }
+        };
+        self.hand_over(id, dst);
+        effects
+    }
+
+    /// Gives the tab of tmux window `id` to `dst`, whose session has the
+    /// window now, with its panes: their events go to `dst` from now on.
+    fn hand_over(&self, id: u32, dst: &Rc<Window>) {
+        let mut surfaces = Vec::new();
+        {
+            let mut st = self.state.borrow_mut();
+            let mut to = dst.state.borrow_mut();
+            let Some(tab) = st.tabs.remove(&id) else { return };
+            to.tabs.insert(id, tab);
+            let windows = to.session.windows();
+            for pane in windows.into_iter().filter(|w| w.id == id).flat_map(|w| w.panes).map(|p| p.pane) {
+                let Some(p) = st.panes.remove(&pane) else { continue };
+                surfaces.push(p.surface.clone());
+                to.panes.insert(pane, p);
+                self.app.set_owner(pane, dst);
+            }
+        }
+        // A prompt answered by keys belongs to the client it was opened in.
+        for surface in surfaces {
+            surface.set_copy_prompt(None);
+        }
     }
 
     /// ghostty's tabOverviewOpen: focus can get lost when the overview
@@ -527,33 +815,33 @@ impl App {
     fn connect_overview(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
         self.overview.connect_open_notify(move |overview| {
-            let Some(app) = weak.upgrade() else { return };
+            let Some(win) = weak.upgrade() else { return };
             if overview.is_open() {
                 return;
             }
-            if let Some(old) = app.overview_focus.take() {
+            if let Some(old) = win.overview_focus.take() {
                 old.remove();
             }
-            let weak = Rc::downgrade(&app);
+            let weak = Rc::downgrade(&win);
             let id = glib::timeout_add_local_once(theme::OVERVIEW_FOCUS, move || {
-                if let Some(app) = weak.upgrade() {
-                    app.overview_focus.take();
-                    if let Some(surface) = app.active_surface() {
+                if let Some(win) = weak.upgrade() {
+                    win.overview_focus.take();
+                    if let Some(surface) = win.active_surface() {
                         surface.grab_focus();
                     }
                 }
             });
-            *app.overview_focus.borrow_mut() = Some(id);
+            *win.overview_focus.borrow_mut() = Some(id);
         });
     }
 
-    fn add_actions(self: &Rc<Self>, application: &adw::Application) {
+    fn add_actions(self: &Rc<Self>) {
         let add = |name: &str, f: Action| {
             let action = gio::SimpleAction::new(name, None);
             let weak = Rc::downgrade(self);
             action.connect_activate(move |_, _| {
-                if let Some(app) = weak.upgrade() {
-                    f(&app);
+                if let Some(win) = weak.upgrade() {
+                    f(&win);
                 }
             });
             self.window.add_action(&action);
@@ -561,79 +849,61 @@ impl App {
         for (name, horizontal, before) in
             [("split-up", false, true), ("split-down", false, false), ("split-left", true, true), ("split-right", true, false)]
         {
-            add(name, Box::new(move |app| app.command(Command::SplitWindow { horizontal, before, full: false, cwd_of_active: true })));
+            add(name, Box::new(move |win| win.command(Command::SplitWindow { horizontal, before, full: false, cwd_of_active: true })));
         }
-        add("new-tab", Box::new(|app| app.command(Command::NewWindow { cwd_of_active: true, after: true })));
-        add("new-window", Box::new(|_| {
-            if let Ok(exe) = std::env::current_exe() {
-                let _ = std::process::Command::new(exe).spawn();
+        add("new-tab", Box::new(|win| win.command(Command::NewWindow { cwd_of_active: true, after: true })));
+        add("new-window", Box::new(|win| {
+            let parent = win.state.borrow().session.active_pane();
+            win.app.new_window(Some(parent));
+        }));
+        add("close", Box::new(|win| win.window.close()));
+        add("close-split", Box::new(|win| win.confirm_close_split()));
+        add("copy", Box::new(|win| {
+            if let Some(surface) = win.active_surface() {
+                win.copy(&surface);
             }
         }));
-        add("close", Box::new(|app| app.window.close()));
-        add("close-split", Box::new(|app| app.confirm_close_split()));
-        add("copy", Box::new(|app| {
-            if let Some(surface) = app.active_surface() {
-                app.copy(&surface);
-            }
-        }));
-        add("paste", Box::new(|app| app.paste(app.window.clipboard())));
-        add("reset", Box::new(|app| app.reset()));
-        add("clear", Box::new(|app| app.clear()));
-        add("prompt-tab-title", Box::new(|app| app.title_dialog(TitleTarget::Tab(app.current_window_id()))));
+        add("paste", Box::new(|win| win.paste(win.window.clipboard())));
+        add("reset", Box::new(|win| win.reset()));
+        add("clear", Box::new(|win| win.clear()));
+        add("prompt-tab-title", Box::new(|win| win.title_dialog(TitleTarget::Tab(win.current_window_id()))));
         add(
             "prompt-context-tab-title",
-            Box::new(|app| {
-                let page = app.context_page.borrow().clone();
-                let id = page.and_then(|page| app.state.borrow().tabs.iter().find(|(_, t)| t.page == page).map(|(&id, _)| id));
-                if let Some(id) = id {
-                    app.title_dialog(TitleTarget::Tab(id));
+            Box::new(|win| {
+                let page = win.context_page.borrow().clone();
+                if let Some(id) = page.and_then(|page| win.tab_of(&page)) {
+                    win.title_dialog(TitleTarget::Tab(id));
                 }
             }),
         );
-        add("prompt-window-title", Box::new(|app| app.title_dialog(TitleTarget::Window)));
-        add("prompt-surface-title", Box::new(|app| app.title_dialog(TitleTarget::Surface)));
-        add("about", Box::new(|app| {
+        add("prompt-window-title", Box::new(|win| win.title_dialog(TitleTarget::Window)));
+        add("prompt-surface-title", Box::new(|win| win.title_dialog(TitleTarget::Surface)));
+        add("about", Box::new(|win| {
             let about = adw::AboutDialog::builder()
                 .application_name("tapust")
                 .developer_name("tapust Developers")
                 .application_icon(theme::ICON)
                 .version(env!("CARGO_PKG_VERSION"))
                 .build();
-            about.present(Some(&app.window));
+            about.present(Some(&win.window));
         }));
         let close_tab = gio::SimpleAction::new("close-tab", Some(glib::VariantTy::STRING));
         let weak = Rc::downgrade(self);
         close_tab.connect_activate(move |_, _| {
-            if let Some(app) = weak.upgrade() {
-                let id = app.current_window_id();
-                app.close_tab(id);
+            if let Some(win) = weak.upgrade() {
+                let id = win.current_window_id();
+                win.close_tab(id);
             }
         });
         self.window.add_action(&close_tab);
-        let present = gio::SimpleAction::new("present-surface", Some(glib::VariantTy::UINT64));
-        let weak = Rc::downgrade(self);
-        present.connect_activate(move |_, parameter| {
-            if let (Some(app), Some(id)) = (weak.upgrade(), parameter.and_then(|p| p.get::<u64>())) {
-                app.present_surface(id);
-            }
-        });
-        application.add_action(&present);
-        let quit = gio::SimpleAction::new("quit", None);
-        let weak = Rc::downgrade(self);
-        quit.connect_activate(move |_, _| {
-            if let Some(app) = weak.upgrade() {
-                app.quit();
-            }
-        });
-        application.add_action(&quit);
     }
 
     fn start_timers(self: &Rc<Self>) {
         // ghostty's termios timer: polls each PTY for a password prompt.
         let weak = Rc::downgrade(self);
         glib::timeout_add_local(theme::TERMIOS_POLL, move || {
-            let Some(app) = weak.upgrade() else { return glib::ControlFlow::Break };
-            for p in app.state.borrow().panes.values() {
+            let Some(win) = weak.upgrade() else { return glib::ControlFlow::Break };
+            for p in win.state.borrow().panes.values() {
                 if let Some(io) = &p.io {
                     p.surface.set_password_input(io.shared.password_input());
                 }
@@ -642,8 +912,8 @@ impl App {
         });
         let weak = Rc::downgrade(self);
         glib::timeout_add_local(NAME_INTERVAL, move || {
-            let Some(app) = weak.upgrade() else { return glib::ControlFlow::Break };
-            app.update_names();
+            let Some(win) = weak.upgrade() else { return glib::ControlFlow::Break };
+            win.update_names();
             glib::ControlFlow::Continue
         });
     }
@@ -680,12 +950,11 @@ impl App {
     }
 
     fn window_of_page(&self, page: &adw::TabPage) -> Option<u32> {
-        let st = self.state.borrow();
-        let id = st.tabs.iter().find(|(_, t)| &t.page == page).map(|(&id, _)| id)?;
-        st.session.windows().into_iter().find(|w| w.id == id).map(|w| w.index)
+        let id = self.tab_of(page)?;
+        self.state.borrow().session.windows().into_iter().find(|w| w.id == id).map(|w| w.index)
     }
 
-    pub fn handle(self: &Rc<Self>, event: Event) -> bool {
+    fn handle(self: &Rc<Self>, event: Event) -> bool {
         match event {
             Event::Key { pane, keyval, state, text } => self.key(pane, keyval, state, text),
             Event::Text { pane, text } => {
@@ -742,9 +1011,9 @@ impl App {
                 if !self.restore_focus_pending.replace(true) {
                     let weak = Rc::downgrade(self);
                     glib::idle_add_local_once(move || {
-                        if let Some(app) = weak.upgrade() {
-                            app.restore_focus_pending.set(false);
-                            if let Some(surface) = app.active_surface().filter(|s| s.area.is_mapped()) {
+                        if let Some(win) = weak.upgrade() {
+                            win.restore_focus_pending.set(false);
+                            if let Some(surface) = win.active_surface().filter(|s| s.area.is_mapped()) {
                                 surface.grab_focus();
                             }
                         }
@@ -886,7 +1155,7 @@ impl App {
                 p.surface.resize_copy_mode(cols, rows);
             }
             None => {
-                let pty = match Pty::spawn(st.command.take(), cols, rows, cell, &p.cwd) {
+                let pty = match Pty::spawn(self.app.command.take(), cols, rows, cell, &p.cwd) {
                     Ok(pty) => pty,
                     Err(err) => {
                         eprintln!("tapust: cannot start a shell: {err}");
@@ -894,7 +1163,7 @@ impl App {
                     }
                 };
                 let mut terminal = term::Terminal::new(cols, rows, SCROLLBACK);
-                terminal.set_default_palette(st.palette.clone());
+                terminal.set_default_palette(self.app.palette.clone());
                 let io = match PaneIo::start(pty, terminal, move || {
                     glib::idle_add_once(move || wake(pane));
                 }) {
@@ -945,7 +1214,7 @@ impl App {
         for message in messages {
             match message {
                 term::Message::DesktopNotification { title, body } => {
-                    self.desktop_notification(&surface, &title, &body)
+                    self.app.desktop_notification(&surface, &title, &body)
                 }
                 term::Message::ProgressReport(report) => surface.set_progress_report(report),
                 term::Message::StartCommand => surface.start_command(),
@@ -983,28 +1252,9 @@ impl App {
         self.queue_reconcile();
     }
 
-    /// ghostty's Surface.showDesktopNotification: across surfaces, at most
-    /// one notification a second and the same one at most every 5 seconds.
-    fn desktop_notification(&self, surface: &Surface, title: &str, body: &str) {
-        let now = Instant::now();
-        let digest = notifications::hash(title, body);
-        if let Some((last, last_digest)) = self.last_notification.get() {
-            let since = now - last;
-            if since < Duration::from_secs(1) || (last_digest == digest && since < Duration::from_secs(5)) {
-                return;
-            }
-        }
-        self.last_notification.set(Some((now, digest)));
-        surface.send_desktop_notification(title, body);
-    }
-
-    /// ghostty's app.present-surface and the window's surfacePresentRequest:
-    /// the notification's surface gets its tab selected, the focus and the
-    /// window raised.
-    fn present_surface(self: &Rc<Self>, id: u64) {
-        if id == 0 {
-            return;
-        }
+    /// ghostty's surfacePresentRequest: the notification's surface gets its
+    /// tab selected, the focus and the window raised.
+    fn present_surface(&self, id: u64) {
         let found = {
             let st = self.state.borrow();
             let surface = st.panes.values().find(|p| p.surface.id == id).map(|p| p.surface.clone());
@@ -1048,13 +1298,13 @@ impl App {
         let weak = Rc::downgrade(self);
         let delay = deadline.saturating_duration_since(Instant::now());
         st.tick = Some(glib::timeout_add_local_once(delay, move || {
-            let Some(app) = weak.upgrade() else { return };
-            let mut st = app.state.borrow_mut();
+            let Some(win) = weak.upgrade() else { return };
+            let mut st = win.state.borrow_mut();
             st.tick = None;
             st.session.tick(Instant::now());
             drop(st);
-            app.queue_reconcile();
-            app.schedule_tick();
+            win.queue_reconcile();
+            win.schedule_tick();
         }));
     }
 
@@ -1063,24 +1313,19 @@ impl App {
         for effect in effects {
             match effect {
                 Effect::Spawn { pane, parent, inherit_cwd } => {
-                    let mut st = self.state.borrow_mut();
-                    let parent = parent.and_then(|p| st.panes.get(&p));
-                    let points = parent.map_or(theme::FONT_POINTS, |p| p.surface.font_points());
-                    let cwd = parent
-                        .filter(|_| inherit_cwd)
-                        .and_then(|p| p.io.as_ref())
-                        .and_then(|io| io.pty.foreground_cwd())
-                        .unwrap_or_else(|| st.cwd.clone());
-                    let weak = Rc::downgrade(self);
+                    let (points, cwd) = self.app.origin(parent, inherit_cwd);
+                    self.app.set_owner(pane, self);
+                    let weak = Rc::downgrade(&self.app);
                     let handler: crate::surface::Handler =
-                        Rc::new(move |event| weak.upgrade().is_some_and(|app| app.handle(event)));
-                    let surface = Surface::new(pane, st.term_bg, points, handler);
-                    st.panes.insert(
+                        Rc::new(move |event| weak.upgrade().is_some_and(|app| app.handle(pane, event)));
+                    let surface = Surface::new(pane, self.app.term_bg, points, handler);
+                    self.state.borrow_mut().panes.insert(
                         pane,
                         Pane { surface, io: None, cwd, title: String::new(), title_override: None, pwd: None, child_exited: false },
                     );
                 }
                 Effect::Destroy { pane } => {
+                    self.app.owners.borrow_mut().remove(&pane);
                     let removed = self.state.borrow_mut().panes.remove(&pane);
                     if let Some(p) = removed {
                         detach(p.surface.outer.upcast_ref());
@@ -1093,10 +1338,8 @@ impl App {
                 }
                 Effect::ResizeSplit { pane, horizontal, cells } => self.resize_split(pane, horizontal, cells),
                 Effect::CopyMode { pane, search } => {
-                    let (surface, keys) = {
-                        let st = self.state.borrow();
-                        (st.panes.get(&pane).map(|p| p.surface.clone()), st.session.mode_keys())
-                    };
+                    let surface = self.state.borrow().panes.get(&pane).map(|p| p.surface.clone());
+                    let keys = self.app.server.mode_keys();
                     // A pane GTK has not sized yet has no screen to copy.
                     if !surface.is_some_and(|s| s.enter_copy_mode(keys, search)) {
                         let result = CopyResult { cancel: true, ..CopyResult::default() };
@@ -1114,11 +1357,13 @@ impl App {
                     self.state.borrow_mut().session.copy_result(pane, result);
                 }
                 Effect::Paste { pane, data, bracket } => self.paste_buffer(pane, &data, bracket),
+                // ghostty's tabViewNPages: the window closes with its last
+                // tab, unless the tab overview is open.
                 Effect::Exit => {
                     if self.overview.is_open() {
                         self.session_ended.set(true);
-                    } else if let Some(app) = self.window.application() {
-                        app.quit();
+                    } else {
+                        self.close_later();
                     }
                 }
             }
@@ -1182,9 +1427,9 @@ impl App {
         }
         let weak = Rc::downgrade(self);
         glib::idle_add_local_once(move || {
-            if let Some(app) = weak.upgrade() {
-                app.reconcile_pending.set(false);
-                app.reconcile();
+            if let Some(win) = weak.upgrade() {
+                win.reconcile_pending.set(false);
+                win.reconcile();
             }
         });
     }
@@ -1192,8 +1437,8 @@ impl App {
     fn queue_geometry(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
         glib::idle_add_local_once(move || {
-            if let Some(app) = weak.upgrade() {
-                app.report_geometry();
+            if let Some(win) = weak.upgrade() {
+                win.report_geometry();
             }
         });
     }
@@ -1231,18 +1476,33 @@ impl App {
     /// the widgets of its split tree, the current window selected and its
     /// active pane focused, and the prompt or message.
     fn reconcile(self: &Rc<Self>) {
+        // Closing the tabs of a window on its way out makes libadwaita
+        // render their thumbnails without a renderer.
+        if self.closing.get() {
+            return;
+        }
         self.syncing.set(true);
         let windows = self.state.borrow().session.windows();
-        // Tabs of windows that are gone.
-        let gone: Vec<u32> =
-            self.state.borrow().tabs.keys().copied().filter(|id| !windows.iter().any(|w| w.id == *id)).collect();
+        // Tabs of windows that are gone; a tab being dragged goes once it
+        // is dropped.
+        let gone: Vec<u32> = self
+            .state
+            .borrow()
+            .tabs
+            .iter()
+            .filter(|(id, t)| !t.detached && !windows.iter().any(|w| w.id == **id))
+            .map(|(&id, _)| id)
+            .collect();
         for id in gone {
             let tab = self.state.borrow_mut().tabs.remove(&id);
             if let Some(tab) = tab {
                 self.tab_view.close_page(&tab.page);
             }
         }
-        for (position, info) in windows.iter().enumerate() {
+        // The position among the pages in the tab view, where a dragged
+        // tab is not.
+        let mut position = 0;
+        for info in &windows {
             let exists = self.state.borrow().tabs.contains_key(&info.id);
             if !exists {
                 let tree_bin = adw::Bin::builder().hexpand(true).vexpand(true).build();
@@ -1254,11 +1514,18 @@ impl App {
                 );
                 tab.append(&split_tree);
                 let page = self.tab_view.append(&tab);
-                self.state.borrow_mut().tabs.insert(info.id, Tab { page, tree_bin, built: None, splits: Vec::new() });
+                let tab = Tab { page, tree_bin, built: None, splits: Vec::new(), detached: false };
+                self.state.borrow_mut().tabs.insert(info.id, tab);
             }
-            let page = self.state.borrow().tabs[&info.id].page.clone();
-            if self.tab_view.page_position(&page) != position as i32 {
-                self.tab_view.reorder_page(&page, position as i32);
+            let (page, detached) = {
+                let tab = &self.state.borrow().tabs[&info.id];
+                (tab.page.clone(), tab.detached)
+            };
+            if !detached {
+                if self.tab_view.page_position(&page) != position {
+                    self.tab_view.reorder_page(&page, position);
+                }
+                position += 1;
             }
             self.rebuild(info.index, info.id);
             let title = self.tab_title(info);
@@ -1270,7 +1537,9 @@ impl App {
             };
             page.set_tooltip(pwd.as_deref().unwrap_or(""));
             if info.active {
-                self.tab_view.set_selected_page(&page);
+                if !detached {
+                    self.tab_view.set_selected_page(&page);
+                }
                 // The override only replaces the header bar's title; the
                 // window keeps the tab's title (ghostty's closureTitle).
                 let shown = self.state.borrow().window_title_override.clone().unwrap_or_else(|| title.clone());
@@ -1344,7 +1613,7 @@ impl App {
                 let index = *counter;
                 *counter += 1;
                 let second = self.build_node(&s.second, window, counter, splits)?;
-                let split = SplitWidget::new(self, window, index, s.horizontal, s.ratio, &first, &second);
+                let split = SplitWidget::new(&self.app, window, index, s.horizontal, s.ratio, &first, &second);
                 let widget: gtk::Widget = split.bin.clone().upcast();
                 splits.push(split);
                 Some(widget)
@@ -1411,8 +1680,8 @@ impl App {
                 let dialog = close_dialog(heading, body);
                 let weak = Rc::downgrade(self);
                 dialog.connect_response(None, move |_, response| {
-                    if let Some(app) = weak.upgrade() {
-                        app.answer((response == "close").then_some("y"));
+                    if let Some(win) = weak.upgrade() {
+                        win.answer((response == "close").then_some("y"));
                     }
                 });
                 dialog.present(Some(&self.window));
@@ -1436,9 +1705,9 @@ impl App {
                 };
                 let weak = Rc::downgrade(self);
                 dialog.connect_response(None, move |_, response| {
-                    if let Some(app) = weak.upgrade() {
+                    if let Some(win) = weak.upgrade() {
                         let text = entry.text();
-                        app.answer((response == "ok").then_some(text.as_str()));
+                        win.answer((response == "ok").then_some(text.as_str()));
                     }
                 });
                 dialog.present(Some(&self.window));
@@ -1454,8 +1723,8 @@ impl App {
     fn connect_incremental(self: &Rc<Self>, entry: &gtk::Entry, last: String) {
         let weak = Rc::downgrade(self);
         entry.connect_changed(move |entry| {
-            if let Some(app) = weak.upgrade() {
-                app.prompt_changed(&entry.text(), '=');
+            if let Some(win) = weak.upgrade() {
+                win.prompt_changed(&entry.text(), '=');
             }
         });
         let keys = gtk::EventControllerKey::builder().propagation_phase(gtk::PropagationPhase::Capture).build();
@@ -1468,13 +1737,13 @@ impl App {
                 gdk::Key::r if held == M::CONTROL_MASK => '-',
                 _ => return glib::Propagation::Proceed,
             };
-            let Some(app) = weak.upgrade() else { return glib::Propagation::Proceed };
+            let Some(win) = weak.upgrade() else { return glib::Propagation::Proceed };
             let text = target.text();
             if text.is_empty() {
                 target.set_text(&last);
                 target.set_position(-1);
             } else {
-                app.prompt_changed(&text, prefix);
+                win.prompt_changed(&text, prefix);
             }
             glib::Propagation::Stop
         });
@@ -1503,10 +1772,10 @@ impl App {
         let dialog = close_dialog("Close Tab?", "All terminal sessions in this tab will be terminated.");
         let weak = Rc::downgrade(self);
         dialog.connect_response(None, move |_, response| {
-            if let Some(app) = weak.upgrade()
+            if let Some(win) = weak.upgrade()
                 && response == "close"
             {
-                app.kill_window(id);
+                win.kill_window(id);
             }
         });
         dialog.present(Some(&self.window));
@@ -1533,7 +1802,7 @@ impl App {
         panes.into_iter().any(|p| self.pane_needs_confirm(p))
     }
 
-    fn app_needs_confirm(&self) -> bool {
+    fn needs_confirm(&self) -> bool {
         let panes: Vec<PaneId> = self.state.borrow().panes.keys().copied().collect();
         panes.into_iter().any(|p| self.pane_needs_confirm(p))
     }
@@ -1548,48 +1817,52 @@ impl App {
         let dialog = close_dialog("Close Split?", "The currently running process in this split will be terminated.");
         let weak = Rc::downgrade(self);
         dialog.connect_response(None, move |_, response| {
-            if let Some(app) = weak.upgrade()
+            if let Some(win) = weak.upgrade()
                 && response == "close"
             {
-                app.command(Command::KillPane);
+                win.command(Command::KillPane);
             }
         });
         dialog.present(Some(&self.window));
     }
 
     /// ghostty's windowCloseRequest: asks before closing a window with a
-    /// pane that needs it.
-    fn window_close_request(self: &Rc<Self>) -> glib::Propagation {
-        if !self.app_needs_confirm() {
-            return glib::Propagation::Proceed;
+    /// pane that needs it. The window closes with its session.
+    fn close_request(self: &Rc<Self>) -> glib::Propagation {
+        if !self.needs_confirm() {
+            self.close();
+            return glib::Propagation::Stop;
         }
         let dialog = close_dialog("Close Window?", "All terminal sessions in this window will be terminated.");
         let weak = Rc::downgrade(self);
         dialog.connect_response(None, move |_, response| {
-            if let Some(app) = weak.upgrade()
+            if let Some(win) = weak.upgrade()
                 && response == "close"
             {
-                app.window.destroy();
+                win.close();
             }
         });
         dialog.present(Some(&self.window));
         glib::Propagation::Stop
     }
 
-    /// ghostty's Application.quit: asks when a pane needs it.
-    fn quit(self: &Rc<Self>) {
-        let Some(application) = self.window.application() else { return };
-        if !self.app_needs_confirm() {
-            application.quit();
-            return;
-        }
-        let dialog = close_dialog("Quit tapust?", "All terminal sessions will be terminated.");
-        dialog.connect_response(None, move |_, response| {
-            if response == "close" {
-                application.quit();
+    /// kill-session, and the window goes even if its session had ended.
+    fn close(self: &Rc<Self>) {
+        let effects = self.state.borrow_mut().session.kill();
+        self.apply(effects.into_iter().filter(|e| *e != Effect::Exit).collect());
+        self.close_later();
+    }
+
+    /// Destroys the window once the signal being handled is over: a drag
+    /// that emptied the session is still using the tab view.
+    fn close_later(self: &Rc<Self>) {
+        self.closing.set(true);
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            if let Some(win) = weak.upgrade() {
+                win.window.destroy();
             }
         });
-        dialog.present(Some(&self.window));
     }
 
     /// ghostty's TitleDialog initial value: the target's title override, else
@@ -1623,7 +1896,7 @@ impl App {
         let (dialog, entry) = title_dialog_widgets(heading, &self.title_initial(target));
         let weak = Rc::downgrade(self);
         dialog.connect_response(None, move |_, response| {
-            let Some(app) = weak.upgrade() else { return };
+            let Some(win) = weak.upgrade() else { return };
             if response != "ok" {
                 return;
             }
@@ -1631,22 +1904,22 @@ impl App {
             let value = Some(text.clone()).filter(|t| !t.is_empty());
             match target {
                 TitleTarget::Tab(id) => {
-                    app.state.borrow_mut().session.rename_window_id(id, &text);
+                    win.state.borrow_mut().session.rename_window_id(id, &text);
 
-                    app.queue_reconcile();
+                    win.queue_reconcile();
                 }
                 TitleTarget::Window => {
-                    app.state.borrow_mut().window_title_override = value;
-                    app.queue_reconcile();
+                    win.state.borrow_mut().window_title_override = value;
+                    win.queue_reconcile();
                 }
                 TitleTarget::Surface => {
-                    let mut st = app.state.borrow_mut();
+                    let mut st = win.state.borrow_mut();
                     let active = st.session.active_pane();
                     if let Some(p) = st.panes.get_mut(&active) {
                         p.title_override = value;
                     }
                     drop(st);
-                    app.queue_reconcile();
+                    win.queue_reconcile();
                 }
             }
         });
@@ -1716,8 +1989,8 @@ impl App {
     fn paste(self: &Rc<Self>, clipboard: gdk::Clipboard) {
         let weak = Rc::downgrade(self);
         clipboard.read_text_async(gio::Cancellable::NONE, move |text| {
-            let (Some(app), Ok(Some(text))) = (weak.upgrade(), text) else { return };
-            app.paste_text(&text, false);
+            let (Some(win), Ok(Some(text))) = (weak.upgrade(), text) else { return };
+            win.paste_text(&text, false);
         });
     }
 
@@ -1785,10 +2058,10 @@ impl App {
         let weak = Rc::downgrade(self);
         let text = text.to_owned();
         dialog.connect_response(None, move |_, response| {
-            if let Some(app) = weak.upgrade()
+            if let Some(win) = weak.upgrade()
                 && response == "ok"
             {
-                app.paste_text(&text, true);
+                win.paste_text(&text, true);
             }
         });
         dialog.present(Some(&self.window));
@@ -1817,7 +2090,7 @@ impl App {
     }
 }
 
-type Action = Box<dyn Fn(&Rc<App>)>;
+type Action = Box<dyn Fn(&Rc<Window>)>;
 
 #[derive(Clone, Copy)]
 enum TitleTarget {
@@ -1825,15 +2098,6 @@ enum TitleTarget {
     Tab(u32),
     Window,
     Surface,
-}
-
-/// A session with tmux's options from the environment: mode-keys follows
-/// $VISUAL or $EDITOR, as tmux's main sets it.
-fn new_session() -> (Session, Vec<Effect>) {
-    let (mut session, effects) = Session::new();
-    let (visual, editor) = (std::env::var_os("VISUAL"), std::env::var_os("EDITOR"));
-    session.set_mode_keys(ModeKeys::from_env(visual.as_deref(), editor.as_deref()));
-    (session, effects)
 }
 
 /// ghostty's CloseConfirmationDialog.

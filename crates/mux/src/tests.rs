@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::*;
 
 fn new_session() -> Session {
-    Session::new().0
+    Session::new(&Server::new(), None).0
 }
 
 fn run(s: &mut Session, cmd: Command) -> CommandOutput {
@@ -380,7 +380,7 @@ fn new_window_fills_gap() {
 
 #[test]
 fn new_session_spawns_first_pane() {
-    let (s, effects) = Session::new();
+    let (s, effects) = Session::new(&Server::new(), None);
     assert_eq!(effects, [Effect::Spawn { pane: 0, parent: None, inherit_cwd: false }]);
     assert_eq!(s.active_pane(), 0);
 }
@@ -830,8 +830,9 @@ fn copy(command: CopyCommand, count: u32) -> Vec<Effect> {
 /// A session whose pane 0 is in copy mode with `keys`.
 fn in_copy_mode(keys: ModeKeys) -> Session {
     let t = Instant::now();
-    let mut s = new_session();
-    s.set_mode_keys(keys);
+    let server = Server::new();
+    server.set_mode_keys(keys);
+    let mut s = Session::new(&server, None).0;
     s.key(ctrl('b'), t);
     assert_eq!(handled(s.key(ch('['), t)), vec![Effect::CopyMode { pane: 0, search: None }]);
     assert!(s.in_mode(0));
@@ -1011,12 +1012,12 @@ fn copies_fill_buffers_up_to_the_limit() {
         let copied = Some(Copied::New(format!("{i}").into_bytes()));
         s.copy_result(0, CopyResult { copied, ..CopyResult::default() });
     }
-    let names = s.buffers.names();
+    let names = s.server.buffers().names();
     assert_eq!(names.len(), paste::BUFFER_LIMIT);
-    assert_eq!((names[0], names[names.len() - 1]), ("buffer2", "buffer51"));
+    assert_eq!((names[0].as_str(), names[names.len() - 1].as_str()), ("buffer2", "buffer51"));
     // Empty copies make no buffer.
     s.copy_result(0, CopyResult { copied: Some(Copied::New(Vec::new())), ..CopyResult::default() });
-    assert_eq!(s.buffers.names().len(), paste::BUFFER_LIMIT);
+    assert_eq!(s.server.buffers().names().len(), paste::BUFFER_LIMIT);
     s.key(ctrl('b'), t);
     assert_eq!(handled(s.key(ch(']'), t)), vec![Effect::Paste { pane: 0, data: b"51".to_vec(), bracket: true }]);
     ok(&mut s, Command::DeleteBuffer);
@@ -1044,13 +1045,13 @@ fn append_selection_names_the_newest_buffer() {
     s.copy_result(0, CopyResult { copied: Some(Copied::Append(b"+".to_vec())), ..CopyResult::default() });
     // paste_set keeps buffer1's name but makes it a named buffer, which
     // paste-buffer and delete-buffer pass over.
-    assert_eq!(s.buffers.names(), ["buffer0", "buffer1"]);
+    assert_eq!(s.server.buffers().names(), ["buffer0", "buffer1"]);
     assert_eq!(
         ok(&mut s, Command::PasteBuffer { bracket: false }),
         vec![Effect::Paste { pane: 0, data: b"one".to_vec(), bracket: false }]
     );
     ok(&mut s, Command::DeleteBuffer);
-    assert_eq!(s.buffers.names(), ["buffer1"]);
+    assert_eq!(s.server.buffers().names(), ["buffer1"]);
     assert_eq!(run(&mut s, Command::DeleteBuffer).error.as_deref(), Some("no buffer"));
 }
 
@@ -1062,4 +1063,174 @@ fn a_pane_that_exits_leaves_copy_mode() {
     s.key(ch('%'), t);
     s.pane_exited(0);
     assert!(!s.in_mode(0));
+}
+
+// --- Sessions and move-window ------------------------------------------------------
+
+/// The windows as `index:@id:panes`, with a `*` on the current one.
+fn layout_of(s: &Session) -> Vec<String> {
+    s.windows()
+        .into_iter()
+        .map(|w| {
+            let panes: Vec<String> = w.panes.iter().map(|p| p.pane.to_string()).collect();
+            format!("{}:@{}:{}{}", w.index, w.id, panes.join(","), if w.active { "*" } else { "" })
+        })
+        .collect()
+}
+
+fn new_window(s: &mut Session) {
+    ok(s, Command::NewWindow { cwd_of_active: false, after: false });
+}
+
+#[test]
+fn sessions_are_numbered_from_next_session_id() {
+    let server = Server::new();
+    let (mut s0, _) = Session::new(&server, None);
+    let (mut s1, _) = Session::new(&server, None);
+    assert_eq!((s0.id, s0.name.as_str(), s1.id, s1.name.as_str()), (0, "0", 1, "1"));
+    // A destroyed session's number is not taken again.
+    assert_eq!(s1.kill(), [Effect::Destroy { pane: 1 }, Effect::Exit]);
+    let (mut s2, _) = Session::new(&server, None);
+    assert_eq!(s2.name, "2");
+    // A number whose name a session has is passed over.
+    ok(&mut s0, Command::RenameSession("3".to_owned()));
+    let (s4, _) = Session::new(&server, None);
+    assert_eq!((s4.id, s4.name.as_str()), (4, "4"));
+    assert_eq!(run(&mut s2, Command::RenameSession("4".to_owned())).error.as_deref(), Some("duplicate session: 4"));
+    ok(&mut s0, Command::RenameSession("3".to_owned()));
+    // The name of a dead or dropped session is free again.
+    ok(&mut s2, Command::RenameSession("1".to_owned()));
+    drop(s4);
+    ok(&mut s2, Command::RenameSession("4".to_owned()));
+    assert_eq!(s2.name, "4");
+}
+
+#[test]
+fn panes_and_windows_are_numbered_across_sessions() {
+    let server = Server::new();
+    let (mut s0, _) = Session::new(&server, None);
+    ok(&mut s0, split(true));
+    // New Window: the first pane comes from the active pane of another session.
+    let (mut s1, effects) = Session::new(&server, Some(1));
+    assert_eq!(effects, [Effect::Spawn { pane: 2, parent: Some(1), inherit_cwd: true }]);
+    assert_eq!(layout_of(&s1), ["0:@1:2*"]);
+    new_window(&mut s0);
+    new_window(&mut s1);
+    assert_eq!(layout_of(&s0), ["0:@0:0,1", "1:@2:3*"]);
+    assert_eq!(layout_of(&s1), ["0:@1:2", "1:@3:4*"]);
+}
+
+#[test]
+fn move_window_goes_to_the_position_with_its_panes() {
+    let server = Server::new();
+    let (mut s0, _) = Session::new(&server, None);
+    ok(&mut s0, split(true));
+    new_window(&mut s0);
+    new_window(&mut s0);
+    let (mut s1, _) = Session::new(&server, None);
+    new_window(&mut s1);
+    assert_eq!(layout_of(&s0), ["0:@0:0,1", "1:@1:2", "2:@2:3*"]);
+    assert_eq!(layout_of(&s1), ["0:@3:4", "1:@4:5*"]);
+    let generation = s1.generation();
+    // -b before the window at position 1: the windows from there move up.
+    assert_eq!(s0.move_window(0, &mut s1, 1), []);
+    assert_eq!(layout_of(&s0), ["1:@1:2", "2:@2:3*"]);
+    assert_eq!(layout_of(&s1), ["0:@3:4", "1:@0:0,1*", "2:@4:5"]);
+    assert_ne!(s1.generation(), generation);
+    // The panes keep their order, active pane and tree.
+    assert_eq!(s1.active_pane(), 1);
+    assert_eq!(shape(&s1), "[0 | 1]");
+    // -a after the last window, past a gap.
+    assert_eq!(s0.move_window(1, &mut s1, 3), []);
+    assert_eq!(layout_of(&s1), ["0:@3:4", "1:@0:0,1", "2:@4:5", "3:@1:2*"]);
+    // A window the session does not have is not moved.
+    assert_eq!(s0.move_window(1, &mut s1, 0), []);
+    assert_eq!(layout_of(&s0), ["2:@2:3*"]);
+    // Commands go on in the new session with the moved panes.
+    let effects = ok(&mut s1, split(false));
+    assert_eq!(effects, [Effect::Spawn { pane: 6, parent: Some(2), inherit_cwd: false }]);
+}
+
+#[test]
+fn the_source_selects_its_last_window_and_dies_when_empty() {
+    let server = Server::new();
+    let (mut s0, _) = Session::new(&server, None);
+    new_window(&mut s0);
+    new_window(&mut s0);
+    ok(&mut s0, Command::SelectWindow(0));
+    ok(&mut s0, Command::SelectWindow(2));
+    let (mut s1, _) = Session::new(&server, None);
+    // session_detach of the current window selects the last one.
+    assert_eq!(s0.move_window(2, &mut s1, 0), []);
+    assert_eq!(layout_of(&s0), ["0:@0:0*", "1:@1:1"]);
+    assert_eq!(layout_of(&s1), ["0:@2:2*", "1:@3:3"]);
+    assert_eq!(s0.move_window(0, &mut s1, 2), []);
+    assert_eq!(s0.move_window(1, &mut s1, 0), [Effect::Exit]);
+    assert_eq!(layout_of(&s1), ["0:@1:1*", "1:@2:2", "2:@3:3", "3:@0:0"]);
+    // The dead session's name is free, and it takes no window.
+    ok(&mut s1, Command::RenameSession("0".to_owned()));
+    assert_eq!(s1.move_window(1, &mut s0, 0), []);
+    assert_eq!(s1.windows().len(), 4);
+}
+
+#[test]
+fn move_window_new_makes_a_session_of_the_window() {
+    let server = Server::new();
+    let (mut s0, _) = Session::new(&server, None);
+    ok(&mut s0, split(true));
+    ok(&mut s0, Command::ZoomPane);
+    new_window(&mut s0);
+    ok(&mut s0, Command::SelectWindow(0));
+    let (s1, effects) = s0.move_window_new(0).unwrap();
+    assert_eq!(effects, []);
+    assert_eq!((s1.id, s1.name.as_str()), (1, "1"));
+    assert_eq!(layout_of(&s1), ["0:@0:0,1*"]);
+    assert!(s1.windows()[0].zoomed);
+    assert_eq!(layout_of(&s0), ["1:@1:2*"]);
+    assert!(s0.move_window_new(0).is_none());
+    let (_, effects) = s0.move_window_new(1).unwrap();
+    assert_eq!(effects, [Effect::Exit]);
+}
+
+#[test]
+fn copy_mode_searches_and_buffers_go_across_sessions() {
+    let t = Instant::now();
+    let mut s0 = in_copy_mode(ModeKeys::Emacs);
+    let search = PaneSearch { text: "x".to_owned(), regex: false };
+    let copied = Some(Copied::New(b"copied".to_vec()));
+    s0.copy_result(0, CopyResult { copied, search: Some(search), cancel: false });
+    let (mut s1, _) = s0.move_window_new(0).unwrap();
+    // The pane is still in copy mode, with its search, in the new session.
+    assert!(s1.in_mode(0));
+    assert_eq!(handled(s1.key(ch('q'), t)), copy(CopyCommand::Cancel, 1));
+    s1.copy_result(0, CopyResult { cancel: true, ..CopyResult::default() });
+    s1.key(ctrl('b'), t);
+    let search = Some(PaneSearch { text: "x".to_owned(), regex: false });
+    assert_eq!(handled(s1.key(ch('['), t)), vec![Effect::CopyMode { pane: 0, search }]);
+    // The paste buffers are the server's.
+    let (mut s2, _) = Session::new(&s1.server, None);
+    assert_eq!(
+        ok(&mut s2, Command::PasteBuffer { bracket: false }),
+        [Effect::Paste { pane: 1, data: b"copied".to_vec(), bracket: false }]
+    );
+}
+
+#[test]
+fn kill_session_destroys_every_pane() {
+    let server = Server::new();
+    let (mut s0, _) = Session::new(&server, None);
+    ok(&mut s0, split(true));
+    new_window(&mut s0);
+    s0.key(ctrl('b'), Instant::now());
+    s0.key(ch(','), Instant::now());
+    assert!(s0.overlay().is_some());
+    let effects = s0.kill();
+    assert_eq!(
+        effects,
+        [Effect::Destroy { pane: 0 }, Effect::Destroy { pane: 1 }, Effect::Destroy { pane: 2 }, Effect::Exit]
+    );
+    assert_eq!(s0.overlay(), None);
+    assert_eq!(s0.kill(), []);
+    let (s1, _) = Session::new(&server, None);
+    assert_eq!(s1.name, "1");
 }

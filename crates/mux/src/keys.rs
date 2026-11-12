@@ -201,7 +201,7 @@ impl Session {
 
     /// server_client_key_callback
     fn key_callback(&mut self, key: Key, now: Instant) -> KeyResult {
-        let in_mode = self.modes.contains_key(&self.cur().active);
+        let in_mode = self.cur().pane(self.cur().active).mode.is_some();
         let mut table = match self.keys.table {
             Table::Root if in_mode => Table::Mode,
             table => table,
@@ -216,7 +216,7 @@ impl Session {
 
             let binding = match table {
                 Table::Prefix => prefix_binding(key),
-                Table::Mode => copy::binding(key, self.mode_keys)
+                Table::Mode => copy::binding(key, self.server.mode_keys())
                     .map(|action| Binding { repeat: false, action: Action::Mode(action) }),
                 Table::Root => None,
             };

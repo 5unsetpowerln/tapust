@@ -1,54 +1,66 @@
 //! Session, winlink and command logic, ported from tmux 3.6 `session.c`,
 //! `server-fn.c`, `resize.c`, `spawn.c` and the `cmd-*.c` files.
 
-use std::collections::btree_map::Entry;
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::keys::KeyState;
 use crate::layout::Layout;
 use crate::split::Side;
 use crate::window::{Pane, Window};
-use crate::{format, paste, Command, CopyCommand, Direction, Effect, ModeKeys, PaneId, Session};
+use crate::{format, paste, Command, CopyCommand, Direction, Effect, PaneId, Server, Session};
 
-pub(crate) fn new_session() -> (Session, Vec<Effect>) {
-    let mut s = Session {
-        name: "0".to_owned(),
+/// session_create: a session with no window yet.
+pub(crate) fn blank(server: &Server) -> Session {
+    let (id, name) = server.add_session();
+    Session {
+        server: server.clone(),
+        id,
+        name,
         winlinks: BTreeMap::new(),
         curw: 0,
         lastw: Vec::new(),
-        next_pane_id: 0,
-        next_window_id: 0,
-        next_active_point: 0,
         keys: KeyState::default(),
         prompt: None,
         message: None,
-        history: [Vec::new(), Vec::new()],
-        mode_keys: ModeKeys::Emacs,
-        modes: BTreeMap::new(),
-        searches: BTreeMap::new(),
-        buffers: Default::default(),
         generation: 0,
         dead: false,
         last_active: 0,
         spawned: Vec::new(),
         writes: Vec::new(),
-    };
+    }
+}
+
+pub(crate) fn new_session(server: &Server, parent: Option<PaneId>) -> (Session, Vec<Effect>) {
+    let mut s = blank(server);
     let effects = s.op(|s| {
         let idx = s.free_index();
-        s.spawn_window(idx, None, false);
+        s.spawn_window(idx, parent, parent.is_some());
         s.curw = idx;
     });
     (s, effects)
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.server.remove_session(self.id);
+    }
 }
 
 impl Session {
     /// Runs one operation the way the tmux server loop would, then turns the
     /// changes into effects.
     pub(crate) fn op(&mut self, f: impl FnOnce(&mut Session)) -> Vec<Effect> {
+        self.op_keeping(&BTreeSet::new(), f)
+    }
+
+    /// [`Session::op`] for an operation that moves the panes `kept` to
+    /// another session: they leave without being destroyed.
+    pub(crate) fn op_keeping(&mut self, kept: &BTreeSet<PaneId>, f: impl FnOnce(&mut Session)) -> Vec<Effect> {
         if self.dead {
             return Vec::new();
         }
-        let before = self.pane_ids();
+        let before = &self.pane_ids() - kept;
         f(self);
         self.generation += 1;
         self.collect_effects(&before)
@@ -64,8 +76,6 @@ impl Session {
         let mut effects = Vec::new();
         for pane in before.difference(&after) {
             effects.push(Effect::Destroy { pane: *pane });
-            self.modes.remove(pane);
-            self.searches.remove(pane);
         }
         for (pane, parent, inherit_cwd) in spawned {
             if after.contains(&pane) {
@@ -74,6 +84,10 @@ impl Session {
         }
         effects.append(&mut self.writes);
         if self.dead {
+            // session_destroy: the name is free again and the client's
+            // prompt goes with the session.
+            self.server.remove_session(self.id);
+            self.prompt = None;
             effects.push(Effect::Exit);
         } else {
             self.last_active = self.cur().active;
@@ -90,9 +104,13 @@ impl Session {
     }
 
     /// The current window and tmux's `next_active_point` counter.
-    fn cur_point(&mut self) -> (&mut Window, &mut u32) {
+    fn cur_point(&mut self) -> (&mut Window, &Cell<u32>) {
         let w = self.winlinks.get_mut(&self.curw).expect("current window");
-        (w, &mut self.next_active_point)
+        (w, self.server.active_point())
+    }
+
+    pub(crate) fn find_pane(&self, wp: PaneId) -> Option<&Pane> {
+        self.winlinks.values().find_map(|w| w.panes.iter().find(|p| p.id == wp))
     }
 
     pub(crate) fn find_pane_mut(&mut self, wp: PaneId) -> Option<&mut Pane> {
@@ -108,9 +126,7 @@ impl Session {
     }
 
     fn new_pane(&mut self) -> Pane {
-        let id = self.next_pane_id;
-        self.next_pane_id += 1;
-        Pane::new(id)
+        Pane::new(self.server.new_pane_id())
     }
 
     /// winlink_add(-1 - base-index): the lowest free index.
@@ -123,19 +139,18 @@ impl Session {
     fn spawn_window(&mut self, idx: u32, parent: Option<PaneId>, inherit_cwd: bool) {
         let pane = self.new_pane();
         let id = pane.id;
-        let mut w = Window::new(self.next_window_id, pane);
-        self.next_window_id += 1;
+        let mut w = Window::new(self.server.new_window_id(), pane);
         // window_set_active_pane with no previous active pane.
-        w.panes[0].active_point = self.next_active_point;
-        self.next_active_point = self.next_active_point.wrapping_add(1);
+        let point = self.server.active_point();
+        w.panes[0].active_point = point.get();
+        point.set(point.get().wrapping_add(1));
         self.winlinks.insert(idx, w);
         self.spawned.push((id, parent, inherit_cwd));
     }
 
-    /// winlink_shuffle_up without `before`: frees the index after the
-    /// current window by moving the windows from there up by one.
-    fn shuffle_up(&mut self) -> u32 {
-        let idx = self.curw + 1;
+    /// winlink_shuffle_up: frees index `idx` by moving the windows from
+    /// there up by one.
+    fn shuffle_up(&mut self, idx: u32) -> u32 {
         let mut last = idx;
         while self.winlinks.contains_key(&last) {
             last += 1;
@@ -192,14 +207,30 @@ impl Session {
         }
     }
 
-    /// session_detach: returns whether the session is now empty.
-    fn session_detach(&mut self, idx: u32) -> bool {
+    /// session_detach followed by server_unlink_window, which destroys
+    /// the session once it is empty.
+    pub(crate) fn unlink_window(&mut self, idx: u32) -> Window {
         if self.curw == idx && self.session_last() != 0 && self.session_previous() != 0 {
             self.session_next();
         }
         self.lastw.retain(|&i| i != idx);
-        self.winlinks.remove(&idx);
-        self.winlinks.is_empty()
+        let w = self.winlinks.remove(&idx).expect("window");
+        if self.winlinks.is_empty() {
+            self.dead = true;
+        }
+        w
+    }
+
+    /// server_link_window for move-window: `-b` before the window at
+    /// `position` in index order, or `-a` after the last one (the base
+    /// index in an empty session), selecting the window (no `-d`).
+    pub(crate) fn link_window(&mut self, w: Window, position: usize) {
+        let idx = match self.winlinks.keys().nth(position).copied() {
+            Some(at) => self.shuffle_up(at),
+            None => self.winlinks.keys().next_back().map_or(0, |&last| last + 1),
+        };
+        self.winlinks.insert(idx, w);
+        self.set_current(idx);
     }
 
     /// winlink_next_by_number / winlink_previous_by_number from the current window.
@@ -221,9 +252,7 @@ impl Session {
         if let Some(w) = self.winlinks.get_mut(&idx) {
             w.unzoom();
         }
-        if self.session_detach(idx) {
-            self.dead = true;
-        }
+        self.unlink_window(idx);
     }
 
     /// server_kill_pane
@@ -255,7 +284,7 @@ impl Session {
             }
             Command::NewWindow { cwd_of_active, after } => {
                 let parent = self.cur().active;
-                let idx = if after { self.shuffle_up() } else { self.free_index() };
+                let idx = if after { self.shuffle_up(self.curw + 1) } else { self.free_index() };
                 self.spawn_window(idx, Some(parent), cwd_of_active);
                 self.set_current(idx);
                 Ok(())
@@ -347,10 +376,11 @@ impl Session {
             }
             Command::CopyMode { page_up } => {
                 let pane = self.cur().active;
+                let p = self.cur_mut().pane_mut(pane);
                 // window_pane_set_mode leaves a pane already in copy mode as it is.
-                if let Entry::Vacant(mode) = self.modes.entry(pane) {
-                    mode.insert(1);
-                    let search = self.searches.get(&pane).cloned();
+                if p.mode.is_none() {
+                    p.mode = Some(1);
+                    let search = p.search.clone();
                     self.writes.push(Effect::CopyMode { pane, search });
                 }
                 // window_copy_pageup, which neither uses nor resets the prefix.
@@ -361,16 +391,17 @@ impl Session {
             }
             Command::PasteBuffer { bracket } => {
                 let pane = self.cur().active;
-                if let Some(top) = self.buffers.top() {
+                if let Some(top) = self.server.buffers().top() {
                     self.writes.push(Effect::Paste { pane, data: paste::paste_data(&top.data), bracket });
                 }
                 Ok(())
             }
             Command::DeleteBuffer => {
-                let Some(name) = self.buffers.top().map(|b| b.name.clone()) else {
+                let mut buffers = self.server.buffers();
+                let Some(name) = buffers.top().map(|b| b.name.clone()) else {
                     return Err("no buffer".to_owned());
                 };
-                self.buffers.free(&name);
+                buffers.free(&name);
                 Ok(())
             }
         }
@@ -484,8 +515,7 @@ impl Session {
         }
         let wp = w.active;
         let pane = w.remove_pane(wp);
-        let nw = Window::new(self.next_window_id, pane);
-        self.next_window_id += 1;
+        let nw = Window::new(self.server.new_window_id(), pane);
         let new = self.free_index();
         self.winlinks.insert(new, nw);
         self.set_current(new);
@@ -587,7 +617,11 @@ impl Session {
         if expanded.is_empty() {
             return Err(format!("invalid session: {expanded}"));
         }
-        self.name = format::vis(&expanded.replace([':', '.'], "_"));
+        let name = format::vis(&expanded.replace([':', '.'], "_"));
+        if name != self.name {
+            self.server.rename_session(self.id, &name)?;
+            self.name = name;
+        }
         Ok(())
     }
 
