@@ -233,6 +233,11 @@ pub(crate) struct Term {
     pub cursor_visible: bool,
     pub cursor_shape: CursorShape,
     pub cursor_blink: bool,
+    /// ghostty's configured cursor style and cursor-style-blink, which
+    /// DECSCUSR 0 and RIS select; `None` blinks and lets DEC mode 12 decide.
+    pub default_cursor: (CursorShape, Option<bool>),
+    /// The cursor follows `default_cursor` (no DECSCUSR chose another).
+    cursor_is_default: bool,
     /// Whether the terminal's surface has focus (for DEC 1004 reports).
     pub focused: bool,
     /// The pointer's CSS cursor name (OSC 22, mouse reporting).
@@ -301,6 +306,8 @@ impl Term {
             cursor_shape: CursorShape::Block,
             // ghostty's default for DEC mode 12 (cursor-style-blink unset).
             cursor_blink: true,
+            default_cursor: (CursorShape::Block, None),
+            cursor_is_default: true,
             focused: true,
             mouse_shape: "text",
             semantic: Semantic::Output,
@@ -1326,13 +1333,54 @@ impl Term {
         let cwd = self.cwd.take();
         let bell = self.bell;
         let base = std::mem::take(&mut self.base_palette);
+        let cursor = self.default_cursor;
         *self = Term::new(self.cols, self.rows, hist);
         self.palette = base.clone();
         self.base_palette = base;
+        self.set_default_cursor(cursor);
         self.replies = replies;
         self.messages = messages;
         self.cwd = cwd;
         self.bell = bell;
+    }
+
+    /// ghostty's setCursorStyle: DECSCUSR's shape and blinking, or with
+    /// `None` the configured default.
+    fn set_cursor_style(&mut self, style: Option<(CursorShape, bool)>) {
+        self.cursor_is_default = style.is_none();
+        let (shape, blink) = self.default_cursor;
+        (self.cursor_shape, self.cursor_blink) = style.unwrap_or((shape, blink.unwrap_or(true)));
+    }
+
+    /// ghostty's setDefaultCursorStyle and setDefaultCursorBlink: shown at
+    /// once unless a program chose another cursor.
+    pub fn set_default_cursor(&mut self, cursor: (CursorShape, Option<bool>)) {
+        self.default_cursor = cursor;
+        if self.cursor_is_default {
+            self.set_cursor_style(None);
+        }
+    }
+
+    /// New configured colors: the entries a program did not change (OSC 4,
+    /// 10, 11, 12) take them, the others keep the program's.
+    pub fn change_default_palette(&mut self, palette: Palette) {
+        let (old, cur) = (&self.base_palette, &mut self.palette);
+        for ((c, o), n) in cur.indexed.iter_mut().zip(&old.indexed).zip(&palette.indexed) {
+            if c == o {
+                *c = *n;
+            }
+        }
+        if cur.foreground == old.foreground {
+            cur.foreground = palette.foreground;
+        }
+        if cur.background == old.background {
+            cur.background = palette.background;
+        }
+        if cur.cursor == old.cursor {
+            cur.cursor = palette.cursor;
+        }
+        self.base_palette = palette;
+        self.mark_all_dirty();
     }
 
     // ---- Modes ---------------------------------------------------------
@@ -1366,7 +1414,9 @@ impl Term {
                 self.autowrap = on;
                 self.update_slow();
             }
-            12 => self.cursor_blink = on,
+            // ghostty: a configured cursor-style-blink outranks DEC mode 12.
+            12 if self.default_cursor.1.is_none() => self.cursor_blink = on,
+            12 => {}
             25 => self.cursor_visible = on,
             9 | 1000 | 1002 | 1003 => {
                 m.mouse_mode = match (on, mode) {
@@ -1602,17 +1652,17 @@ impl Term {
             (0, 0, b's') => self.save_cursor(),
             (0, 0, b'u') => self.restore_cursor(),
             (0, b' ', b'q') => {
-                let (shape, blink) = match p.get(0) {
-                    0 | 1 => (CursorShape::Block, true),
-                    2 => (CursorShape::Block, false),
-                    3 => (CursorShape::Underline, true),
-                    4 => (CursorShape::Underline, false),
-                    5 => (CursorShape::Bar, true),
-                    6 => (CursorShape::Bar, false),
+                let style = match p.get(0) {
+                    0 => None,
+                    1 => Some((CursorShape::Block, true)),
+                    2 => Some((CursorShape::Block, false)),
+                    3 => Some((CursorShape::Underline, true)),
+                    4 => Some((CursorShape::Underline, false)),
+                    5 => Some((CursorShape::Bar, true)),
+                    6 => Some((CursorShape::Bar, false)),
                     _ => return,
                 };
-                self.cursor_shape = shape;
-                self.cursor_blink = blink;
+                self.set_cursor_style(style);
             }
             (0, b'!', b'p') => self.soft_reset(),
             (0, b'$', b'p') => {
@@ -1759,7 +1809,7 @@ impl Term {
             }
             110 => self.palette.foreground = self.base_palette.foreground,
             111 => self.palette.background = self.base_palette.background,
-            112 => self.palette.cursor = None,
+            112 => self.palette.cursor = self.base_palette.cursor,
             _ => {}
         }
         if matches!(cmd, 110 | 111) {

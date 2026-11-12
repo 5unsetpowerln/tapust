@@ -1064,6 +1064,51 @@ fn cursor_style_and_visibility() {
     assert!(t.cursor().visible);
 }
 
+/// ghostty's cursor-style and cursor-style-blink: the default DECSCUSR 0
+/// and RIS go back to, shown at once while no program chose a cursor.
+#[test]
+fn configured_cursor_defaults() {
+    let mut t = term(10, 2);
+    let shown = |t: &Terminal| (t.cursor().shape, t.cursor().blinking);
+    t.set_default_cursor(CursorShape::BlockHollow, Some(false));
+    assert_eq!(shown(&t), (CursorShape::BlockHollow, false));
+    // A configured blink outranks DEC mode 12, DECSCUSR does not.
+    feed(&mut t, "\x1b[?12h");
+    assert_eq!(shown(&t), (CursorShape::BlockHollow, false));
+    feed(&mut t, "\x1b[5 q");
+    assert_eq!(shown(&t), (CursorShape::Bar, true));
+    // A new default waits while a program's cursor is shown.
+    t.set_default_cursor(CursorShape::Underline, None);
+    assert_eq!(shown(&t), (CursorShape::Bar, true));
+    feed(&mut t, "\x1b[0 q");
+    assert_eq!(shown(&t), (CursorShape::Underline, true));
+    feed(&mut t, "\x1b[?12l");
+    assert_eq!(shown(&t), (CursorShape::Underline, false));
+    feed(&mut t, "\x1b[2 q\x1bc");
+    assert_eq!(shown(&t), (CursorShape::Underline, true));
+}
+
+/// A reload's colors replace the configured ones a program left alone.
+#[test]
+fn changed_default_palette_keeps_what_programs_set() {
+    let mut t = term(10, 2);
+    let rgb = |v: u8| Rgb { r: v, g: v, b: v };
+    feed(&mut t, "\x1b]4;1;#010101\x07\x1b]11;#020202\x07");
+    let mut new = Palette::default();
+    new.indexed[1] = rgb(9);
+    new.indexed[2] = rgb(8);
+    new.foreground = rgb(7);
+    new.background = rgb(6);
+    new.cursor = Some(rgb(5));
+    t.change_default_palette(new.clone());
+    let p = t.palette().clone();
+    assert_eq!((p.indexed[1], p.indexed[2], p.indexed[3]), (rgb(1), rgb(8), Palette::default().indexed[3]));
+    assert_eq!((p.foreground, p.background, p.cursor), (rgb(7), rgb(2), Some(rgb(5))));
+    // OSC 104, 111 and 112 reset to the new colors.
+    feed(&mut t, "\x1b]12;#030303\x07\x1b]104\x07\x1b]111\x07\x1b]112\x07");
+    assert_eq!(*t.palette(), new);
+}
+
 #[test]
 fn newline_mode() {
     let mut t = term(10, 3);

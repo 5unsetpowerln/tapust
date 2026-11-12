@@ -15,8 +15,9 @@ use gtk::{gdk, gio, glib, graphene};
 use mux::{CopyCommand, CopyResult, Direction, ModeKeys, PaneId, PaneSearch};
 use term::{Point, Selection};
 
-use crate::bindings::{self, Binding, Scroll};
+use crate::bindings::{self, Binding, FontSize, Press, Scroll};
 use crate::compose;
+use crate::config::{Config, CopyOnSelect};
 use crate::copy::CopyMode;
 use crate::font::Fonts;
 use crate::frame::{Frame, Grid};
@@ -37,7 +38,7 @@ pub enum Event {
     Focused { pane: PaneId },
     /// A key press; returns whether it was used. `text` is what the input
     /// method committed for it, if anything.
-    Key { pane: PaneId, keyval: gdk::Key, state: gdk::ModifierType, text: Option<String> },
+    Key { pane: PaneId, press: Press, text: Option<String> },
     /// Text the input method committed outside a plain key press (a
     /// finished composition).
     Text { pane: PaneId, text: String },
@@ -51,6 +52,8 @@ pub enum Event {
     PastePrimary,
     /// The surface's selection appeared or went away (the Copy action).
     SelectionChanged,
+    /// copy-on-select put the selection on the clipboard.
+    SelectionCopied,
     /// A touchpad swipe asks for the next (or previous) tab.
     SwipeTab { next: bool },
     /// A right click not reported to the program opens the context menu.
@@ -186,7 +189,14 @@ pub struct Surface {
     /// The pane's font size (ghostty's font_size), which its fonts are
     /// loaded at, multiplied by `font_scale`.
     font_points: Cell<f32>,
+    /// What reset_font_size goes back to (ghostty's original_font_size):
+    /// the size the pane was made with, the configured one after a reload.
+    font_base: Cell<f32>,
+    /// The size was changed with a binding (ghostty's font_size_adjusted),
+    /// so a reload leaves it.
+    font_adjusted: Cell<bool>,
     font_scale: Cell<f64>,
+    config: RefCell<Rc<Config>>,
     cell_idle: Cell<bool>,
     handler: Handler,
     draw: RefCell<Draw>,
@@ -236,7 +246,7 @@ fn surface_id() -> u64 {
 }
 
 /// ghostty's internal_os.open on Linux.
-fn xdg_open(url: &str) {
+pub fn xdg_open(url: impl AsRef<std::ffi::OsStr>) {
     if let Err(err) = std::process::Command::new("xdg-open").arg(url).stdout(std::process::Stdio::null()).spawn() {
         eprintln!("tapust: cannot run xdg-open: {err}");
     }
@@ -259,10 +269,14 @@ fn button_of(number: u32) -> Option<mouse::Button> {
     }
 }
 
-fn load_fonts(points: f32, scale: f64) -> Option<Fonts> {
-    Fonts::new(theme::FONT_FAMILY, points, scale)
-        .inspect_err(|err| eprintln!("tapust: cannot load fonts: {err}"))
-        .ok()
+fn load_fonts(family: &str, points: f32, scale: f64) -> Option<Fonts> {
+    Fonts::new(family, points, scale).inspect_err(|err| eprintln!("tapust: cannot load fonts: {err}")).ok()
+}
+
+/// The configured background, which the padding and the window show.
+fn background(config: &Config) -> [u8; 4] {
+    let palette = config.term_palette();
+    compose::resolve(term::Color::Default, &palette, palette.background)
 }
 
 fn padding(scale: f64) -> u32 {
@@ -294,7 +308,10 @@ fn drop_direction(x: f64, y: f64, w: f64, h: f64) -> Direction {
 }
 
 impl Surface {
-    pub fn new(pane: PaneId, term_bg: [u8; 4], font_points: f32, handler: Handler) -> Rc<Surface> {
+    /// A pane's surface with its fonts at `font_points`, which reset_font_size
+    /// goes back to.
+    pub fn new(pane: PaneId, config: Rc<Config>, font_points: f32, handler: Handler) -> Rc<Surface> {
+        let term_bg = background(&config);
         let area = gtk::GLArea::builder().hexpand(true).vexpand(true).focusable(true).focus_on_click(true).build();
         area.set_allowed_apis(gdk::GLAPI::GL);
         area.set_required_version(3, 3);
@@ -470,7 +487,10 @@ impl Surface {
             menu: RefCell::new(None),
             last_blink_reset: Cell::new(None),
             font_points: Cell::new(font_points),
+            font_base: Cell::new(font_points),
+            font_adjusted: Cell::new(false),
             font_scale: Cell::new(0.0),
+            config: RefCell::new(config),
             cell_idle: Cell::new(false),
             handler: handler.clone(),
             draw: RefCell::new(Draw {
@@ -502,7 +522,7 @@ impl Surface {
                 return;
             }
             let scale = area.native().and_then(|n| n.surface()).map_or(1.0, |s| s.scale());
-            let Some(fonts) = load_fonts(s.font_points.get(), scale) else { return };
+            let Some(fonts) = load_fonts(s.config.borrow().font_family(), s.font_points.get(), scale) else { return };
             s.draw.borrow_mut().renderer = Some(Renderer::new(crate::gl::context(), fonts));
             s.im.set_client_widget(Some(area));
             s.font_scale.set(scale);
@@ -576,9 +596,10 @@ impl Surface {
 
         let keys = gtk::EventControllerKey::new();
         let (weak, h) = (Rc::downgrade(self), handler.clone());
-        keys.connect_key_pressed(move |keys, keyval, _, state| {
+        keys.connect_key_pressed(move |keys, keyval, keycode, state| {
             let Some(s) = weak.upgrade() else { return glib::Propagation::Proceed };
             let Some(event) = keys.current_event() else { return glib::Propagation::Proceed };
+            let press = Press::new(keys, keyval, keycode, state);
             // ghostty's keyEvent: the input method sees the key first.
             s.update_ime_position();
             s.in_keyevent.set(if s.im_composing.get() { InKeyEvent::Composing } else { InKeyEvent::NotComposing });
@@ -588,7 +609,7 @@ impl Surface {
             if handled && (s.im_composing.get() || was == InKeyEvent::Composing || text.is_none()) {
                 return glib::Propagation::Stop;
             }
-            if !h(Event::Key { pane: s.pane, keyval, state, text }) {
+            if !h(Event::Key { pane: s.pane, press, text }) {
                 return glib::Propagation::Proceed;
             }
             // A key the terminal used ends a composition.
@@ -782,12 +803,13 @@ impl Surface {
         // binding that opens the search, which selects the query again.
         let keys = gtk::EventControllerKey::builder().propagation_phase(gtk::PropagationPhase::Capture).build();
         let w = weak.clone();
-        keys.connect_key_pressed(move |_, keyval, _, state| {
+        keys.connect_key_pressed(move |keys, keyval, keycode, state| {
             let Some(s) = w.upgrade() else { return glib::Propagation::Proceed };
             let enter = matches!(keyval, gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::ISO_Enter);
+            let bound = s.config.borrow().keybind.lookup(&Press::new(keys, keyval, keycode, state));
             if enter && state.contains(gdk::ModifierType::SHIFT_MASK) {
                 s.navigate_search(false);
-            } else if bindings::binding(keyval, state) == Some(Binding::StartSearch) {
+            } else if bound.map(|b| b.binding) == Some(Binding::StartSearch) {
                 s.start_search();
             } else {
                 return glib::Propagation::Proceed;
@@ -857,7 +879,7 @@ impl Surface {
             // ghostty's content scale callback: a new scale needs fonts
             // rasterized for it.
             if scale != self.font_scale.get()
-                && let Some(fonts) = load_fonts(self.font_points.get(), scale)
+                && let Some(fonts) = load_fonts(self.config.borrow().font_family(), self.font_points.get(), scale)
             {
                 renderer.set_fonts(fonts);
                 self.font_scale.set(scale);
@@ -887,18 +909,61 @@ impl Surface {
         self.font_points.get()
     }
 
-    /// ghostty's setFontSize: the fonts at `points`, and the grid that fits
-    /// the same pixels with their cell size; the split keeps its size.
-    pub fn set_font_points(self: &Rc<Self>, points: f32) {
-        if points == self.font_points.get() {
-            return;
+    /// ghostty's increase_font_size, decrease_font_size and reset_font_size.
+    pub fn change_font_size(self: &Rc<Self>, change: FontSize) {
+        let points = bindings::font_points(self.font_points.get(), change, self.font_base.get());
+        self.font_adjusted.set(change != FontSize::Reset);
+        if points != self.font_points.get() {
+            self.set_fonts(points);
         }
-        let Some(fonts) = load_fonts(points, self.font_scale.get()) else { return };
+    }
+
+    /// ghostty's Surface.updateConfig: the new colors, cursor, fonts and
+    /// copy-on-select. A size changed with a binding stays, others take the
+    /// configured size, which reset_font_size goes back to from now on.
+    pub fn apply_config(self: &Rc<Self>, config: Rc<Config>) {
+        let family_changed = config.font_family() != self.config.borrow().font_family();
+        let palette = config.term_palette();
+        if let Some(shared) = self.draw.borrow().shared.clone() {
+            let mut term = shared.term.lock();
+            term.change_default_palette(palette.clone());
+            term.set_default_cursor(config.cursor_style, config.cursor_style_blink);
+        }
+        if let Some(mode) = self.copy.borrow_mut().as_mut() {
+            mode.term_mut().change_default_palette(palette);
+        }
+        let bg = background(&config);
         {
             let mut d = self.draw.borrow_mut();
-            let Some(renderer) = d.renderer.as_mut() else { return };
+            d.term_bg = bg;
+            d.frame.window_bg = bg;
+            for grid in &mut d.frame.grids {
+                grid.bg = bg;
+            }
+            d.full = true;
+        }
+        self.font_base.set(config.font_size);
+        *self.config.borrow_mut() = config;
+        let points = if self.font_adjusted.get() { self.font_points.get() } else { self.font_base.get() };
+        if family_changed || points != self.font_points.get() {
+            self.set_fonts(points);
+        }
+        self.area.queue_render();
+    }
+
+    /// ghostty's setFontSize: the fonts at `points`, and the grid that fits
+    /// the same pixels with their cell size; the split keeps its size.
+    fn set_fonts(self: &Rc<Self>, points: f32) {
+        // A surface not realized yet loads its fonts when it is.
+        if self.draw.borrow().renderer.is_none() {
+            self.font_points.set(points);
+            return;
+        }
+        let Some(fonts) = load_fonts(self.config.borrow().font_family(), points, self.font_scale.get()) else { return };
+        {
+            let mut d = self.draw.borrow_mut();
             self.area.make_current();
-            renderer.set_fonts(fonts);
+            d.renderer.as_mut().expect("a realized surface's renderer").set_fonts(fonts);
         }
         self.font_points.set(points);
         self.schedule_cell_size();
@@ -1036,6 +1101,13 @@ impl Surface {
         self.copy.borrow().is_some()
     }
 
+    /// tmux's mode-keys changed: copy mode goes on with the new keys.
+    pub fn set_mode_keys(&self, keys: ModeKeys) {
+        if let Some(mode) = self.copy.borrow_mut().as_mut() {
+            mode.set_keys(keys);
+        }
+    }
+
     /// tmux's copy-mode (window_copy_init): a frozen copy of the screen,
     /// with the pane's last search. False while the pane has no terminal.
     pub fn enter_copy_mode(self: &Rc<Self>, keys: ModeKeys, search: Option<PaneSearch>) -> bool {
@@ -1151,19 +1223,25 @@ impl Surface {
         true
     }
 
-    /// ghostty's select_all, copied to the primary selection like a
-    /// selection made with the mouse.
+    /// ghostty's select_all, copied like a selection made with the mouse.
     pub fn select_all(&self) {
         let all = self.shown(|term| selection::all(term)).flatten();
         if all.is_some() {
             self.set_selection(all);
-            self.copy_primary();
+            self.copy_on_select();
         }
     }
 
-    /// ghostty's copy-on-select = primary, which copies as .mixed too.
-    fn copy_primary(&self) {
-        self.copy_selection(&self.area.primary_clipboard());
+    /// ghostty's copy-on-select, which copies as .mixed too; the clipboard
+    /// gets ghostty's toast.
+    fn copy_on_select(&self) {
+        let mode = self.config.borrow().copy_on_select;
+        if matches!(mode, CopyOnSelect::Primary | CopyOnSelect::Both) {
+            self.copy_selection(&self.area.primary_clipboard());
+        }
+        if matches!(mode, CopyOnSelect::Clipboard | CopyOnSelect::Both) && self.copy_selection(&self.area.clipboard()) {
+            (self.handler)(Event::SelectionCopied);
+        }
     }
 
     /// The cell under the logical point (`x`, `y`), clamped to the grid,
@@ -1288,7 +1366,7 @@ impl Surface {
                 };
                 if let Some(word) = word {
                     self.set_selection(Some(word));
-                    self.copy_primary();
+                    self.copy_on_select();
                 }
                 (self.handler)(Event::ContextMenu { pane: self.pane, x, y });
             }
@@ -1313,7 +1391,7 @@ impl Surface {
             return;
         }
         if button == mouse::Button::Left && self.has_selection() {
-            self.copy_primary();
+            self.copy_on_select();
         }
         // ghostty opens the hovered link on a left release that did not drag,
         // or else moves the cursor to a click at the prompt.
@@ -1984,12 +2062,12 @@ impl Surface {
             let (x, y) = mode.cursor();
             let term = mode.term_mut();
             let selection = term.selection();
-            compose::copy_pane(grid, term, d.full, &marks, current, selection.as_ref());
+            compose::copy_pane(grid, term, d.full, &marks, current, selection.as_ref(), &self.config.borrow());
             if let Some(link) = self.hover.borrow().as_ref() {
                 compose::underline(grid, term, link);
             }
             if !focused || d.blink_on {
-                d.frame.cursors.extend(compose::copy_cursor(term, 0, x, y, focused));
+                d.frame.cursors.extend(compose::copy_cursor(term, 0, x, y, focused, &self.config.borrow()));
             }
         } else if let Some(shared) = &d.shared {
             use std::sync::atomic::Ordering;
@@ -1999,7 +2077,8 @@ impl Surface {
             shared.want_lock.store(false, Ordering::Release);
             let selection = term.selection();
             let found = self.found.borrow();
-            compose::copy_pane(grid, &mut term, d.full, &found.matches, found.current, selection.as_ref());
+            let config = self.config.borrow();
+            compose::copy_pane(grid, &mut term, d.full, &found.matches, found.current, selection.as_ref(), &config);
             if let Some(link) = self.hover.borrow().as_ref() {
                 compose::underline(grid, &term, link);
             }
@@ -2009,9 +2088,9 @@ impl Surface {
                 compose::preedit(grid, &term, text);
                 None
             } else if self.password.get() {
-                compose::lock_cursor(&term, 0)
+                compose::lock_cursor(&term, 0, &config)
             } else if !focused || !term.cursor().blinking || d.blink_on {
-                compose::pane_cursor(&term, 0, focused)
+                compose::pane_cursor(&term, 0, focused, &config)
             } else {
                 None
             };

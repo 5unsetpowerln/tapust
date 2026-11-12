@@ -1,6 +1,7 @@
 mod attention;
 mod bindings;
 mod compose;
+mod config;
 mod copy;
 mod font;
 mod frame;
@@ -25,11 +26,11 @@ use std::error::Error;
 use std::ffi::OsString;
 
 use adw::prelude::*;
-use gtk::{gdk, gio};
+use gtk::gio;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    // `tapust -e PROGRAM [ARGS...]` runs PROGRAM in the first pane instead of the login shell.
+    // `tapust -e PROGRAM [ARGS...]` runs PROGRAM in the first pane instead of the configured command.
     let command = match args.split_first() {
         None => None,
         Some((flag, rest)) if flag == "-e" && !rest.is_empty() => Some(rest.to_vec()),
@@ -40,12 +41,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         .application_id("dev.tapust.tapust")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
-    application.connect_startup(|_| {
-        let provider = gtk::CssProvider::new();
-        provider.load_from_string(&gui::css());
-        let display = gdk::Display::default().expect("display");
-        gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-    });
     let command = std::cell::RefCell::new(command);
     application.connect_activate(move |application| {
         gui::App::build(application, command.borrow_mut().take());

@@ -106,17 +106,35 @@ pub struct ChildExit {
     pub runtime: Duration,
 }
 
+/// What a pane runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Program {
+    /// The login shell as a login shell (argv[0] prefixed with '-', like tmux).
+    LoginShell,
+    /// A program and its arguments.
+    Argv(Vec<OsString>),
+    /// ghostty's shell command: a command line for `/bin/sh -c`.
+    ShellCommand(String),
+}
+
 impl Pty {
-    /// Starts `argv`, or without it the login shell as a login shell (argv[0]
-    /// prefixed with '-', like tmux), with tapust's shell integration.
-    pub fn spawn(argv: Option<Vec<OsString>>, cols: u16, rows: u16, cell: (u32, u32), cwd: &Path) -> io::Result<Pty> {
-        let login = argv.is_none();
-        let argv = match argv {
-            Some(argv) => argv,
-            None => vec![login_shell()?.into_os_string()],
-        };
+    /// Starts `program` with tapust's shell integration, whose prompt
+    /// cursor blinks with `cursor_blink`.
+    pub fn spawn(
+        program: Program,
+        cursor_blink: bool,
+        cols: u16,
+        rows: u16,
+        cell: (u32, u32),
+        cwd: &Path,
+    ) -> io::Result<Pty> {
         let mut env: shell::Env = std::env::vars_os().collect();
-        let argv = shell::prepare(argv, login, &mut env);
+        let login = program == Program::LoginShell;
+        let argv = match program {
+            Program::LoginShell => shell::prepare(vec![login_shell()?.into_os_string()], true, cursor_blink, &mut env),
+            Program::Argv(argv) => shell::prepare(argv, false, cursor_blink, &mut env),
+            Program::ShellCommand(line) => shell::prepare_command(&line, cursor_blink, &mut env),
+        };
         let mut command = Command::new(&argv[0]);
         command.args(&argv[1..]).env_clear().envs(&env);
         if login {

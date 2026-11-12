@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::copy::{self, ModeAction};
 use crate::prompt::PromptKind;
-use crate::{Command, Direction, Effect, Key, KeyCode, KeyResult, Layout, Session};
+use crate::{Command, Direction, Effect, Key, KeyCode, KeyResult, Layout, Mods, Session};
 
 /// The `repeat-time` option.
 pub(crate) const REPEAT_TIME: Duration = Duration::from_millis(500);
@@ -80,9 +80,65 @@ fn split(horizontal: bool, full: bool) -> Option<Binding> {
     run(Command::SplitWindow { horizontal, before: false, full, cwd_of_active: true })
 }
 
-/// Whether `key` is the `prefix` option (C-b).
-pub fn is_prefix(key: Key) -> bool {
-    key.code == KeyCode::Char('b') && key.mods.ctrl && !key.mods.meta
+/// tmux's key_string_lookup_string for the keys the model can tell apart:
+/// `None` (no key), `^x` and `C-`, `M-` and `S-` modifiers before a
+/// character or a key name, as `set -g prefix` takes them.
+pub fn parse_key(string: &str) -> Result<Option<Key>, String> {
+    let bad = || format!("bad key: {string}");
+    if string.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    let mut mods = Mods::default();
+    let mut rest = string;
+    if let Some(short) = rest.strip_prefix('^').filter(|r| !r.is_empty()) {
+        mods.ctrl = true;
+        rest = short;
+        // `^A` alone is C-a, as tmux lowercases it.
+        let mut chars = rest.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            return Ok(Some(Key { code: KeyCode::Char(c.to_ascii_lowercase()), mods }));
+        }
+    }
+    while let [m, b'-', _, ..] = rest.as_bytes() {
+        match m {
+            b'C' | b'c' => mods.ctrl = true,
+            b'M' | b'm' => mods.meta = true,
+            b'S' | b's' => mods.shift = true,
+            _ => return Err(bad()),
+        }
+        rest = &rest[2..];
+    }
+    let mut chars = rest.chars();
+    let code = match (chars.next(), chars.next()) {
+        (Some(c), None) if !c.is_control() => KeyCode::Char(c),
+        (Some(_), None) | (None, _) => return Err(bad()),
+        _ => match rest.to_ascii_lowercase().as_str() {
+            "enter" => KeyCode::Enter,
+            "escape" => KeyCode::Escape,
+            "tab" => KeyCode::Tab,
+            "btab" => {
+                mods.shift = true;
+                KeyCode::Tab
+            }
+            "bspace" => KeyCode::Backspace,
+            "space" => KeyCode::Char(' '),
+            "up" => KeyCode::Up,
+            "down" => KeyCode::Down,
+            "left" => KeyCode::Left,
+            "right" => KeyCode::Right,
+            "home" => KeyCode::Home,
+            "end" => KeyCode::End,
+            "ppage" | "pageup" | "pgup" => KeyCode::PageUp,
+            "npage" | "pagedown" | "pgdn" => KeyCode::PageDown,
+            "ic" | "insert" => KeyCode::Insert,
+            "dc" | "delete" => KeyCode::Delete,
+            name => match name.strip_prefix('f').and_then(|n| n.parse::<u8>().ok()) {
+                Some(n @ 1..=12) => KeyCode::F(n),
+                _ => return Err(bad()),
+            },
+        },
+    };
+    Ok(Some(Key { code, mods }))
 }
 
 /// The command the prefix table binds `key` to, as tmux's list-keys shows
@@ -223,7 +279,7 @@ impl Session {
         };
         let mut first = table;
         loop {
-            if is_prefix(key) && table != Table::Prefix {
+            if self.server.prefix() == Some(key) && table != Table::Prefix {
                 self.keys.table = Table::Prefix;
                 return KeyResult::Handled(Vec::new());
             }

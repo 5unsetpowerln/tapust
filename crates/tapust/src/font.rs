@@ -22,6 +22,63 @@ const EMBEDDED: [(&str, &[u8]); 5] = [
 #[link(name = "fontconfig")]
 unsafe extern "C" {
     fn FcConfigAppFontAddFile(config: *mut libc::c_void, file: *const libc::c_uchar) -> libc::c_int;
+    fn FcPatternCreate() -> *mut libc::c_void;
+    fn FcPatternDestroy(pattern: *mut libc::c_void);
+    fn FcPatternAddString(
+        pattern: *mut libc::c_void,
+        object: *const libc::c_char,
+        s: *const libc::c_uchar,
+    ) -> libc::c_int;
+    fn FcPatternGetString(
+        pattern: *const libc::c_void,
+        object: *const libc::c_char,
+        n: libc::c_int,
+        s: *mut *const libc::c_uchar,
+    ) -> libc::c_int;
+    fn FcConfigSubstitute(config: *mut libc::c_void, pattern: *mut libc::c_void, kind: libc::c_int) -> libc::c_int;
+    fn FcDefaultSubstitute(pattern: *mut libc::c_void);
+    fn FcFontMatch(
+        config: *mut libc::c_void,
+        pattern: *mut libc::c_void,
+        result: *mut libc::c_int,
+    ) -> *mut libc::c_void;
+}
+
+/// The families of `pattern`, in order.
+unsafe fn families(pattern: *const libc::c_void) -> Vec<String> {
+    let mut families = Vec::new();
+    let mut s: *const libc::c_uchar = std::ptr::null();
+    // FcResultMatch is 0.
+    while unsafe { FcPatternGetString(pattern, c"family".as_ptr(), families.len() as libc::c_int, &mut s) } == 0 {
+        families.push(unsafe { std::ffi::CStr::from_ptr(s.cast()) }.to_string_lossy().into_owned());
+    }
+    families
+}
+
+/// Whether fontconfig has a font of the family `name`, or `name` is one of
+/// its aliases (`monospace`). crossfont takes fontconfig's best match for any
+/// name, which for a family that is not there is some other font: the
+/// match must be `name` or a family fontconfig put before it in its place.
+pub fn family_exists(name: &str) -> bool {
+    let Ok(family) = CString::new(name) else { return false };
+    unsafe {
+        let pattern = FcPatternCreate();
+        FcPatternAddString(pattern, c"family".as_ptr(), family.as_ptr().cast());
+        // FcMatchPattern is 0.
+        FcConfigSubstitute(std::ptr::null_mut(), pattern, 0);
+        FcDefaultSubstitute(pattern);
+        let wanted = families(pattern);
+        let mut result = 0;
+        let matched = FcFontMatch(std::ptr::null_mut(), pattern, &mut result);
+        FcPatternDestroy(pattern);
+        if matched.is_null() {
+            return false;
+        }
+        let found = families(matched);
+        FcPatternDestroy(matched);
+        let Some(at) = wanted.iter().position(|f| f.eq_ignore_ascii_case(name)) else { return false };
+        found.iter().any(|f| wanted[..=at].iter().any(|w| w.eq_ignore_ascii_case(f)))
+    }
 }
 
 /// Makes the bundled fonts visible to fontconfig, and so to crossfont,

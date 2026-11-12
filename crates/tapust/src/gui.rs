@@ -7,7 +7,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
@@ -17,18 +18,19 @@ use mux::{
     Command, ConfirmTarget, Copied, CopyResult, Effect, InputKind, KeyResult, ModeKeys, Node, Overlay, PaneId, Rect,
     Server, Session,
 };
+use term::Rgb;
 
 use crate::attention::Attention;
-use crate::bindings::{self, Binding, Scroll};
-use crate::compose;
+use crate::bindings::{Binding, Press, Scroll};
+use crate::config::{self, Command as ConfigCommand, Config, ConfirmClose, Diagnostic, WorkingDirectory};
+use crate::font;
 use crate::input;
 use crate::notifications;
 use crate::palette::{self, Run};
-use crate::pty::{ChildExit, PaneIo, Pty};
-use crate::surface::{Event, Surface};
+use crate::pty::{ChildExit, PaneIo, Program, Pty};
+use crate::surface::{self, Event, Surface};
 use crate::theme;
 
-const SCROLLBACK: usize = 10_000;
 /// How often foreground process names are checked (tmux `NAME_INTERVAL`).
 const NAME_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -41,6 +43,8 @@ struct Pane {
     io: Option<PaneIo<term::Terminal>>,
     /// The directory the shell starts in.
     cwd: PathBuf,
+    /// What the pane runs instead of the configured command (`-e`).
+    program: Option<Vec<OsString>>,
     /// The terminal title (OSC 0/2) last seen; empty until the program sets one.
     title: String,
     /// ghostty's surface title override (Change Terminal Title).
@@ -82,11 +86,18 @@ pub struct App {
     windows: RefCell<Vec<Rc<Window>>>,
     /// The window showing each pane, which gets the pane's events.
     owners: RefCell<HashMap<PaneId, Weak<Window>>>,
+    /// The directory tapust started in (working-directory = inherit).
     cwd: PathBuf,
-    /// Program for the first pane (`-e`); later panes run the login shell.
+    /// What the next new pane runs instead of the configured command: `-e`
+    /// for the first pane, the editor for Open Configuration in New Window.
     command: RefCell<Option<Vec<OsString>>>,
-    palette: term::Palette,
-    term_bg: [u8; 4],
+    config: RefCell<Rc<Config>>,
+    /// The stylesheet, whose runtime rules follow the configuration.
+    css: gtk::CssProvider,
+    /// ghostty's config errors dialog while it is open, with its text. A
+    /// dialog presented as a window does not tell when it closes: it is gone
+    /// once its window is.
+    errors: RefCell<Option<(glib::WeakRef<adw::AlertDialog>, glib::WeakRef<gtk::TextView>)>>,
     /// When the last desktop notification was shown and its hash (ghostty's
     /// last_notification_time and last_notification_digest).
     last_notification: Cell<Option<(Instant, u64)>>,
@@ -283,7 +294,7 @@ fn targeted(label: &str, action: &str, target: &str) -> gio::MenuItem {
     item
 }
 
-/// ghostty's Config submenu; tapust has no configuration to act on.
+/// ghostty's Config submenu.
 fn config_menu() -> gio::Menu {
     let config = gio::Menu::new();
     config.append_item(&targeted("Open Configuration in OS Editor", "app.open-config", "os-open"));
@@ -361,37 +372,162 @@ fn main_menu() -> gio::Menu {
 
 impl App {
     pub fn build(application: &adw::Application, command: Option<Vec<OsString>>) -> Rc<App> {
-        let palette = theme::palette();
-        let term_bg = compose::resolve(term::Color::Default, &palette, palette.background);
-        // ghostty's window-theme = auto: the scheme follows how light the
-        // terminal background is (perceived luminance).
-        let [r, g, b, _] = term_bg.map(|c| f64::from(c) / 255.0);
-        let luminance = 0.299 * r + 0.587 * g + 0.114 * b;
-        application.style_manager().set_color_scheme(if luminance > 0.5 {
-            adw::ColorScheme::PreferLight
-        } else {
-            adw::ColorScheme::PreferDark
-        });
-        // tmux's main sets mode-keys from $VISUAL or $EDITOR.
-        let server = Server::new();
-        let (visual, editor) = (std::env::var_os("VISUAL"), std::env::var_os("EDITOR"));
-        server.set_mode_keys(ModeKeys::from_env(visual.as_deref(), editor.as_deref()));
+        let (config, diagnostics) = config::load(&font::family_exists);
+        let display = gdk::Display::default().expect("display");
+        let css = gtk::CssProvider::new();
+        gtk::style_context_add_provider_for_display(&display, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
         let app = Rc::new(App {
             application: application.clone(),
-            server,
+            server: Server::new(),
             windows: RefCell::new(Vec::new()),
             owners: RefCell::new(HashMap::new()),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             command: RefCell::new(command),
-            palette,
-            term_bg,
+            config: RefCell::new(Rc::new(config)),
+            css,
+            errors: RefCell::new(None),
             last_notification: Cell::new(None),
-            attention: Attention::new(&gdk::Display::default().expect("display")),
+            attention: Attention::new(&display),
         });
         APP.with(|a| *a.borrow_mut() = Some(app.clone()));
+        app.apply_config();
         app.add_actions();
         app.new_window(None);
+        // ghostty shows the errors of the configuration it starts with on
+        // their own, not knowing whether a window will come.
+        app.show_errors(&diagnostics);
         app
+    }
+
+    pub fn config(&self) -> Rc<Config> {
+        self.config.borrow().clone()
+    }
+
+    /// What the configuration sets for the whole application: ghostty's
+    /// window-theme = auto, its runtime stylesheet, and tmux's prefix and
+    /// mode-keys.
+    fn apply_config(&self) {
+        let config = self.config();
+        // The scheme follows how light the terminal background is
+        // (perceived luminance).
+        let Rgb { r, g, b } = config.background;
+        let luminance = (0.299 * f64::from(r) + 0.587 * f64::from(g) + 0.114 * f64::from(b)) / 255.0;
+        let scheme = if luminance > 0.5 { adw::ColorScheme::PreferLight } else { adw::ColorScheme::PreferDark };
+        self.application.style_manager().set_color_scheme(scheme);
+        self.css.load_from_string(&css(&config));
+        self.server.set_prefix(config.tmux_prefix);
+        self.server.set_mode_keys(mode_keys(&config));
+    }
+
+    /// ghostty's reload_config: the file read again, and what it sets
+    /// applied to the application and every pane, whose programs go on.
+    fn reload_config(self: &Rc<Self>) {
+        let (config, diagnostics) = config::load(&font::family_exists);
+        let config = Rc::new(config);
+        *self.config.borrow_mut() = config.clone();
+        self.apply_config();
+        let keys = self.server.mode_keys();
+        for window in self.windows() {
+            let surfaces: Vec<Rc<Surface>> = window.state.borrow().panes.values().map(|p| p.surface.clone()).collect();
+            for surface in surfaces {
+                surface.apply_config(config.clone());
+                surface.set_mode_keys(keys);
+            }
+        }
+        self.show_errors(&diagnostics);
+    }
+
+    /// ghostty's ConfigErrorsDialog: the errors listed, to ignore or to
+    /// reload the configuration after fixing them. An open dialog shows the
+    /// new errors, and goes away when there are none.
+    fn show_errors(self: &Rc<Self>, diagnostics: &[Diagnostic]) {
+        let text: String = diagnostics.iter().map(|d| format!("{d}\n")).collect();
+        let open = self.errors.borrow().as_ref().and_then(|(dialog, view)| dialog.upgrade().zip(view.upgrade()));
+        match open {
+            Some((dialog, _)) if diagnostics.is_empty() => {
+                self.errors.borrow_mut().take();
+                dialog.force_close();
+            }
+            Some((_, view)) => view.buffer().set_text(&text),
+            None if diagnostics.is_empty() => {}
+            None => {
+                let dialog = adw::AlertDialog::new(
+                    Some("Configuration Errors"),
+                    Some(concat!(
+                        "One or more configuration errors were found. Please review the errors below, ",
+                        "and either reload your configuration or ignore these errors."
+                    )),
+                );
+                dialog.add_response("ignore", "Ignore");
+                dialog.add_response("reload", "Reload Configuration");
+                dialog.set_response_appearance("reload", adw::ResponseAppearance::Suggested);
+                let view = gtk::TextView::builder()
+                    .editable(false)
+                    .cursor_visible(false)
+                    .top_margin(8)
+                    .bottom_margin(8)
+                    .left_margin(8)
+                    .right_margin(8)
+                    .build();
+                view.buffer().set_text(&text);
+                let scrolled =
+                    gtk::ScrolledWindow::builder().min_content_width(500).min_content_height(100).child(&view).build();
+                dialog.set_extra_child(Some(&scrolled));
+                let weak = Rc::downgrade(self);
+                dialog.connect_response(Some("reload"), move |_, _| {
+                    if let Some(app) = weak.upgrade() {
+                        // The dialog closes after its response: errors of the
+                        // reload need a new one.
+                        app.errors.borrow_mut().take();
+                        app.reload_config();
+                    }
+                });
+                *self.errors.borrow_mut() = Some((dialog.downgrade(), view.downgrade()));
+                dialog.present(None::<&gtk::Widget>);
+            }
+        }
+    }
+
+    /// ghostty's open_config: the configuration file, made with a short
+    /// header if missing, in the desktop's editor for it, or in a new window
+    /// running $VISUAL or $EDITOR (vi without them).
+    fn open_config(self: &Rc<Self>, new_window: bool) {
+        let path = match config::path().and_then(|path| create_config(&path).map(|()| path)) {
+            Ok(path) => path,
+            Err(err) => {
+                self.toast(&err);
+                return;
+            }
+        };
+        if !new_window {
+            surface::xdg_open(path.as_os_str());
+            return;
+        }
+        let editor = ["VISUAL", "EDITOR"].iter().find_map(|v| std::env::var_os(v).filter(|e| !e.is_empty()));
+        let mut line = editor.unwrap_or_else(|| "vi".into());
+        line.push(" ");
+        line.push(shell_quote(path.as_os_str()));
+        *self.command.borrow_mut() = Some(vec!["/bin/sh".into(), "-c".into(), line]);
+        self.new_window(None);
+    }
+
+    /// A toast in the active window, or the first one.
+    fn toast(&self, text: &str) {
+        let windows = self.windows();
+        if let Some(window) = windows.iter().find(|w| w.window.is_active()).or(windows.first()) {
+            window.toast(text);
+        }
+    }
+
+    /// The directory of a pane that does not take its parent's: ghostty's
+    /// working-directory.
+    fn default_cwd(&self) -> PathBuf {
+        match &self.config().working_directory {
+            WorkingDirectory::Inherit => self.cwd.clone(),
+            // ghostty inherits when there is no home directory.
+            WorkingDirectory::Home => config::home().unwrap_or_else(|| self.cwd.clone()),
+            WorkingDirectory::Path(path) => path.clone(),
+        }
     }
 
     /// new-session in a new window (ghostty's new_window): the first pane
@@ -433,6 +569,23 @@ impl App {
             }
         });
         self.application.add_action(&quit);
+        // ghostty's app.open-config with the target os-open or new-window.
+        let open = gio::SimpleAction::new("open-config", Some(glib::VariantTy::STRING));
+        let weak = Rc::downgrade(self);
+        open.connect_activate(move |_, parameter| {
+            if let (Some(app), Some(target)) = (weak.upgrade(), parameter.and_then(|p| p.get::<String>())) {
+                app.open_config(target == "new-window");
+            }
+        });
+        self.application.add_action(&open);
+        let reload = gio::SimpleAction::new("reload-config", None);
+        let weak = Rc::downgrade(self);
+        reload.connect_activate(move |_, _| {
+            if let Some(app) = weak.upgrade() {
+                app.reload_config();
+            }
+        });
+        self.application.add_action(&reload);
         // A request to stop from outside ends the sessions like an
         // unconfirmed quit, so the panes hang up their programs.
         for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
@@ -471,17 +624,17 @@ impl App {
 
     /// What a new pane takes from the pane it was made from, in whichever
     /// window that is: the font size, and with `inherit_cwd` the directory
-    /// of its foreground process; else the defaults.
+    /// of its foreground process; else the configured ones.
     fn origin(&self, parent: Option<PaneId>, inherit_cwd: bool) -> (f32, PathBuf) {
         let window = parent.and_then(|p| self.owner(p));
         let st = window.as_ref().map(|w| w.state.borrow());
         let parent = st.as_ref().zip(parent).and_then(|(st, p)| st.panes.get(&p));
-        let points = parent.map_or(theme::FONT_POINTS, |p| p.surface.font_points());
+        let points = parent.map_or(self.config().font_size, |p| p.surface.font_points());
         let cwd = parent
             .filter(|_| inherit_cwd)
             .and_then(|p| p.io.as_ref())
             .and_then(|io| io.pty.foreground_cwd())
-            .unwrap_or_else(|| self.cwd.clone());
+            .unwrap_or_else(|| self.default_cwd());
         (points, cwd)
     }
 
@@ -1005,7 +1158,7 @@ impl Window {
 
     fn handle(self: &Rc<Self>, event: Event) -> bool {
         match event {
-            Event::Key { pane, keyval, state, text } => self.key(pane, keyval, state, text),
+            Event::Key { pane, press, text } => self.key(pane, press, text),
             Event::Text { pane, text } => {
                 for c in text.chars() {
                     let key = mux::Key { code: mux::KeyCode::Char(c), mods: mux::Mods::default() };
@@ -1039,6 +1192,10 @@ impl Window {
             }
             Event::SelectionChanged => {
                 self.sync_copy_action();
+                true
+            }
+            Event::SelectionCopied => {
+                self.toast("Copied to clipboard");
                 true
             }
             Event::BellChanged => {
@@ -1102,12 +1259,16 @@ impl Window {
 
     /// A key press; `commit` is the input method's text for it, which is
     /// typed as it is (a dead key or a direct input method).
-    fn key(self: &Rc<Self>, pane: PaneId, keyval: gdk::Key, state: gdk::ModifierType, commit: Option<String>) -> bool {
-        // ghostty's bindings come before the tmux key tables.
-        if let Some(binding) = bindings::binding(keyval, state)
-            && self.perform(pane, binding)
-        {
-            return true;
+    fn key(self: &Rc<Self>, pane: PaneId, press: Press, commit: Option<String>) -> bool {
+        // ghostty's bindings come before the tmux key tables. A performable
+        // one that could not be performed is no binding, and an unconsumed
+        // one lets the key go on too.
+        let bound = self.app.config().keybind.lookup(&press);
+        if let Some(bound) = bound {
+            let performed = self.perform(pane, bound.binding);
+            if bound.consumed && (performed || !bound.performable) {
+                return true;
+            }
         }
         let (key, text) = match commit {
             Some(text) => {
@@ -1117,7 +1278,7 @@ impl Window {
                 }
                 return true;
             }
-            None => match input::from_gdk(keyval, state) {
+            None => match input::from_gdk(press.keyval, press.state) {
                 Some(key) => key,
                 None => return false,
             },
@@ -1126,19 +1287,21 @@ impl Window {
         true
     }
 
-    /// Carries out a binding on the pane; returns false when it does not
-    /// apply, and the key goes on as if it had none.
+    /// Carries out a binding on the pane; returns whether it could
+    /// (ghostty's performable: a copy needs a selection).
     fn perform(self: &Rc<Self>, pane: PaneId, binding: Binding) -> bool {
         let Some(surface) = self.state.borrow().panes.get(&pane).map(|p| p.surface.clone()) else { return false };
         match binding {
             Binding::StartSearch => surface.start_search(),
-            Binding::Copy { performable } => return self.copy(&surface) || !performable,
+            Binding::Copy => return self.copy(&surface),
             Binding::Paste { primary: false } => self.paste(self.window.clipboard()),
             Binding::Paste { primary: true } => self.paste(self.window.primary_clipboard()),
             Binding::Scroll(scroll) => surface.scroll(scroll),
             Binding::SelectAll => surface.select_all(),
-            Binding::FontSize(change) => surface.set_font_points(bindings::font_points(surface.font_points(), change)),
+            Binding::FontSize(change) => surface.change_font_size(change),
             Binding::ToggleCommandPalette => self.open_palette(pane),
+            Binding::OpenConfig { new_window } => self.app.open_config(new_window),
+            Binding::ReloadConfig => self.app.reload_config(),
         }
         true
     }
@@ -1147,10 +1310,11 @@ impl Window {
     /// the palette closes it. Its entries run on `pane`, where it was opened
     /// (ghostty runs them on the window's active surface then).
     fn open_palette(self: &Rc<Self>, pane: PaneId) {
-        let mut entries = palette::commands();
+        let config = self.app.config();
+        let mut entries = palette::commands(&config, self.app.server.prefix());
         entries.extend(self.app.focus_entries());
         let weak = Rc::downgrade(self);
-        palette::present(&self.window, entries, move |run| {
+        palette::present(&self.window, entries, config.keybind.clone(), move |run| {
             if let Some(win) = weak.upgrade() {
                 win.run_entry(pane, run);
             }
@@ -1239,15 +1403,26 @@ impl Window {
                 p.surface.resize_copy_mode(cols, rows);
             }
             None => {
-                let pty = match Pty::spawn(self.app.command.take(), cols, rows, cell, &p.cwd) {
+                let config = self.app.config();
+                let program = match (p.program.take(), &config.command) {
+                    (Some(argv), _) => Program::Argv(argv),
+                    (None, None) => Program::LoginShell,
+                    (None, Some(ConfigCommand::Shell(line))) => Program::ShellCommand(line.clone()),
+                    (None, Some(ConfigCommand::Direct(words))) => {
+                        Program::Argv(words.iter().map(OsString::from).collect())
+                    }
+                };
+                let blink = config.cursor_style_blink.unwrap_or(true);
+                let pty = match Pty::spawn(program, blink, cols, rows, cell, &p.cwd) {
                     Ok(pty) => pty,
                     Err(err) => {
                         eprintln!("tapust: cannot start a shell: {err}");
                         return;
                     }
                 };
-                let mut terminal = term::Terminal::new(cols, rows, SCROLLBACK);
-                terminal.set_default_palette(self.app.palette.clone());
+                let mut terminal = term::Terminal::new(cols, rows, config.scrollback_lines);
+                terminal.set_default_palette(config.term_palette());
+                terminal.set_default_cursor(config.cursor_style, config.cursor_style_blink);
                 let io = match PaneIo::start(pty, terminal, move || {
                     glib::idle_add_once(move || wake(pane));
                 }) {
@@ -1402,10 +1577,20 @@ impl Window {
                     let weak = Rc::downgrade(&self.app);
                     let handler: crate::surface::Handler =
                         Rc::new(move |event| weak.upgrade().is_some_and(|app| app.handle(pane, event)));
-                    let surface = Surface::new(pane, self.app.term_bg, points, handler);
+                    let surface = Surface::new(pane, self.app.config(), points, handler);
+                    let program = self.app.command.take();
                     self.state.borrow_mut().panes.insert(
                         pane,
-                        Pane { surface, io: None, cwd, title: String::new(), title_override: None, pwd: None, child_exited: false },
+                        Pane {
+                            surface,
+                            io: None,
+                            cwd,
+                            program,
+                            title: String::new(),
+                            title_override: None,
+                            pwd: None,
+                            child_exited: false,
+                        },
                     );
                 }
                 Effect::Destroy { pane } => {
@@ -1415,8 +1600,11 @@ impl Window {
                         detach(p.surface.outer.upcast_ref());
                     }
                 }
-                Effect::Write { pane, bytes } => {
+                Effect::Key { pane, key } => {
                     if let Some(io) = self.state.borrow().panes.get(&pane).and_then(|p| p.io.as_ref()) {
+                        let app_cursor = io.shared.term.lock().modes().app_cursor;
+                        let mut bytes = Vec::new();
+                        input::encode(key, None, app_cursor, &mut bytes);
                         io.shared.write(&bytes);
                     }
                 }
@@ -1871,12 +2059,18 @@ impl Window {
         self.queue_reconcile();
     }
 
-    /// ghostty's needsConfirmQuit with confirm-close-surface = true: a live
-    /// process that is not sitting at its shell prompt.
+    /// ghostty's needsConfirmQuit: a live process, which with
+    /// confirm-close-surface = true is not sitting at its shell prompt.
     fn pane_needs_confirm(&self, pane: PaneId) -> bool {
+        let confirm = self.app.config().confirm_close_surface;
         let st = self.state.borrow();
         st.panes.get(&pane).and_then(|p| p.io.as_ref()).is_some_and(|io| {
-            io.shared.exited.get().is_none() && !io.shared.term.lock().cursor_at_prompt()
+            let alive = io.shared.exited.get().is_none();
+            match confirm {
+                ConfirmClose::False => false,
+                ConfirmClose::Always => alive,
+                ConfirmClose::True => alive && !io.shared.term.lock().cursor_at_prompt(),
+            }
         })
     }
 
@@ -2246,14 +2440,57 @@ fn wake(pane: PaneId) {
     }
 }
 
-/// ghostty's style.css and runtime CSS rules that apply to tapust.
-pub fn css() -> String {
-    let [r, g, b] = theme::UNFOCUSED_FILL;
+/// ghostty's style.css and runtime CSS rules that apply to tapust: the
+/// unfocused-split-fill is the background.
+fn css(config: &Config) -> String {
+    let Rgb { r, g, b } = config.background;
     format!(
         "{}\nwidget.unfocused-split {{\n opacity: {:.2};\n background-color: rgb({r},{g},{b});\n}}\n",
         theme::GHOSTTY_CSS,
         theme::UNFOCUSED_ALPHA
     )
+}
+
+/// tmux-mode-keys, else tmux's main's choice from $VISUAL or $EDITOR.
+fn mode_keys(config: &Config) -> ModeKeys {
+    config.tmux_mode_keys.unwrap_or_else(|| {
+        let (visual, editor) = (std::env::var_os("VISUAL"), std::env::var_os("EDITOR"));
+        ModeKeys::from_env(visual.as_deref(), editor.as_deref())
+    })
+}
+
+/// The header of a configuration file Open Configuration makes.
+const CONFIG_HEADER: &str = "# tapust configuration, in ghostty's syntax: one `key = value` per line.
+# Reload Configuration (in the menu or the command palette) applies changes.
+";
+
+/// Makes the configuration file with its header unless there is one.
+fn create_config(path: &Path) -> Result<(), String> {
+    let make = || -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(mut file) => std::io::Write::write_all(&mut file, CONFIG_HEADER.as_bytes()),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(err) => Err(err),
+        }
+    };
+    make().map_err(|err| format!("Cannot create {}: {err}", path.display()))
+}
+
+/// `word` quoted for /bin/sh.
+fn shell_quote(word: &std::ffi::OsStr) -> OsString {
+    let mut quoted = b"'".to_vec();
+    for &b in word.as_bytes() {
+        if b == b'\'' {
+            quoted.extend_from_slice(b"'\\''");
+        } else {
+            quoted.push(b);
+        }
+    }
+    quoted.push(b'\'');
+    OsString::from_vec(quoted)
 }
 
 #[cfg(test)]

@@ -519,15 +519,59 @@ fn prefix_during_repeat_enters_prefix() {
 }
 
 #[test]
-fn prefix_prefix_writes_ctrl_b() {
+fn prefix_prefix_sends_ctrl_b() {
     let t = Instant::now();
     let mut s = new_session();
     s.key(ctrl('b'), t);
-    assert_eq!(
-        s.key(ctrl('b'), t),
-        KeyResult::Handled(vec![Effect::Write { pane: 0, bytes: vec![0x02] }])
-    );
+    assert_eq!(s.key(ctrl('b'), t), KeyResult::Handled(vec![Effect::Key { pane: 0, key: ctrl('b') }]));
     assert_eq!(s.key(ctrl('b'), t), KeyResult::Handled(vec![]));
+}
+
+/// `set -g prefix C-a`: C-a enters the prefix table, C-b goes to the
+/// program, the prefix table keeps its bindings and its C-b (send-prefix)
+/// sends the new prefix.
+#[test]
+fn another_prefix_replaces_c_b() {
+    let t = Instant::now();
+    let server = Server::new();
+    let mut s = Session::new(&server, None).0;
+    server.set_prefix(Some(ctrl('a')));
+    assert_eq!(s.key(ctrl('b'), t), KeyResult::Forward(0));
+    assert_eq!(s.key(ctrl('a'), t), KeyResult::Handled(vec![]));
+    s.key(ch('|'), t);
+    assert_eq!(ids(&s).len(), 2);
+    s.key(ctrl('a'), t);
+    let active = s.active_pane();
+    assert_eq!(s.key(ctrl('b'), t), KeyResult::Handled(vec![Effect::Key { pane: active, key: ctrl('a') }]));
+    // Without a prefix, no key enters the prefix table and send-prefix sends nothing.
+    server.set_prefix(None);
+    assert_eq!(s.key(ctrl('a'), t), KeyResult::Forward(active));
+    assert_eq!(s.key(ctrl('b'), t), KeyResult::Forward(active));
+    assert_eq!(s.run_prefix_binding(ctrl('b'), t), vec![]);
+}
+
+#[test]
+fn key_strings_read_as_tmux_reads_them() {
+    let with = |code, ctrl, meta, shift| Ok(Some(Key { code, mods: Mods { ctrl, meta, shift } }));
+    let c = KeyCode::Char;
+    assert_eq!(parse_key("C-a"), with(c('a'), true, false, false));
+    assert_eq!(parse_key("c-a"), with(c('a'), true, false, false));
+    assert_eq!(parse_key("^A"), with(c('a'), true, false, false));
+    assert_eq!(parse_key("^M-a"), with(c('a'), true, true, false));
+    assert_eq!(parse_key("C-M-x"), with(c('x'), true, true, false));
+    assert_eq!(parse_key("M-|"), with(c('|'), false, true, false));
+    assert_eq!(parse_key("C--"), with(c('-'), true, false, false));
+    assert_eq!(parse_key("`"), with(c('`'), false, false, false));
+    assert_eq!(parse_key("C-Space"), with(c(' '), true, false, false));
+    assert_eq!(parse_key("F12"), with(KeyCode::F(12), false, false, false));
+    assert_eq!(parse_key("S-PgUp"), with(KeyCode::PageUp, false, false, true));
+    assert_eq!(parse_key("BTab"), with(KeyCode::Tab, false, false, true));
+    assert_eq!(parse_key("\u{e9}"), with(c('\u{e9}'), false, false, false));
+    assert_eq!(parse_key("^"), with(c('^'), false, false, false));
+    assert_eq!(parse_key("None"), Ok(None));
+    for bad in ["", "C-", "X-a", "ab", "F13", "Ctrl-a", "C-\u{1}"] {
+        assert_eq!(parse_key(bad), Err(format!("bad key: {bad}")), "{bad:?}");
+    }
 }
 
 #[test]

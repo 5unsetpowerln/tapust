@@ -48,9 +48,11 @@ enum Plan {
 }
 
 /// Returns the command line for `argv` and sets `env` up for tapust's shell
-/// integration; `login` tells that argv[0] will start with '-'.
-pub fn prepare(argv: Vec<OsString>, login: bool, env: &mut Env) -> Vec<OsString> {
-    env.insert("TAPUST_CURSOR_BLINK".into(), "1".into());
+/// integration, whose prompt cursor blinks with `cursor_blink` (ghostty's
+/// cursor:blink or cursor:steady); `login` tells that argv[0] will start
+/// with '-'.
+pub fn prepare(argv: Vec<OsString>, login: bool, cursor_blink: bool, env: &mut Env) -> Vec<OsString> {
+    env.insert("TAPUST_CURSOR_BLINK".into(), if cursor_blink { "1" } else { "0" }.into());
     let Some(plan) = plan(&argv, login, env) else { return argv };
     let dir = match env.get(OsStr::new("XDG_RUNTIME_DIR")) {
         Some(runtime) if !runtime.is_empty() => Path::new(runtime).join("tapust/shell-integration"),
@@ -64,6 +66,65 @@ pub fn prepare(argv: Vec<OsString>, login: bool, env: &mut Env) -> Vec<OsString>
         return argv;
     }
     apply(plan, argv, &dir, env)
+}
+
+/// The command line for ghostty's shell command `line`, run by `/bin/sh -c`,
+/// with the integration of the shell its words start, which ghostty finds
+/// the same way. bash's integration changes its arguments, so it runs as
+/// those words (as ghostty's does).
+pub fn prepare_command(line: &str, cursor_blink: bool, env: &mut Env) -> Vec<OsString> {
+    let sh: Vec<OsString> = vec!["/bin/sh".into(), "-c".into(), line.into()];
+    match words(line) {
+        Some(words) => {
+            let argv = prepare(words.clone(), false, cursor_blink, env);
+            if argv == words { sh } else { argv }
+        }
+        None => prepare(sh, false, cursor_blink, env),
+    }
+}
+
+/// The words of a command line as /bin/sh splits them, for one with
+/// quotes and backslashes but no expansions or operators.
+fn words(line: &str) -> Option<Vec<OsString>> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' => words.extend(word.take().map(OsString::from)),
+            '\'' => {
+                let word = word.get_or_insert_default();
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        c => word.push(c),
+                    }
+                }
+            }
+            '"' => {
+                let word = word.get_or_insert_default();
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        '\\' => {
+                            let next = chars.next()?;
+                            if !matches!(next, '"' | '\\' | '$' | '`') {
+                                word.push('\\');
+                            }
+                            word.push(next);
+                        }
+                        '$' | '`' => return None,
+                        c => word.push(c),
+                    }
+                }
+            }
+            '\\' => word.get_or_insert_default().push(chars.next()?),
+            _ if "$`;|&<>()*?[]{}~#\n".contains(c) => return None,
+            c => word.get_or_insert_default().push(c),
+        }
+    }
+    words.extend(word.map(OsString::from));
+    Some(words)
 }
 
 /// The integration for `argv`, if its shell and arguments are supported.
@@ -322,8 +383,39 @@ mod tests {
     #[test]
     fn without_a_runtime_directory_the_shell_runs_unmodified() {
         let mut env = vars(&[("ZDOTDIR", "/z")]);
-        assert_eq!(prepare(os(&["zsh"]), true, &mut env), os(&["zsh"]));
+        assert_eq!(prepare(os(&["zsh"]), true, true, &mut env), os(&["zsh"]));
         assert_eq!(env, vars(&[("ZDOTDIR", "/z"), ("TAPUST_CURSOR_BLINK", "1")]));
+    }
+
+    #[test]
+    fn shell_commands_split_into_words_without_expansions() {
+        assert_eq!(words("fish -l"), Some(os(&["fish", "-l"])));
+        assert_eq!(words(r#" a  'b c' "d \"e\" \q" f\ g"#), Some(os(&["a", "b c", "d \"e\" \\q", "f g"])));
+        for line in ["echo $HOME", "a | b", "a; b", "ls *", "~/bin/x", "a 'b", "\"$x\"", "a # b"] {
+            assert_eq!(words(line), None, "{line}");
+        }
+    }
+
+    /// ghostty runs a shell command through /bin/sh -c with the integration
+    /// of the shell it starts; bash's needs its arguments, so it runs them.
+    #[test]
+    fn shell_commands_run_through_sh_unless_bash_needs_its_arguments() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-shell-command");
+        let integration = dir.join("tapust/shell-integration");
+        let run = |line: &str| {
+            let mut env = vars(&[("XDG_RUNTIME_DIR", dir.to_str().unwrap())]);
+            let argv = prepare_command(line, false, &mut env);
+            (argv, env)
+        };
+        let (argv, env) = run("fish -l");
+        assert_eq!(argv, os(&["/bin/sh", "-c", "fish -l"]));
+        assert_eq!(get(&env, "XDG_DATA_DIRS"), integration.to_str());
+        assert_eq!(get(&env, "TAPUST_CURSOR_BLINK"), Some("0"));
+        let (argv, _) = run("bash -i");
+        assert_eq!(argv, os(&["bash", "--rcfile", integration.join(BASH_SCRIPT).to_str().unwrap(), "-i"]));
+        assert_eq!(run("vim 'a b'").0, os(&["/bin/sh", "-c", "vim 'a b'"]));
+        assert_eq!(run("bash -c 'echo $0'").0, os(&["/bin/sh", "-c", "bash -c 'echo $0'"]));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

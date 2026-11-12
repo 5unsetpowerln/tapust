@@ -34,9 +34,9 @@ mod window;
 mod tests;
 
 pub use copy::{CopyCommand, ModeKeys, SearchArg};
-pub use keys::{is_prefix, prefix_command};
+pub use keys::{parse_key, prefix_command};
 pub use layout::Layout;
-pub use server::Server;
+pub use server::{DEFAULT_PREFIX, Server};
 pub use split::{f16, Node, Split};
 
 use keys::KeyState;
@@ -123,8 +123,8 @@ pub enum Effect {
     ResizeSplit { pane: PaneId, horizontal: bool, cells: i32 },
     /// The pane was removed; kill its process and drop it.
     Destroy { pane: PaneId },
-    /// Write bytes to the pane's PTY (e.g. `send-prefix`).
-    Write { pane: PaneId, bytes: Vec<u8> },
+    /// `send-prefix`: the key goes to the pane's program as if typed.
+    Key { pane: PaneId, key: Key },
     /// `copy-mode`: the pane enters copy mode on a frozen copy of its
     /// screen, with the pane's last search (`search`) to search again.
     CopyMode { pane: PaneId, search: Option<PaneSearch> },

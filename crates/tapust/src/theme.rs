@@ -1,4 +1,5 @@
-//! ghostty's default appearance (colors, font, padding).
+//! ghostty's default appearance (colors, font, padding), which the
+//! configuration file can change, and its constants.
 
 use term::{Palette, Rgb};
 
@@ -15,16 +16,13 @@ const ANSI: [u32; 16] = [
     0x666666, 0xD54E53, 0xB9CA4A, 0xE7C547, 0x7AA6DA, 0xC397D8, 0x70C0B1, 0xEAEAEA,
 ];
 
-pub fn palette() -> Palette {
-    let mut palette = Palette::default();
-    for (slot, &value) in palette.indexed.iter_mut().zip(&ANSI) {
+/// ghostty's 256 colors.
+pub fn palette() -> [Rgb; 256] {
+    let mut indexed = Palette::default().indexed;
+    for (slot, &value) in indexed.iter_mut().zip(&ANSI) {
         *slot = rgb(value);
     }
-    palette.foreground = FOREGROUND;
-    palette.background = BACKGROUND;
-    // The cursor uses the foreground color, and text under it the background.
-    palette.cursor = None;
-    palette
+    indexed
 }
 
 pub const FONT_FAMILY: &str = "JetBrains Mono";
@@ -34,7 +32,6 @@ pub const PADDING_POINTS: f64 = 2.0;
 
 /// ghostty's `widget.unfocused-split`: `unfocused-split-fill` (the
 /// background) at opacity `1 - unfocused-split-opacity`.
-pub const UNFOCUSED_FILL: [u8; 3] = [0x28, 0x2C, 0x34];
 pub const UNFOCUSED_ALPHA: f64 = 1.0 - 0.7;
 /// ghostty's drag icon: the surface scaled by 0.2.
 pub const DRAG_PREVIEW_SCALE: f64 = 0.2;

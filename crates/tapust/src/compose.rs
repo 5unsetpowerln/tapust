@@ -2,6 +2,7 @@
 
 use term::{Attrs, Cell, Color, CursorShape, Palette, Point, Rgb, Selection, Style, StyleId, Terminal, Underline, Width};
 
+use crate::config::{Config, TerminalColor};
 use crate::frame::{BOLD, CursorStyle, FrameCell, FrameCursor, Grid, ITALIC, STRIKE, WIDE};
 use crate::links::Link;
 use crate::theme;
@@ -74,15 +75,40 @@ fn frame_cell(cell: Cell, styled: FrameCell) -> FrameCell {
     }
 }
 
-/// Gives the cells of `sel` on `line` the colors (`fg`, `bg`).
-fn paint(out: &mut [FrameCell], sel: &Selection, line: u64, cols: usize, (fg, bg): ([u8; 4], [u8; 4])) {
+/// Gives the cells of `sel` on `line` the colors `colors` picks for them.
+fn paint(
+    out: &mut [FrameCell],
+    sel: &Selection,
+    line: u64,
+    cols: usize,
+    colors: impl Fn(&FrameCell) -> ([u8; 4], [u8; 4]),
+) {
     if let Some((left, right)) = sel.columns(line, cols as u16)
         && let Some(cells) = out.get_mut(left as usize..=(right as usize).min(cols - 1))
     {
         for cell in cells {
-            (cell.fg, cell.bg) = (fg, bg);
+            (cell.fg, cell.bg) = colors(cell);
         }
     }
+}
+
+/// A configured color for a cell drawn as (`fg`, `bg`): its own color,
+/// the cell's foreground or background, or `default` when unset.
+fn pick(color: Option<TerminalColor>, (fg, bg): ([u8; 4], [u8; 4]), default: [u8; 4]) -> [u8; 4] {
+    match color {
+        None => default,
+        Some(TerminalColor::Rgb(c)) => rgba(c),
+        Some(TerminalColor::CellForeground) => fg,
+        Some(TerminalColor::CellBackground) => bg,
+    }
+}
+
+/// ghostty's selection colors for a cell drawn as `cell`: the configured
+/// selection-foreground and -background, by default the terminal's default
+/// foreground and background swapped.
+fn selected(config: &Config, palette: &Palette, cell: ([u8; 4], [u8; 4])) -> ([u8; 4], [u8; 4]) {
+    let (fg, bg) = style_colors(&Style::DEFAULT, palette, false);
+    (pick(config.selection_foreground, cell, bg), pick(config.selection_background, cell, fg))
 }
 
 /// Copies the terminal's dirty viewport rows (all of them when `full`) into
@@ -90,8 +116,7 @@ fn paint(out: &mut [FrameCell], sel: &Selection, line: u64, cols: usize, (fg, bg
 /// terminal does not have yet (it is resized after the grid) are blank.
 /// The search's `matches` (ordered and not overlapping) get ghostty's search
 /// colors, the `current` one its selected-match colors, and the cells of
-/// `selection` over them ghostty's default selection colors: the terminal's
-/// default foreground and background swapped.
+/// `selection` over them the selection colors of `config`.
 pub fn copy_pane(
     grid: &mut Grid,
     term: &mut Terminal,
@@ -99,14 +124,16 @@ pub fn copy_pane(
     matches: &[Selection],
     current: Option<usize>,
     selection: Option<&Selection>,
+    config: &Config,
 ) {
     let (rows, cols) = (term.rows().min(grid.rows()), term.cols().min(grid.cols()) as usize);
     let palette = term.palette();
     let reverse_video = term.modes().reverse_video;
-    let blank = FrameCell::blank(style_colors(&Style::DEFAULT, palette, reverse_video).1);
+    // Blank cells draw nothing in the foreground color, which a selection
+    // of the cells' foreground still needs.
+    let (blank_fg, blank_bg) = style_colors(&Style::DEFAULT, palette, reverse_video);
+    let blank = FrameCell { fg: blank_fg, ..FrameCell::blank(blank_bg) };
     let colors = |(fg, bg): (Rgb, Rgb)| (rgba(fg), rgba(bg));
-    let (fg, bg) = style_colors(&Style::DEFAULT, palette, false);
-    let selected = (bg, fg);
     // Cells in a row mostly share their style: resolve it once per run.
     let mut run = (StyleId::DEFAULT, styled(&Style::DEFAULT, palette, reverse_video));
     for y in 0..grid.rows() {
@@ -133,11 +160,11 @@ pub fn copy_pane(
         // Ordered matches that do not overlap end in order too.
         let first = matches.partition_point(|m| m.end.line < line);
         for (i, m) in matches.iter().enumerate().skip(first).take_while(|(_, m)| m.start.line <= line) {
-            let pair = if Some(i) == current { theme::SEARCH_CURRENT } else { theme::SEARCH_MATCH };
-            paint(out, m, line, cols, colors(pair));
+            let pair = colors(if Some(i) == current { theme::SEARCH_CURRENT } else { theme::SEARCH_MATCH });
+            paint(out, m, line, cols, |_| pair);
         }
         if let Some(sel) = selection {
-            paint(out, sel, line, cols, selected);
+            paint(out, sel, line, cols, |cell| selected(config, palette, (cell.fg, cell.bg)));
         }
     }
     term.clear_dirty();
@@ -214,45 +241,56 @@ pub fn preedit(grid: &mut Grid, term: &Terminal, text: &str) {
 /// that does not have the keyboard focus gets ghostty's hollow block.
 /// ghostty's lock cursor at a password prompt: drawn even when the cursor
 /// is hidden, unfocused or blinked off.
-pub fn lock_cursor(term: &Terminal, grid: usize) -> Option<FrameCursor> {
+pub fn lock_cursor(term: &Terminal, grid: usize, config: &Config) -> Option<FrameCursor> {
     let cursor = term.cursor();
     let on_screen = cursor.x < term.cols() && cursor.y < term.rows();
-    on_screen.then(|| cursor_at(term, grid, cursor.x, cursor.y, CursorStyle::Lock))
+    on_screen.then(|| cursor_at(term, grid, cursor.x, cursor.y, CursorStyle::Lock, config))
 }
 
-pub fn pane_cursor(term: &Terminal, grid: usize, focused: bool) -> Option<FrameCursor> {
+pub fn pane_cursor(term: &Terminal, grid: usize, focused: bool, config: &Config) -> Option<FrameCursor> {
     let cursor = term.cursor();
     if !cursor.visible || cursor.x >= term.cols() || cursor.y >= term.rows() {
         return None;
     }
     let style = match (focused, cursor.shape) {
-        (false, _) => CursorStyle::Hollow,
+        (false, _) | (true, CursorShape::BlockHollow) => CursorStyle::Hollow,
         (true, CursorShape::Block) => CursorStyle::Block,
         (true, CursorShape::Underline) => CursorStyle::Underline,
         (true, CursorShape::Bar) => CursorStyle::Bar,
     };
-    Some(cursor_at(term, grid, cursor.x, cursor.y, style))
+    Some(cursor_at(term, grid, cursor.x, cursor.y, style, config))
 }
 
 /// tmux's copy-mode cursor at (`x`, `y`) of the view, drawn as the pane's
 /// block cursor (hollow without the keyboard focus). On a selected cell it
 /// takes the selection's colors inverted, where ghostty's cursor, in the
 /// foreground color, would not show on the selection it moves.
-pub fn copy_cursor(term: &Terminal, grid: usize, x: u16, y: u16, focused: bool) -> Option<FrameCursor> {
+pub fn copy_cursor(
+    term: &Terminal,
+    grid: usize,
+    x: u16,
+    y: u16,
+    focused: bool,
+    config: &Config,
+) -> Option<FrameCursor> {
     if x >= term.cols() || y >= term.rows() {
         return None;
     }
     let style = if focused { CursorStyle::Block } else { CursorStyle::Hollow };
-    let mut cursor = cursor_at(term, grid, x, y, style);
+    let mut cursor = cursor_at(term, grid, x, y, style, config);
     let cell = Point { line: term.view_top() + u64::from(y), col: x };
-    if term.palette().cursor.is_none() && term.selection().is_some_and(|s| s.contains(cell, term.cols())) {
-        let (fg, bg) = style_colors(&Style::DEFAULT, term.palette(), false);
-        (cursor.color, cursor.text_color) = (bg, fg);
+    let colored = term.palette().cursor.is_some() || config.cursor_color.is_some();
+    if !colored && term.selection().is_some_and(|s| s.contains(cell, term.cols())) {
+        let palette = term.palette();
+        let shown = style_colors(term.style(term.row(y)[x as usize].style()), palette, term.modes().reverse_video);
+        (cursor.color, cursor.text_color) = selected(config, palette, shown);
     }
     Some(cursor)
 }
 
-fn cursor_at(term: &Terminal, grid: usize, x: u16, y: u16, style: CursorStyle) -> FrameCursor {
+/// ghostty's cursor-color and cursor-text for the cell under the cursor;
+/// unset, the cell's foreground and background.
+fn cursor_at(term: &Terminal, grid: usize, x: u16, y: u16, style: CursorStyle, config: &Config) -> FrameCursor {
     let palette = term.palette();
     let cell = term.row(y)[x as usize];
     let (fg, bg) = style_colors(term.style(cell.style()), palette, term.modes().reverse_video);
@@ -261,8 +299,8 @@ fn cursor_at(term: &Terminal, grid: usize, x: u16, y: u16, style: CursorStyle) -
         x,
         y,
         style,
-        color: palette.cursor.map(rgba).unwrap_or(fg),
-        text_color: bg,
+        color: palette.cursor.map(rgba).unwrap_or_else(|| pick(config.cursor_color, (fg, bg), fg)),
+        text_color: pick(config.cursor_text, (fg, bg), bg),
         wide: cell.width() == Width::Wide,
     }
 }
@@ -281,8 +319,8 @@ mod tests {
         let selection = Selection { start: Point { line: top, col: 5 }, end: Point { line: top, col: 5 }, rect: false };
         let new_grid = || Grid::new(0, (0, 0, 120, 40), (0, 0), (12, 2), [0; 4]);
         let (mut plain, mut grid) = (new_grid(), new_grid());
-        copy_pane(&mut plain, &mut t, true, &[], None, None);
-        copy_pane(&mut grid, &mut t, true, &matches, Some(3), Some(&selection));
+        copy_pane(&mut plain, &mut t, true, &[], None, None, &Config::default());
+        copy_pane(&mut grid, &mut t, true, &matches, Some(3), Some(&selection), &Config::default());
         let colors = |grid: &Grid, y: u16, x: usize| (grid.row(y)[x].fg, grid.row(y)[x].bg);
         let pair = |(fg, bg): (Rgb, Rgb)| (rgba(fg), rgba(bg));
         let (found, current) = (pair(theme::SEARCH_MATCH), pair(theme::SEARCH_CURRENT));
@@ -307,15 +345,51 @@ mod tests {
         t.feed(b"abc");
         let palette = t.palette().clone();
         let (fg, bg) = (rgba(palette.foreground), rgba(palette.background));
-        let cursor = copy_cursor(&t, 0, 1, 0, true).unwrap();
+        let cursor = copy_cursor(&t, 0, 1, 0, true, &Config::default()).unwrap();
         assert_eq!((cursor.style, cursor.color, cursor.text_color), (CursorStyle::Block, fg, bg));
         let top = t.view_top();
         let (start, end) = (Point { line: top, col: 0 }, Point { line: top, col: 2 });
         t.set_selection(Some(Selection { start, end, rect: false }));
-        let cursor = copy_cursor(&t, 0, 1, 0, true).unwrap();
+        let cursor = copy_cursor(&t, 0, 1, 0, true, &Config::default()).unwrap();
         assert_eq!((cursor.color, cursor.text_color), (bg, fg));
-        assert_eq!(copy_cursor(&t, 0, 1, 0, false).unwrap().style, CursorStyle::Hollow);
-        assert!(copy_cursor(&t, 0, 12, 0, true).is_none());
+        assert_eq!(copy_cursor(&t, 0, 1, 0, false, &Config::default()).unwrap().style, CursorStyle::Hollow);
+        assert!(copy_cursor(&t, 0, 12, 0, true, &Config::default()).is_none());
+    }
+
+    /// ghostty's selection-foreground and -background, and cursor-color and
+    /// cursor-text: a color, or the cell's own foreground or background.
+    #[test]
+    fn configured_selection_and_cursor_colors() {
+        let mut t = Terminal::new(12, 2, 10);
+        // A red on blue cell, then an inverse one.
+        t.feed(b"\x1b[31;44ma\x1b[7mb\x1b[0m");
+        let top = t.view_top();
+        let selection = Selection { start: Point { line: top, col: 0 }, end: Point { line: top, col: 2 }, rect: false };
+        let config = Config {
+            selection_foreground: Some(TerminalColor::CellBackground),
+            selection_background: Some(TerminalColor::Rgb(Rgb { r: 1, g: 2, b: 3 })),
+            cursor_color: Some(TerminalColor::CellBackground),
+            cursor_text: Some(TerminalColor::CellForeground),
+            ..Config::default()
+        };
+        let mut grid = new_grid();
+        copy_pane(&mut grid, &mut t, true, &[], None, Some(&selection), &config);
+        let p = t.palette().clone();
+        let (red, blue) = (rgba(p.indexed[1]), rgba(p.indexed[4]));
+        let row = grid.row(0);
+        assert_eq!((row[0].fg, row[0].bg), (blue, [1, 2, 3, 0xff]));
+        // The inverse cell shows blue on red, and the blank one the defaults.
+        assert_eq!(row[1].fg, red);
+        assert_eq!(row[2].fg, rgba(p.background));
+        t.feed(b"\x1b[H");
+        let cursor = pane_cursor(&t, 0, true, &config).unwrap();
+        assert_eq!((cursor.color, cursor.text_color), (blue, red));
+        // An OSC 12 color outranks the configured one.
+        t.feed(b"\x1b]12;#fff\x07");
+        assert_eq!(pane_cursor(&t, 0, true, &config).unwrap().color, [0xf0, 0xf0, 0xf0, 0xff]);
+        let hollow = Config { cursor_style: CursorShape::BlockHollow, ..Config::default() };
+        t.set_default_cursor(CursorShape::BlockHollow, None);
+        assert_eq!(pane_cursor(&t, 0, true, &hollow).unwrap().style, CursorStyle::Hollow);
     }
 
     #[test]
@@ -326,7 +400,7 @@ mod tests {
         t.feed(b"\x1b[4:3;58;5;1ma\x1b[0m\x1b[4:4mb\x1b[0m\x1b[2;4;58:2::200:100:0mc\x1b[0m\x1b[8;4;58;5;2md");
         t.feed("\x1b[0m\x1b[21;7;58;5;3m\u{4e00}".as_bytes());
         let mut grid = new_grid();
-        copy_pane(&mut grid, &mut t, true, &[], None, None);
+        copy_pane(&mut grid, &mut t, true, &[], None, None, &Config::default());
         let palette = t.palette();
         let (fg, bg) = (rgba(palette.foreground), rgba(palette.background));
         let row = grid.row(0);
@@ -354,7 +428,7 @@ mod tests {
         let cells = Selection { start: Point { line: top, col: 0 }, end: Point { line: top, col: 6 }, rect: false };
         let link = Link { cells, id: None, target: String::new() };
         let mut grid = new_grid();
-        copy_pane(&mut grid, &mut t, true, &[], None, None);
+        copy_pane(&mut grid, &mut t, true, &[], None, None, &Config::default());
         let kinds = |grid: &Grid| grid.row(0)[..8].iter().map(|c| c.underline).collect::<Vec<_>>();
         let (none, single, double) = (Underline::None, Underline::Single, Underline::Double);
         // Plain text and other kinds get a single underline, a single one
@@ -364,7 +438,7 @@ mod tests {
             underline(&mut grid, &t, &link);
             assert_eq!(kinds(&grid), hovered);
         }
-        copy_pane(&mut grid, &mut t, true, &[], None, None);
+        copy_pane(&mut grid, &mut t, true, &[], None, None, &Config::default());
         assert_eq!(kinds(&grid)[..6], [none, none, single, single, Underline::Curly, Underline::Curly]);
     }
 
@@ -381,12 +455,12 @@ mod tests {
         let mut grid = new_grid();
         let kinds = |grid: &Grid| grid.row(0)[..6].iter().map(|c| c.underline).collect::<Vec<_>>();
         let (none, single, double) = (Underline::None, Underline::Single, Underline::Double);
-        copy_pane(&mut grid, &mut t, true, &[], None, None);
+        copy_pane(&mut grid, &mut t, true, &[], None, None, &Config::default());
         underline(&mut grid, &t, &link);
         assert_eq!(kinds(&grid), [single, single, none, none, double, none]);
         // A link whose id now belongs to another URI underlines nothing.
         let stale = Link { target: "gemini://b".to_owned(), ..link };
-        copy_pane(&mut grid, &mut t, true, &[], None, None);
+        copy_pane(&mut grid, &mut t, true, &[], None, None, &Config::default());
         underline(&mut grid, &t, &stale);
         assert_eq!(kinds(&grid), [none, none, none, none, single, none]);
     }

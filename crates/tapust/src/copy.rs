@@ -815,6 +815,11 @@ pub struct CopyMode {
 }
 
 impl CopyMode {
+    /// tmux reads mode-keys whenever a key or command needs it.
+    pub fn set_keys(&mut self, keys: ModeKeys) {
+        self.vi = keys == ModeKeys::Vi;
+    }
+
     /// window_copy_init on `term`, a copy of the pane's screen, with the
     /// pane's last search.
     pub fn new(term: Terminal, keys: ModeKeys, search: Option<PaneSearch>) -> CopyMode {

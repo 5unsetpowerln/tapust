@@ -65,6 +65,8 @@ pub enum CursorShape {
     Block,
     Underline,
     Bar,
+    /// ghostty's block_hollow, only ever the configured default.
+    BlockHollow,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,6 +295,17 @@ impl Terminal {
         self.term.palette = palette.clone();
         self.term.base_palette = palette;
         self.term.mark_all_dirty();
+    }
+
+    /// Changes the configured colors, keeping those a program set.
+    pub fn change_default_palette(&mut self, palette: Palette) {
+        self.term.change_default_palette(palette);
+    }
+
+    /// The configured cursor shape and blinking (`None`: blinking, which
+    /// DEC mode 12 may change), which DECSCUSR 0 and RIS restore.
+    pub fn set_default_cursor(&mut self, shape: CursorShape, blink: Option<bool>) {
+        self.term.set_default_cursor((shape, blink));
     }
 
     /// Bytes to send back to the application (DA, DSR, DECRQM, OSC color

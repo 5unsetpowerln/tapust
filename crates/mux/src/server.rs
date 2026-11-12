@@ -7,14 +7,13 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use crate::paste::Buffers;
-use crate::{ModeKeys, PaneId};
+use crate::{Key, KeyCode, ModeKeys, Mods, PaneId};
 
 /// The state the sessions of one process share, as tmux's server holds it.
 /// Clones are handles to the same state.
 #[derive(Clone, Default)]
 pub struct Server(Rc<Shared>);
 
-#[derive(Default)]
 struct Shared {
     next_session_id: Cell<u32>,
     /// The names of the live sessions by id (tmux's `sessions` tree).
@@ -27,7 +26,28 @@ struct Shared {
     history: RefCell<[Vec<String>; 2]>,
     /// The `mode-keys` option.
     mode_keys: Cell<ModeKeys>,
+    /// The `prefix` option; `None` is tmux's `None`, no prefix key.
+    prefix: Cell<Option<Key>>,
 }
+
+impl Default for Shared {
+    fn default() -> Shared {
+        Shared {
+            next_session_id: Cell::default(),
+            sessions: RefCell::default(),
+            next_window_id: Cell::default(),
+            next_pane_id: Cell::default(),
+            next_active_point: Cell::default(),
+            buffers: RefCell::default(),
+            history: RefCell::default(),
+            mode_keys: Cell::default(),
+            prefix: Cell::new(Some(DEFAULT_PREFIX)),
+        }
+    }
+}
+
+/// tmux's default `prefix`, C-b.
+pub const DEFAULT_PREFIX: Key = Key { code: KeyCode::Char('b'), mods: Mods { ctrl: true, meta: false, shift: false } };
 
 impl Server {
     pub fn new() -> Server {
@@ -42,6 +62,16 @@ impl Server {
 
     pub fn mode_keys(&self) -> ModeKeys {
         self.0.mode_keys.get()
+    }
+
+    /// `set -g prefix`: the key that switches to the prefix table, and
+    /// which `send-prefix` sends.
+    pub fn set_prefix(&self, prefix: Option<Key>) {
+        self.0.prefix.set(prefix);
+    }
+
+    pub fn prefix(&self) -> Option<Key> {
+        self.0.prefix.get()
     }
 
     /// session_create without a name: the next `$N`, named N, skipping the

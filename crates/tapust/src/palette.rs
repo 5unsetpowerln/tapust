@@ -1,9 +1,10 @@
 //! ghostty's command palette (command_palette.zig, command-palette.blp): a
 //! dialog with a search entry over a list of commands, each row with its
 //! title over what it runs and its key binding at the end. The commands are
-//! the terminal bindings (bindings.rs), the window's actions, the bindings of
-//! tmux's prefix table that the model implements, shown as the prefix and
-//! then the key, and ghostty's jump commands to every terminal.
+//! the terminal bindings (bindings.rs) with the keys the configuration binds
+//! them to, the window's actions, the bindings of tmux's prefix table that
+//! the model implements, shown as the configured prefix and then the key,
+//! and ghostty's jump commands to every terminal.
 //!
 //! ghostty filters by a case-insensitive substring of the title or the action
 //! and keeps its alphabetical order, so Enter, which runs the first row, runs
@@ -20,15 +21,16 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gdk, gio, glib, pango};
 
-use crate::bindings::{self, Binding};
+use crate::bindings::{self, Binding, FontSize, Keybinds, Press, Scroll};
+use crate::config::Config;
 use crate::input;
 use crate::theme;
-use Source::{Action, Key, Prefix};
+use Source::{Action, Bound, Prefix};
 use gdk::Key as K;
 use gdk::ModifierType as M;
 
 /// What an entry runs, on the pane that was active when the palette opened.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Run {
     /// A terminal binding, as its key runs it.
     Binding(Binding),
@@ -58,8 +60,8 @@ pub struct Entry {
 }
 
 enum Source {
-    /// A key of the terminal bindings, and ghostty's name for its action.
-    Key(gdk::ModifierType, gdk::Key, &'static str),
+    /// A terminal binding, and ghostty's name for its action.
+    Bound(Binding, &'static str),
     /// A key of tmux's prefix table.
     Prefix(gdk::ModifierType, gdk::Key),
     /// A GTK action and ghostty's name for it, or the GTK action's own.
@@ -70,10 +72,6 @@ const NONE: M = M::empty();
 const SHIFT: M = M::SHIFT_MASK;
 const CTRL: M = M::CONTROL_MASK;
 const ALT: M = M::ALT_MASK;
-const CTRL_SHIFT: M = M::CONTROL_MASK.union(M::SHIFT_MASK);
-
-/// tmux's prefix, C-b.
-const PREFIX: (M, gdk::Key) = (CTRL, K::b);
 
 /// Titles and descriptions follow ghostty's commands (command.zig) where
 /// ghostty has the command, and its words for tmux's: a window is a tab,
@@ -82,29 +80,68 @@ const COMMANDS: &[(&str, &str, Source)] = &[
     (
         "Copy to Clipboard",
         "Copy the selected text to the clipboard in both plain and styled formats.",
-        Key(CTRL_SHIFT, K::c, "copy_to_clipboard:mixed"),
+        Bound(Binding::Copy, "copy_to_clipboard:mixed"),
     ),
     (
         "Paste from Clipboard",
         "Paste the contents of the main clipboard.",
-        Key(CTRL_SHIFT, K::v, "paste_from_clipboard"),
+        Bound(Binding::Paste { primary: false }, "paste_from_clipboard"),
     ),
     (
         "Paste from Selection",
         "Paste the contents of the selection clipboard.",
-        Key(SHIFT, K::Insert, "paste_from_selection"),
+        Bound(Binding::Paste { primary: true }, "paste_from_selection"),
     ),
-    ("Select All", "Select all text on the screen.", Key(CTRL_SHIFT, K::a, "select_all")),
-    ("Start Search", "Start a search if one isn't already active.", Key(CTRL_SHIFT, K::f, "start_search")),
-    ("Scroll Page Up", "Scroll the screen up by a page.", Key(SHIFT, K::Page_Up, "scroll_page_up")),
-    ("Scroll Page Down", "Scroll the screen down by a page.", Key(SHIFT, K::Page_Down, "scroll_page_down")),
-    ("Scroll to Top", "Scroll to the top of the scrollback.", Key(SHIFT, K::Home, "scroll_to_top")),
-    ("Scroll to Bottom", "Scroll to the bottom of the scrollback.", Key(SHIFT, K::End, "scroll_to_bottom")),
-    ("Jump to Previous Prompt", "Scroll to the previous shell prompt.", Key(CTRL_SHIFT, K::Up, "jump_to_prompt:-1")),
-    ("Jump to Next Prompt", "Scroll to the next shell prompt.", Key(CTRL_SHIFT, K::Down, "jump_to_prompt:1")),
-    ("Increase Font Size", "Increase the font size by 1 point.", Key(CTRL, K::plus, "increase_font_size:1")),
-    ("Decrease Font Size", "Decrease the font size by 1 point.", Key(CTRL, K::minus, "decrease_font_size:1")),
-    ("Reset Font Size", "Reset the font size to the default.", Key(CTRL, K::_0, "reset_font_size")),
+    ("Select All", "Select all text on the screen.", Bound(Binding::SelectAll, "select_all")),
+    ("Start Search", "Start a search if one isn't already active.", Bound(Binding::StartSearch, "start_search")),
+    ("Scroll Page Up", "Scroll the screen up by a page.", Bound(Binding::Scroll(Scroll::PageUp), "scroll_page_up")),
+    (
+        "Scroll Page Down",
+        "Scroll the screen down by a page.",
+        Bound(Binding::Scroll(Scroll::PageDown), "scroll_page_down"),
+    ),
+    ("Scroll to Top", "Scroll to the top of the scrollback.", Bound(Binding::Scroll(Scroll::Top), "scroll_to_top")),
+    (
+        "Scroll to Bottom",
+        "Scroll to the bottom of the scrollback.",
+        Bound(Binding::Scroll(Scroll::Bottom), "scroll_to_bottom"),
+    ),
+    (
+        "Jump to Previous Prompt",
+        "Scroll to the previous shell prompt.",
+        Bound(Binding::Scroll(Scroll::Prompt(-1)), "jump_to_prompt:-1"),
+    ),
+    (
+        "Jump to Next Prompt",
+        "Scroll to the next shell prompt.",
+        Bound(Binding::Scroll(Scroll::Prompt(1)), "jump_to_prompt:1"),
+    ),
+    (
+        "Increase Font Size",
+        "Increase the font size by 1 point.",
+        Bound(Binding::FontSize(FontSize::Increase(1.0)), "increase_font_size:1"),
+    ),
+    (
+        "Decrease Font Size",
+        "Decrease the font size by 1 point.",
+        Bound(Binding::FontSize(FontSize::Decrease(1.0)), "decrease_font_size:1"),
+    ),
+    (
+        "Reset Font Size",
+        "Reset the font size to the default.",
+        Bound(Binding::FontSize(FontSize::Reset), "reset_font_size"),
+    ),
+    (
+        "Open Config Using OS editor",
+        "Open the config file with the OS's default editor.",
+        Bound(Binding::OpenConfig { new_window: false }, "open_config:os_open"),
+    ),
+    (
+        "Open Config in New Terminal Window",
+        "Open the config file in a new window using $EDITOR or $VISUAL.",
+        Bound(Binding::OpenConfig { new_window: true }, "open_config:new_window"),
+    ),
+    ("Reload Config", "Reload the config file.", Bound(Binding::ReloadConfig, "reload_config")),
     ("Clear Screen", "Clear the screen and scrollback.", Action("win.clear", "clear_screen")),
     ("Reset Terminal", "Reset the terminal to a clean state.", Action("win.reset", "reset")),
     (
@@ -211,30 +248,86 @@ const COMMANDS: &[(&str, &str, Source)] = &[
     ),
     ("Enter Copy Mode and Page Up", "Enter copy mode a page up the scrollback.", Prefix(NONE, K::Page_Up)),
     ("Paste from Buffer", "Paste the most recent buffer that copy mode copied.", Prefix(NONE, K::bracketright)),
-    ("Send Prefix Key", "Send Ctrl+B to the program in the terminal.", Prefix(CTRL, K::b)),
+    // The description names the configured prefix.
+    ("Send Prefix Key", "", Prefix(CTRL, K::b)),
 ];
 
-/// The palette's commands, each running what its key binding runs.
-pub fn commands() -> Vec<Entry> {
+/// The palette's commands, each running what its key binding runs, with
+/// the keys of `config` and the tmux `prefix`.
+pub fn commands(config: &Config, prefix: Option<mux::Key>) -> Vec<Entry> {
+    let prefix = prefix.map(gdk_key);
     COMMANDS
         .iter()
         .map(|(title, description, source)| {
+            let mut description = (*description).to_owned();
             let (action, accel, run) = match *source {
-                Key(mods, key, action) => {
-                    let binding = bindings::binding(key, mods).expect("a terminal binding");
-                    (action.to_owned(), accelerator(mods, key), Run::Binding(binding))
+                Bound(binding, action) => {
+                    let accel = config.keybind.trigger(binding).map(|t| t.accelerator()).unwrap_or_default();
+                    (action.to_owned(), accel, Run::Binding(binding))
                 }
                 Prefix(mods, key) => {
                     let (pressed, _) = input::from_gdk(key, mods).expect("a key");
                     let command = mux::prefix_command(pressed).expect("a binding of the prefix table");
-                    let accel = format!("{}+{}", accelerator(PREFIX.0, PREFIX.1), accelerator(mods, key));
-                    (command, accel, Run::Prefix(pressed))
+                    let accel = prefix.map(|(p, k)| format!("{}+{}", accelerator(p, k), accelerator(mods, key)));
+                    if command == "send-prefix" {
+                        description = match prefix {
+                            Some(prefix) => format!("Send {} to the program in the terminal.", label(prefix)),
+                            None => "Send the prefix key to the program in the terminal.".to_owned(),
+                        };
+                    }
+                    (command, accel.unwrap_or_default(), Run::Prefix(pressed))
                 }
                 Action(name, action) => (action.to_owned(), String::new(), Run::Action(name)),
             };
-            Entry { title: (*title).to_owned(), description: (*description).to_owned(), action, accel, run, order: 0 }
+            Entry { title: (*title).to_owned(), description, action, accel, run, order: 0 }
         })
         .collect()
+}
+
+/// A key as GTK labels a shortcut, "Ctrl+B".
+fn label((mods, keyval): (M, gdk::Key)) -> String {
+    let mut label = String::new();
+    for (mask, name) in [(SHIFT, "Shift+"), (CTRL, "Ctrl+"), (ALT, "Alt+")] {
+        if mods.contains(mask) {
+            label.push_str(name);
+        }
+    }
+    match keyval.to_unicode().filter(|c| !c.is_whitespace()) {
+        Some(c) => label.extend(c.to_uppercase()),
+        None => label.push_str(&keyval.name().unwrap_or_default()),
+    }
+    label
+}
+
+/// tmux's key as the GDK key and modifiers that type it.
+fn gdk_key(key: mux::Key) -> (M, gdk::Key) {
+    use mux::KeyCode as C;
+    let mut mods = M::empty();
+    let keyval = match key.code {
+        C::Char(c) => {
+            mods.set(SHIFT, c.is_uppercase());
+            bindings::key_of(c)
+        }
+        C::Enter => K::Return,
+        C::Escape => K::Escape,
+        C::Tab => K::Tab,
+        C::Backspace => K::BackSpace,
+        C::Up => K::Up,
+        C::Down => K::Down,
+        C::Left => K::Left,
+        C::Right => K::Right,
+        C::Home => K::Home,
+        C::End => K::End,
+        C::PageUp => K::Page_Up,
+        C::PageDown => K::Page_Down,
+        C::Insert => K::Insert,
+        C::Delete => K::Delete,
+        C::F(n) => gdk::Key::from_name(format!("F{n}")).expect("a function key"),
+    };
+    mods.set(SHIFT, mods.contains(SHIFT) || key.mods.shift);
+    mods.set(CTRL, key.mods.ctrl);
+    mods.set(ALT, key.mods.meta);
+    (mods, keyval)
 }
 
 /// ghostty's jump command for a terminal: its title, and as its directory
@@ -368,7 +461,12 @@ fn row(entry: &Entry) -> gtk::Box {
 /// and gave the focus back; Up and Down move the selection, which stays on
 /// the best match as the query changes; Escape closes, and ctrl+shift+p
 /// closes it too (ghostty's toggle).
-pub fn present(parent: &impl IsA<gtk::Widget>, mut entries: Vec<Entry>, run: impl Fn(Run) + 'static) {
+pub fn present(
+    parent: &impl IsA<gtk::Widget>,
+    mut entries: Vec<Entry>,
+    keybinds: Keybinds,
+    run: impl Fn(Run) + 'static,
+) {
     entries.sort_by(compare);
     let entries = Rc::new(entries);
     let search = theme::styled(
@@ -437,8 +535,9 @@ pub fn present(parent: &impl IsA<gtk::Widget>, mut entries: Vec<Entry>, run: imp
     });
     let keys = gtk::EventControllerKey::builder().propagation_phase(gtk::PropagationPhase::Capture).build();
     let weak = dialog.downgrade();
-    keys.connect_key_pressed(move |_, keyval, _, state| {
-        if bindings::binding(keyval, state) == Some(Binding::ToggleCommandPalette) {
+    keys.connect_key_pressed(move |keys, keyval, keycode, state| {
+        let bound = keybinds.lookup(&Press::new(keys, keyval, keycode, state));
+        if bound.map(|b| b.binding) == Some(Binding::ToggleCommandPalette) {
             if let Some(dialog) = weak.upgrade() {
                 dialog.close();
             }
@@ -464,8 +563,11 @@ pub fn present(parent: &impl IsA<gtk::Widget>, mut entries: Vec<Entry>, run: imp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bindings::{FontSize, Scroll};
     use mux::{KeyCode, Mods};
+
+    fn commands() -> Vec<Entry> {
+        super::commands(&Config::default(), Some(mux::DEFAULT_PREFIX))
+    }
 
     fn sorted(mut entries: Vec<Entry>) -> Vec<Entry> {
         entries.sort_by(compare);
@@ -502,14 +604,17 @@ mod tests {
             })
             .collect();
         let scrolls =
-            [Scroll::PageUp, Scroll::PageDown, Scroll::Top, Scroll::Bottom, Scroll::PreviousPrompt, Scroll::NextPrompt];
-        let sizes = [FontSize::Increase, FontSize::Decrease, FontSize::Reset];
+            [Scroll::PageUp, Scroll::PageDown, Scroll::Top, Scroll::Bottom, Scroll::Prompt(-1), Scroll::Prompt(1)];
+        let sizes = [FontSize::Increase(1.0), FontSize::Decrease(1.0), FontSize::Reset];
         let all = [
             Binding::StartSearch,
-            Binding::Copy { performable: true },
+            Binding::Copy,
             Binding::Paste { primary: false },
             Binding::Paste { primary: true },
             Binding::SelectAll,
+            Binding::OpenConfig { new_window: false },
+            Binding::OpenConfig { new_window: true },
+            Binding::ReloadConfig,
         ]
         .into_iter()
         .chain(scrolls.map(Binding::Scroll))
@@ -550,11 +655,11 @@ mod tests {
 
     #[test]
     fn prefix_entries_run_the_key_a_press_gives() {
-        assert!(mux::is_prefix(input::from_gdk(PREFIX.1, PREFIX.0).unwrap().0));
+        assert_eq!(input::from_gdk(K::b, CTRL).unwrap().0, mux::DEFAULT_PREFIX);
         let char_key = |c| Run::Prefix(mux::Key { code: KeyCode::Char(c), mods: Mods::default() });
         assert_eq!(entry("Split Right").run, char_key('|'));
         assert_eq!(entry("Resize Split: Left").run, char_key('H'));
-        assert_eq!(entry("Copy to Clipboard").run, Run::Binding(Binding::Copy { performable: true }));
+        assert_eq!(entry("Copy to Clipboard").run, Run::Binding(Binding::Copy));
         assert_eq!(entry("Quit").run, Run::Action("app.quit"));
     }
 
@@ -569,7 +674,32 @@ mod tests {
         assert_eq!(entry("Select Layout: Tiled").accel, "<Control>b+<Alt>5");
         assert_eq!(entry("Send Prefix Key").accel, "<Control>b+<Control>b");
         assert_eq!(entry("Quit").accel, "");
+        assert_eq!(entry("Reload Config").accel, "<Shift><Control>comma");
+        assert_eq!(entry("Open Config Using OS editor").accel, "<Control>comma");
+        assert_eq!(entry("Open Config in New Terminal Window").accel, "");
         assert_eq!(entry("Split Right").action, "split-window -h -c \"#{pane_current_path}\"");
+        assert_eq!(entry("Send Prefix Key").description, "Send Ctrl+B to the program in the terminal.");
+    }
+
+    #[test]
+    fn accelerators_follow_the_keybinds_and_the_prefix() {
+        let mut config = Config::default();
+        config.keybind.parse("ctrl+alt+c=copy_to_clipboard").unwrap();
+        config.keybind.parse("ctrl+shift+v=unbind").unwrap();
+        config.keybind.parse("paste=unbind").unwrap();
+        let prefix = mux::parse_key("C-a").unwrap();
+        let entries = super::commands(&config, prefix);
+        let find = |title: &str| entries.iter().find(|e| e.title == title).unwrap();
+        assert_eq!(find("Copy to Clipboard").accel, "<Control><Alt>c");
+        assert_eq!(find("Paste from Clipboard").accel, "");
+        assert_eq!(find("Split Right").accel, "<Control>a+bar");
+        assert_eq!(find("Send Prefix Key").accel, "<Control>a+<Control>b");
+        assert_eq!(find("Send Prefix Key").description, "Send Ctrl+A to the program in the terminal.");
+        let entries = super::commands(&config, mux::parse_key("M-F2").unwrap());
+        let find = |title: &str| entries.iter().find(|e| e.title == title).unwrap().accel.clone();
+        assert_eq!(find("Split Right"), "<Alt>F2+bar");
+        let entries = super::commands(&config, None);
+        assert_eq!(entries.iter().find(|e| e.title == "Split Right").unwrap().accel, "");
     }
 
     #[test]

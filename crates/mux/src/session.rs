@@ -371,7 +371,9 @@ impl Session {
             Command::RenameSession(ref name) => self.rename_session(name),
             Command::SendPrefix => {
                 let pane = self.cur().active;
-                self.writes.push(Effect::Write { pane, bytes: vec![0x02] });
+                if let Some(key) = self.server.prefix() {
+                    self.writes.push(Effect::Key { pane, key });
+                }
                 Ok(())
             }
             Command::CopyMode { page_up } => {
