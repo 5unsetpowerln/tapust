@@ -1125,10 +1125,30 @@ impl Surface {
         self.shown(|term| term.selection().is_some()) == Some(true)
     }
 
-    /// The selected text as ghostty copies it.
-    pub fn selection_text(&self) -> Option<String> {
-        let text = self.shown(|term| term.selection().map(|s| selection::text(term, &s)))??;
-        (!text.is_empty()).then_some(text)
+    /// Puts the selection on `clipboard` as ghostty's copy_to_clipboard =
+    /// .mixed does: the plain text, offered as set_text offers it, and HTML.
+    /// False when there is no text selected.
+    pub fn copy_selection(&self, clipboard: &gdk::Clipboard) -> bool {
+        let copy = |term: &mut term::Terminal| {
+            term.selection().map(|s| (selection::text(term, &s), selection::html(term, &s)))
+        };
+        let Some((text, html)) = self.shown(copy).flatten() else { return false };
+        if text.is_empty() {
+            return false;
+        }
+        // Plain text comes first: an application that takes the first type
+        // offered must not get HTML markup as text.
+        let bytes = |mime, data: Vec<u8>| gdk::ContentProvider::for_bytes(mime, &glib::Bytes::from_owned(data));
+        let content = gdk::ContentProvider::new_union(&[
+            bytes("text/plain;charset=utf-8", text.clone().into_bytes()),
+            bytes("text/plain", text.clone().into_bytes()),
+            bytes("text/html", html.into_bytes()),
+            gdk::ContentProvider::for_value(&text.to_value()),
+        ]);
+        if let Err(err) = clipboard.set_content(Some(&content)) {
+            eprintln!("tapust: cannot set the clipboard: {err}");
+        }
+        true
     }
 
     /// ghostty's select_all, copied to the primary selection like a
@@ -1141,11 +1161,9 @@ impl Surface {
         }
     }
 
-    /// ghostty's copy-on-select = primary.
+    /// ghostty's copy-on-select = primary, which copies as .mixed too.
     fn copy_primary(&self) {
-        if let Some(text) = self.selection_text() {
-            self.area.primary_clipboard().set_text(&text);
-        }
+        self.copy_selection(&self.area.primary_clipboard());
     }
 
     /// The cell under the logical point (`x`, `y`), clamped to the grid,

@@ -1,8 +1,13 @@
 //! Selections on a terminal's absolute lines, after ghostty's
 //! SelectionGesture (drag rules), Screen.selectWord and selectLine, and the
-//! plain formatter it copies with.
+//! plain and HTML formatters it copies with.
 
-use term::{Cell, Point, PromptMark, Selection, Semantic, Terminal, Width};
+use std::fmt::Write;
+
+use term::{
+    Attrs, Cell, Color, LinkId, Palette, Point, PromptMark, Rgb, Selection, Semantic, Style, StyleId, Terminal,
+    Underline, Width,
+};
 
 /// ghostty's default selection-word-chars.
 const WORD_BOUNDARIES: [char; 20] =
@@ -420,43 +425,217 @@ pub fn all(term: &Terminal) -> Option<Selection> {
     Some(Selection { start, end, rect: false })
 }
 
+/// What comes before a cell that is written: line breaks, then blank cells.
+#[derive(Default)]
+struct Gap {
+    lines: usize,
+    blanks: usize,
+}
+
+/// The selected cells as ghostty's formatter goes through them with
+/// unwrap: `visit` gets each cell that is not `blank` (a wide character
+/// once) with the gap before it. Every cell of a row without text is blank;
+/// soft-wrapped lines join (not in a rectangle), and the blank cells at the
+/// end of a line and the blank lines at the end are left out.
+fn walk(term: &Terminal, sel: &Selection, blank: impl Fn(Cell) -> bool, mut visit: impl FnMut(Gap, u64, u16, Cell)) {
+    let (first, last) = sel.ordered();
+    let cols = term.cols();
+    let mut gap = Gap::default();
+    for line in first.line..=last.line {
+        let Some(row) = term.line(line) else { continue };
+        let Some((left, right)) = sel.columns(line, cols) else { continue };
+        let cells = &row[left as usize..=right as usize];
+        let has_text = cells.iter().any(|c| c.codepoint() != 0);
+        for (x, &cell) in (left..).zip(cells) {
+            if matches!(cell.width(), Width::SpacerTail | Width::SpacerHead) {
+                continue;
+            }
+            if !has_text || blank(cell) {
+                gap.blanks += 1;
+                continue;
+            }
+            visit(std::mem::take(&mut gap), line, x, cell);
+        }
+        let joined = !sel.rect && term.line_wrapped(line) && line != last.line;
+        if !joined {
+            gap.blanks = 0;
+            gap.lines += 1;
+        }
+    }
+}
+
 /// The selected text as ghostty copies it (plain, unwrapped, trimmed):
 /// soft-wrapped lines join, blank and space cells become spaces only when
 /// text follows on the line, and trailing blank lines are dropped.
 pub fn text(term: &Terminal, sel: &Selection) -> String {
-    let (first, last) = sel.ordered();
-    let cols = term.cols();
     let mut out = String::new();
-    let mut blanks = 0;
-    let mut newlines = 0;
-    for line in first.line..=last.line {
-        let Some(row) = term.line(line) else { continue };
-        let Some((left, right)) = sel.columns(line, cols) else { continue };
-        for x in left..=right {
-            let cell = row[x as usize];
-            if matches!(cell.width(), Width::SpacerTail | Width::SpacerHead) {
-                continue;
-            }
-            match char_at(cell) {
-                None | Some(' ') => blanks += 1,
-                Some(c) => {
-                    out.extend(std::iter::repeat_n('\n', newlines));
-                    out.extend(std::iter::repeat_n(' ', blanks));
-                    (newlines, blanks) = (0, 0);
-                    match term.line_grapheme(line, x) {
-                        Some(cluster) => out.push_str(cluster),
-                        None => out.push(c),
-                    }
-                }
-            }
+    walk(term, sel, |cell| matches!(char_at(cell), None | Some(' ')), |gap, line, x, cell| {
+        out.extend(std::iter::repeat_n('\n', gap.lines));
+        out.extend(std::iter::repeat_n(' ', gap.blanks));
+        match term.line_grapheme(line, x) {
+            Some(cluster) => out.push_str(cluster),
+            None => out.extend(char_at(cell)),
         }
-        let joined = !sel.rect && term.line_wrapped(line) && line != last.line;
-        if !joined {
-            blanks = 0;
-            newlines += 1;
+    });
+    out
+}
+
+/// The selected cells as ghostty's HTML formatter writes them for
+/// copy_to_clipboard = .mixed: a monospace block that keeps its spaces,
+/// without the default colors so that the text takes those of where it is
+/// pasted; inline CSS for each run of a style; an anchor for each OSC 8
+/// hyperlink; text escaped, all but ASCII as numeric references; and "\n"
+/// between lines. Unlike ghostty, the runs are spans, not inline divs that
+/// importers which ignore CSS take for blocks; anchors and spans nest, and
+/// a URI is escaped by character rather than by byte; inverse swaps the
+/// colors as on screen rather than inverting them with a CSS filter; and
+/// the blank cells written before text are unstyled and unlinked, as on
+/// screen, rather than in the style of the text before.
+pub fn html(term: &Terminal, sel: &Selection) -> String {
+    let mut html = Html { out: r#"<div style="font-family: monospace; white-space: pre;">"#.into(), ..Html::default() };
+    walk(term, sel, |cell| cell.codepoint() == 0 && cell.style() == StyleId::DEFAULT, |gap, line, x, cell| {
+        html.cell(term, gap, line, x, cell)
+    });
+    html.close_link();
+    html.out.push_str("</div>");
+    html.out
+}
+
+#[derive(Default)]
+struct Html {
+    out: String,
+    /// The CSS of the open span; empty when none is open.
+    span: String,
+    /// The link of the open anchor.
+    link: Option<LinkId>,
+    /// The CSS of the last style id seen.
+    style: (StyleId, String),
+}
+
+impl Html {
+    fn close_span(&mut self) {
+        if !self.span.is_empty() {
+            self.out.push_str("</span>");
+            self.span.clear();
         }
     }
-    out
+
+    /// Closes the anchor and the span in it.
+    fn close_link(&mut self) {
+        self.close_span();
+        if self.link.take().is_some() {
+            self.out.push_str("</a>");
+        }
+    }
+
+    fn cell(&mut self, term: &Terminal, gap: Gap, line: u64, x: u16, cell: Cell) {
+        if gap.lines > 0 {
+            self.close_span();
+            self.out.extend(std::iter::repeat_n('\n', gap.lines));
+        }
+        if gap.blanks > 0 {
+            self.close_link();
+            self.out.extend(std::iter::repeat_n(' ', gap.blanks));
+        }
+        let link = cell.link();
+        if link != self.link {
+            self.close_link();
+            if let Some(uri) = link.and_then(|id| term.link_uri(id)) {
+                self.out.push_str("<a href=\"");
+                uri.chars().for_each(|c| escape(&mut self.out, c));
+                self.out.push_str("\">");
+                self.link = link;
+            }
+        }
+        if cell.style() != self.style.0 {
+            self.style = (cell.style(), css(term.style(cell.style()), term.palette()));
+        }
+        if self.span != self.style.1 {
+            self.close_span();
+            if !self.style.1.is_empty() {
+                let _ = write!(self.out, "<span style=\"{}\">", self.style.1);
+                self.span.clone_from(&self.style.1);
+            }
+        }
+        match term.line_grapheme(line, x) {
+            Some(cluster) => cluster.chars().for_each(|c| escape(&mut self.out, c)),
+            // A cell without text that has a style shows it as a space.
+            None => escape(&mut self.out, char_at(cell).unwrap_or(' ')),
+        }
+    }
+}
+
+/// ghostty's HTML escaping: the characters HTML gives a meaning, and all
+/// but ASCII as numeric references, since the HTML has no charset.
+fn escape(out: &mut String, c: char) {
+    match c {
+        '<' => out.push_str("&lt;"),
+        '>' => out.push_str("&gt;"),
+        '&' => out.push_str("&amp;"),
+        '"' => out.push_str("&quot;"),
+        '\'' => out.push_str("&#39;"),
+        c if c.is_ascii() => out.push(c),
+        c => {
+            let _ = write!(out, "&#{};", u32::from(c));
+        }
+    }
+}
+
+/// ghostty's Style.formatterHtml with the palette: the style as inline CSS
+/// properties, colors as rgb(). Colors left at the default are not set;
+/// inverse swaps the colors, taking the terminal's default for one left at
+/// the default.
+fn css(style: &Style, palette: &Palette) -> String {
+    let resolve = |c: Color| match c {
+        Color::Default => None,
+        Color::Indexed(i) => Some(palette.indexed[i as usize]),
+        Color::Rgb(r, g, b) => Some(Rgb { r, g, b }),
+    };
+    let attrs = style.attrs;
+    let (mut fg, mut bg) = (resolve(style.fg), resolve(style.bg));
+    if attrs.contains(Attrs::INVERSE) {
+        (fg, bg) = (Some(bg.unwrap_or(palette.background)), Some(fg.unwrap_or(palette.foreground)));
+    }
+    let mut css = String::new();
+    let colors = [("color", fg), ("background-color", bg), ("text-decoration-color", resolve(style.underline_color))];
+    for (property, color) in colors {
+        if let Some(Rgb { r, g, b }) = color {
+            let _ = write!(css, "{property}: rgb({r}, {g}, {b});");
+        }
+    }
+    let lines = [
+        (style.underline != Underline::None, " underline"),
+        (attrs.contains(Attrs::STRIKE), " line-through"),
+        (attrs.contains(Attrs::OVERLINE), " overline"),
+        (attrs.contains(Attrs::BLINK), " blink"),
+    ];
+    if lines.iter().any(|&(on, _)| on) {
+        css.push_str("text-decoration-line:");
+        css.extend(lines.iter().filter(|&&(on, _)| on).map(|&(_, line)| line));
+        css.push(';');
+    }
+    let underline = match style.underline {
+        Underline::None => "",
+        Underline::Single => "solid",
+        Underline::Double => "double",
+        Underline::Curly => "wavy",
+        Underline::Dotted => "dotted",
+        Underline::Dashed => "dashed",
+    };
+    if !underline.is_empty() {
+        let _ = write!(css, "text-decoration-style: {underline};");
+    }
+    for (flag, property) in [
+        (Attrs::BOLD, "font-weight: bold;"),
+        (Attrs::ITALIC, "font-style: italic;"),
+        (Attrs::DIM, "opacity: 0.5;"),
+        (Attrs::HIDDEN, "visibility: hidden;"),
+    ] {
+        if attrs.contains(flag) {
+            css.push_str(property);
+        }
+    }
+    css
 }
 
 #[cfg(test)]
@@ -586,5 +765,100 @@ mod tests {
         let t = term(10, 3, "abc\r\ndef");
         let s = Selection { start: at(&t, 0, 1), end: at(&t, 1, 1), rect: true };
         assert_eq!(text(&t, &s), "b\ne");
+    }
+
+    /// The HTML of `sel` inside its monospace block.
+    fn html_of(t: &Terminal, sel: Selection) -> String {
+        let html = html(t, &sel);
+        let inner = html.strip_prefix(r#"<div style="font-family: monospace; white-space: pre;">"#).unwrap();
+        inner.strip_suffix("</div>").unwrap().to_owned()
+    }
+
+    fn line_of(t: &Terminal, row: u64) -> Selection {
+        Selection { start: at(t, row, 0), end: at(t, row, t.cols() - 1), rect: false }
+    }
+
+    #[test]
+    fn html_escapes_text_and_keeps_written_spaces() {
+        // A wide character, an accent combined with 'e', and the characters
+        // HTML gives a meaning; the spaces at the end were written.
+        let t = term(20, 2, "<a> & \"b\" 'c'  \r\n\u{65e5}e\u{301} x");
+        let s = Selection { start: at(&t, 0, 0), end: at(&t, 1, 19), rect: false };
+        assert_eq!(html_of(&t, s), "&lt;a&gt; &amp; &quot;b&quot; &#39;c&#39;  \n&#26085;e&#769; x");
+        assert_eq!(text(&t, &s), "<a> & \"b\" 'c'\n\u{65e5}e\u{301} x");
+    }
+
+    #[test]
+    fn html_runs_of_a_style_are_spans_in_the_current_palette() {
+        let t = term(
+            30,
+            3,
+            "\x1b[31mred\x1b[0m \x1b[1;44mbold on blue\x1b[0m <&>\r\n\
+             \x1b]4;2;rgb:12/34/56\x1b\\\x1b[32;48;2;1;2;3mgreen\x1b[0m\r\n",
+        );
+        let s = Selection { start: at(&t, 0, 0), end: at(&t, 2, 29), rect: false };
+        assert_eq!(
+            html_of(&t, s),
+            "<span style=\"color: rgb(205, 0, 0);\">red</span> \
+             <span style=\"background-color: rgb(0, 0, 238);font-weight: bold;\">bold on blue</span> &lt;&amp;&gt;\n\
+             <span style=\"color: rgb(18, 52, 86);background-color: rgb(1, 2, 3);\">green</span>"
+        );
+        assert_eq!(text(&t, &s), "red bold on blue <&>\ngreen");
+    }
+
+    #[test]
+    fn html_swaps_inverse_colors_and_writes_attributes_as_ghostty() {
+        let t = term(
+            20,
+            1,
+            "\x1b[7mi\x1b[31mr\x1b[0m\x1b[2mf\x1b[22;8mh\x1b[28;3mi\x1b[0m\x1b[4:3;58;5;2mc\x1b[0m\x1b[4;9;53mu\x1b[0m",
+        );
+        assert_eq!(
+            html_of(&t, line_of(&t, 0)),
+            "<span style=\"color: rgb(0, 0, 0);background-color: rgb(229, 229, 229);\">i</span>\
+             <span style=\"color: rgb(0, 0, 0);background-color: rgb(205, 0, 0);\">r</span>\
+             <span style=\"opacity: 0.5;\">f</span>\
+             <span style=\"visibility: hidden;\">h</span>\
+             <span style=\"font-style: italic;\">i</span>\
+             <span style=\"text-decoration-color: rgb(0, 205, 0);text-decoration-line: underline;\
+             text-decoration-style: wavy;\">c</span>\
+             <span style=\"text-decoration-line: underline line-through overline;\
+             text-decoration-style: solid;\">u</span>"
+        );
+    }
+
+    #[test]
+    fn html_links_are_anchors_around_their_spans() {
+        let t = term(30, 1, "\x1b]8;;https://e.com/?a=1&b=\u{e9}\x1b\\li\x1b[1mnk\x1b[0m\x1b]8;;\x1b\\ x");
+        assert_eq!(
+            html_of(&t, line_of(&t, 0)),
+            "<a href=\"https://e.com/?a=1&amp;b=&#233;\">li<span style=\"font-weight: bold;\">nk</span></a> x"
+        );
+    }
+
+    #[test]
+    fn html_writes_blank_cells_unstyled_and_rows_without_text_as_blank_lines() {
+        // A tab leaves cells unwritten; an erase gives them the background.
+        let t = term(12, 4, "\x1b[41mA\x1b[0m\tB\r\n\x1b[44m\x1b[K\x1b[0m\r\n\x1b[44mX\x1b[K\x1b[0m");
+        let s = Selection { start: at(&t, 0, 0), end: at(&t, 2, 4), rect: false };
+        assert_eq!(
+            html_of(&t, s),
+            "<span style=\"background-color: rgb(205, 0, 0);\">A</span>       B\n\n\
+             <span style=\"background-color: rgb(0, 0, 238);\">X    </span>"
+        );
+        assert_eq!(text(&t, &s), "A       B\n\nX");
+    }
+
+    #[test]
+    fn html_joins_soft_wraps_except_in_a_rectangle() {
+        // "abcd" wraps into "ef".
+        let t = term(4, 3, "ab\x1b[32mcdef\x1b[0m\r\nxyz");
+        let green = "<span style=\"color: rgb(0, 205, 0);\">";
+        let s = Selection { start: at(&t, 0, 1), end: at(&t, 2, 2), rect: false };
+        assert_eq!(html_of(&t, s), format!("b{green}cdef</span>\nxyz"));
+        assert_eq!(text(&t, &s), "bcdef\nxyz");
+        let s = Selection { start: at(&t, 0, 1), end: at(&t, 2, 2), rect: true };
+        assert_eq!(html_of(&t, s), format!("b{green}c</span>\n{green}f</span>\nyz"));
+        assert_eq!(text(&t, &s), "bc\nf\nyz");
     }
 }

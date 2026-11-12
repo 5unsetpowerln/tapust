@@ -1948,15 +1948,19 @@ impl Window {
     }
 
     /// ghostty's copy_to_clipboard: the surface's selection to the
-    /// clipboard; returns whether it had one.
+    /// clipboard as plain text and HTML, with ghostty's toast; returns
+    /// whether it had one.
     fn copy(&self, surface: &Surface) -> bool {
-        let Some(text) = surface.selection_text() else { return false };
-        self.set_clipboard(&text);
-        true
+        let copied = surface.copy_selection(&self.window.clipboard());
+        if copied {
+            self.toast("Copied to clipboard");
+        }
+        copied
     }
 
-    /// ghostty's clipboard write, for a copy binding or a program's OSC 52,
-    /// with its toast (app-notifications clipboard-copy).
+    /// ghostty's clipboard write for a program's OSC 52, plain text only,
+    /// with its toast (app-notifications clipboard-copy): a copy-mode copy
+    /// reaches the clipboard as tmux's set-clipboard sends it with OSC 52.
     fn set_clipboard(&self, text: &str) {
         self.window.clipboard().set_text(text);
         self.toast("Copied to clipboard");
