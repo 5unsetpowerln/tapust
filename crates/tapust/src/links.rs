@@ -1,11 +1,11 @@
-//! ghostty's default link matcher: the URL and path regex of its
-//! config/url.zig, run with Oniguruma (as ghostty does) over the logical
-//! line under the pointer.
+//! The links under the pointer: OSC 8 hyperlinks, and ghostty's default
+//! link matcher: the URL and path regex of its config/url.zig, run with
+//! Oniguruma (as ghostty does) over the logical line under the pointer.
 
 use std::sync::OnceLock;
 
 use onig::Regex;
-use term::{Point, Selection, Terminal, Width};
+use term::{LinkId, Point, Selection, Terminal, Width};
 
 use crate::selection;
 
@@ -41,9 +41,32 @@ fn url_regex() -> &'static Regex {
     })
 }
 
-/// ghostty's linkAtPos for the default URL matcher: the match on the
+/// A link under the pointer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Link {
+    /// The link's cells around the pointer: a match, or the run of a
+    /// hyperlink's cells.
+    pub cells: Selection,
+    /// The hyperlink, all of whose visible cells are underlined.
+    pub id: Option<LinkId>,
+    /// What opening the link opens and the URL label shows: a hyperlink's
+    /// URI, or the matched text.
+    pub target: String,
+}
+
+/// ghostty's linkAtPos: the OSC 8 hyperlink of the cell at `p`, or else the
+/// URL regex match there.
+pub fn link_at(term: &Terminal, p: Point) -> Option<Link> {
+    let Some(id) = term.line(p.line)?[p.col as usize].link() else {
+        return url_at(term, p).map(|(cells, target)| Link { cells, id: None, target });
+    };
+    let same = |q: Point| term.line(q.line).is_some_and(|row| row[q.col as usize].link() == Some(id));
+    Some(Link { cells: selection::run(term, p, same), id: Some(id), target: term.link_uri(id)?.to_owned() })
+}
+
+/// ghostty's linkAtPin for the default URL matcher: the match on the
 /// logical line under `p` (Screen.selectLine) that covers `p`, and its text.
-pub fn link_at(term: &Terminal, p: Point) -> Option<(Selection, String)> {
+pub fn url_at(term: &Terminal, p: Point) -> Option<(Selection, String)> {
     let line = selection::line(term, p, true)?;
     // The line's text with the cell each byte came from.
     let mut text = String::new();
@@ -113,13 +136,36 @@ mod tests {
     }
 
     #[test]
-    fn link_at_finds_the_url_under_the_pointer() {
+    fn url_at_finds_the_url_under_the_pointer() {
         let mut t = Terminal::new(20, 3, 10);
         t.feed(b"see https://example.com/abc now");
         let top = t.view_top();
-        let (sel, text) = link_at(&t, Point { line: top, col: 6 }).unwrap();
+        let (sel, text) = url_at(&t, Point { line: top, col: 6 }).unwrap();
         assert_eq!(text, "https://example.com/abc");
         assert_eq!((sel.start, sel.end), (Point { line: top, col: 4 }, Point { line: top + 1, col: 6 }));
-        assert!(link_at(&t, Point { line: top, col: 1 }).is_none());
+        assert!(url_at(&t, Point { line: top, col: 1 }).is_none());
+    }
+
+    #[test]
+    fn a_hyperlink_comes_before_a_url_and_shows_its_uri() {
+        let mut t = Terminal::new(10, 4, 10);
+        // A hyperlink over text that looks like a URL, soft-wrapped onto the
+        // next row, then the same link again after unlinked text.
+        t.feed(b"\x1b]8;id=a;gemini://a/b\x1b\\x https://c\x1b]8;;\x1b\\ y\r\n");
+        t.feed(b"\x1b]8;id=a;gemini://a/b\x1b\\z\x1b]8;;\x1b\\ https://d");
+        let top = t.view_top();
+        let at = |line: u64, col: u16| link_at(&t, Point { line: top + line, col });
+        let link = at(0, 5).unwrap();
+        assert_eq!(link.target, "gemini://a/b");
+        assert_eq!((link.cells.start, link.cells.end), (Point { line: top, col: 0 }, Point { line: top + 1, col: 0 }));
+        assert_eq!(at(1, 0), Some(link.clone()));
+        // The same link elsewhere: the same id, its own cells.
+        let other = at(2, 0).unwrap();
+        assert_eq!((other.id, other.target.as_str()), (link.id, "gemini://a/b"));
+        let z = Point { line: top + 2, col: 0 };
+        assert_eq!((other.cells.start, other.cells.end), (z, z));
+        // Outside the hyperlinks, the regex.
+        assert_eq!(at(2, 3).map(|l| (l.id, l.target)), Some((None, "https://d".to_owned())));
+        assert_eq!(at(1, 3), None);
     }
 }

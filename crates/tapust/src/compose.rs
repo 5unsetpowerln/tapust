@@ -3,6 +3,7 @@
 use term::{Attrs, Cell, Color, CursorShape, Palette, Rgb, Selection, Style, StyleId, Terminal, Underline, Width};
 
 use crate::frame::{BOLD, CursorStyle, FrameCell, FrameCursor, Grid, ITALIC, STRIKE, WIDE};
+use crate::links::Link;
 use crate::theme;
 
 fn rgba(c: Rgb) -> [u8; 4] {
@@ -142,22 +143,28 @@ pub fn copy_pane(
     term.clear_dirty();
 }
 
-/// Underlines the visible cells of a hovered link, as ghostty does: with a
-/// single underline, or a double one where the text has a single underline.
-/// The kind comes from the terminal, so underlining again changes nothing.
-pub fn underline(grid: &mut Grid, term: &Terminal, link: &Selection) {
+/// Underlines the visible cells of a hovered link, as ghostty does: every
+/// cell of a hyperlink, or the cells of a match; with a single underline, or
+/// a double one where the text has a single underline. The kind comes from
+/// the terminal, so underlining again changes nothing.
+pub fn underline(grid: &mut Grid, term: &Terminal, link: &Link) {
+    // The terminal reuses a hyperlink's id once no cell has it.
+    if link.id.is_some_and(|id| term.link_uri(id) != Some(link.target.as_str())) {
+        return;
+    }
     let top = term.view_top();
     let (rows, cols) = (term.rows().min(grid.rows()), term.cols().min(grid.cols()));
     for y in 0..rows {
-        if let Some((left, right)) = link.columns(top + u64::from(y), cols)
-            && let Some(cells) = term.row(y).get(left as usize..=(right as usize).min(cols as usize - 1))
-        {
-            for (dst, cell) in grid.row_mut(y)[left as usize..].iter_mut().zip(cells) {
-                let style = term.style(cell.style());
-                if !style.attrs.contains(Attrs::HIDDEN) {
-                    let single = style.underline == Underline::Single;
-                    dst.underline = if single { Underline::Double } else { Underline::Single };
-                }
+        let span = link.cells.columns(top + u64::from(y), cols);
+        for (x, (dst, cell)) in grid.row_mut(y).iter_mut().zip(term.row(y)).take(cols as usize).enumerate() {
+            let hovered = match link.id {
+                Some(id) => cell.link() == Some(id),
+                None => span.is_some_and(|(left, right)| (left as usize..=right as usize).contains(&x)),
+            };
+            let style = term.style(cell.style());
+            if hovered && !style.attrs.contains(Attrs::HIDDEN) {
+                let single = style.underline == Underline::Single;
+                dst.underline = if single { Underline::Double } else { Underline::Single };
             }
         }
     }
@@ -310,7 +317,8 @@ mod tests {
         let mut t = Terminal::new(12, 2, 10);
         t.feed(b"ab\x1b[4mcd\x1b[4:3mef\x1b[8mg");
         let top = t.view_top();
-        let link = Selection { start: Point { line: top, col: 0 }, end: Point { line: top, col: 6 }, rect: false };
+        let cells = Selection { start: Point { line: top, col: 0 }, end: Point { line: top, col: 6 }, rect: false };
+        let link = Link { cells, id: None, target: String::new() };
         let mut grid = new_grid();
         copy_pane(&mut grid, &mut t, true, &[], None, None);
         let kinds = |grid: &Grid| grid.row(0)[..8].iter().map(|c| c.underline).collect::<Vec<_>>();
@@ -324,5 +332,28 @@ mod tests {
         }
         copy_pane(&mut grid, &mut t, true, &[], None, None);
         assert_eq!(kinds(&grid)[..6], [none, none, single, single, Underline::Curly, Underline::Curly]);
+    }
+
+    #[test]
+    fn a_hovered_hyperlink_underlines_all_its_visible_cells() {
+        let mut t = Terminal::new(12, 2, 10);
+        // The same link (same id and URI) twice, apart; another link with the
+        // same URI but no id; a single underline under the link.
+        t.feed(b"\x1b]8;id=a;gemini://a\x1b\\ab\x1b]8;;\x1b\\c\x1b]8;;gemini://a\x1b\\d\x1b]8;;\x1b\\");
+        t.feed(b"\x1b]8;id=a;gemini://a\x1b\\\x1b[4me\x1b[0m\x1b]8;;\x1b\\");
+        let top = t.view_top();
+        let link = crate::links::link_at(&t, Point { line: top, col: 0 }).unwrap();
+        assert_eq!((link.cells.end, link.target.as_str()), (Point { line: top, col: 1 }, "gemini://a"));
+        let mut grid = new_grid();
+        let kinds = |grid: &Grid| grid.row(0)[..6].iter().map(|c| c.underline).collect::<Vec<_>>();
+        let (none, single, double) = (Underline::None, Underline::Single, Underline::Double);
+        copy_pane(&mut grid, &mut t, true, &[], None, None);
+        underline(&mut grid, &t, &link);
+        assert_eq!(kinds(&grid), [single, single, none, none, double, none]);
+        // A link whose id now belongs to another URI underlines nothing.
+        let stale = Link { target: "gemini://b".to_owned(), ..link };
+        copy_pane(&mut grid, &mut t, true, &[], None, None);
+        underline(&mut grid, &t, &stale);
+        assert_eq!(kinds(&grid), [none, none, none, none, single, none]);
     }
 }

@@ -49,10 +49,15 @@ fn left_wrap(term: &Terminal, p: Point) -> Option<Point> {
 }
 
 /// Screen.selectWord: the run of boundary or non-boundary characters around
-/// `p`, continuing onto the next line only from a soft-wrapped one.
+/// `p`.
 pub fn word(term: &Terminal, p: Point) -> Option<Selection> {
     let boundary = WORD_BOUNDARIES.contains(&word_char(term, p)?);
-    let same = |q: Point| word_char(term, q).is_some_and(|c| WORD_BOUNDARIES.contains(&c) == boundary);
+    Some(run(term, p, |q| word_char(term, q).is_some_and(|c| WORD_BOUNDARIES.contains(&c) == boundary)))
+}
+
+/// The cells around `p` for which `same` holds, continuing onto the next
+/// line only from a soft-wrapped one.
+pub fn run(term: &Terminal, p: Point, same: impl Fn(Point) -> bool) -> Selection {
     let last_col = term.cols() - 1;
     let mut end = p;
     while let Some(next) = right_wrap(term, end) {
@@ -74,7 +79,7 @@ pub fn word(term: &Terminal, p: Point) -> Option<Selection> {
         }
         start = prev;
     }
-    Some(Selection { start, end, rect: false })
+    Selection { start, end, rect: false }
 }
 
 /// Screen.selectWordBetween: the first word found walking from `from`

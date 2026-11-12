@@ -166,8 +166,8 @@ pub struct Surface {
     mods: Cell<mouse::Mods>,
     /// The CSS cursor name last given to the GLArea.
     cursor: Cell<&'static str>,
-    /// The link under the pointer while ctrl is held, and its text.
-    hover: RefCell<Option<(Selection, String)>>,
+    /// The link under the pointer while ctrl is held.
+    hover: RefCell<Option<links::Link>>,
     /// ghostty's context_menu, made on the first right click.
     menu: RefCell<Option<gtk::PopoverMenu>>,
     last_blink_reset: Cell<Option<Instant>>,
@@ -326,7 +326,7 @@ impl Surface {
             .child(&inner)
             .build();
         overlay.add_overlay(&resize_bin);
-        // ghostty's url_left and url_right: the hovered link's text.
+        // ghostty's url_left and url_right: the hovered link's target.
         let url_label = |align| {
             theme::styled(
                 gtk::Label::builder().visible(false).halign(align).valign(gtk::Align::End).build(),
@@ -1078,8 +1078,8 @@ impl Surface {
                 g.output = g.count == 3 && mods.ctrl;
                 let selection = match g.count {
                     1 => None,
-                    // A double click on a link selects all of it.
-                    2 => links::link_at(&term, point.cell).map(|(sel, _)| sel).or_else(|| selection::word(&term, point.cell)),
+                    // A double click on a URL selects all of it.
+                    2 => links::url_at(&term, point.cell).map(|(sel, _)| sel).or_else(|| selection::word(&term, point.cell)),
                     _ if g.output => selection::output(&term, point.cell),
                     _ => selection::line(&term, point.cell, true),
                 };
@@ -1096,7 +1096,7 @@ impl Surface {
                 let term = shared.term.lock();
                 let Some(point) = self.drag_point(&term, x, y) else { return };
                 let inside = term.selection().is_some_and(|s| s.contains(point.cell, term.cols()));
-                let hovered = self.hover.borrow().as_ref().map(|(sel, _)| *sel);
+                let hovered = self.hover.borrow().as_ref().map(|link| link.cells);
                 if !inside && let Some(word) = hovered.or_else(|| selection::word(&term, point.cell)) {
                     drop(term);
                     self.set_selection(Some(word));
@@ -1130,9 +1130,9 @@ impl Surface {
         // ghostty opens the hovered link on a left release that did not drag,
         // or else moves the cursor to a click at the prompt.
         if button == mouse::Button::Left && !self.gesture.borrow().dragged {
-            let link = self.hover.borrow().as_ref().map(|(_, text)| text.clone());
-            match link {
-                Some(text) => self.open_link(&text),
+            let target = self.hover.borrow().as_ref().map(|link| link.target.clone());
+            match target {
+                Some(target) => self.open_link(&target),
                 None => self.prompt_click(x, y),
             }
         }
@@ -1285,7 +1285,7 @@ impl Surface {
 
     /// ghostty's link hover: with exactly ctrl held (shift too while a
     /// program reports the mouse), the link under the pointer is underlined
-    /// and its text shown at the bottom left.
+    /// and its target (a hyperlink's URI) shown at the bottom left.
     fn update_hover(&self) {
         let m = self.mods.get();
         let reporting = self.reporting();
@@ -1303,9 +1303,9 @@ impl Surface {
             return;
         }
         match &link {
-            Some((_, text)) => {
-                self.url_left.set_label(text);
-                self.url_right.set_label(text);
+            Some(link) => {
+                self.url_left.set_label(&link.target);
+                self.url_right.set_label(&link.target);
                 self.url_left.set_visible(true);
             }
             None => {
@@ -1777,7 +1777,7 @@ impl Surface {
             let selection = term.selection();
             let found = self.found.borrow();
             compose::copy_pane(grid, &mut term, d.full, &found.matches, found.current, selection.as_ref());
-            if let Some((link, _)) = self.hover.borrow().as_ref() {
+            if let Some(link) = self.hover.borrow().as_ref() {
                 compose::underline(grid, &term, link);
             }
             let focused = self.focused.get();
