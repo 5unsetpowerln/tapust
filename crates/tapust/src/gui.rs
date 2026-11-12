@@ -429,6 +429,17 @@ impl App {
             }
         });
         self.application.add_action(&quit);
+        // A request to stop from outside ends the sessions like an
+        // unconfirmed quit, so the panes hang up their programs.
+        for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+            let weak = Rc::downgrade(self);
+            glib::unix_signal_add_local(signal, move || {
+                if let Some(app) = weak.upgrade() {
+                    app.close_all();
+                }
+                glib::ControlFlow::Continue
+            });
+        }
     }
 
     fn windows(&self) -> Vec<Rc<Window>> {
