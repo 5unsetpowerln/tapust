@@ -214,8 +214,14 @@ impl Pty {
 impl Drop for Pty {
     fn drop(&mut self) {
         // Closing the master hangs up the session; SIGHUP covers shells that ignore EOF.
-        unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGHUP) };
-        let _ = self.child.try_wait();
+        let pid = self.child.id() as libc::pid_t;
+        unsafe { libc::kill(pid, libc::SIGHUP) };
+        // A child that has not exited yet is reaped when it does, so it never
+        // stays a zombie for the rest of tapust's life.
+        if let Ok(None) = self.child.try_wait() {
+            let reaper = std::thread::Builder::new().name("pane-reaper".into());
+            let _ = reaper.spawn(move || unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) });
+        }
     }
 }
 
