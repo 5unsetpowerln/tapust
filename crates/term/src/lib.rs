@@ -12,6 +12,7 @@ mod palette;
 mod parser;
 #[cfg(test)]
 mod resize_tests;
+mod search;
 mod selection;
 mod style;
 mod term;

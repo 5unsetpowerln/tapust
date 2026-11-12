@@ -18,3 +18,7 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 [[bench]]
 name = "feed"
 harness = false
+
+[[bench]]
+name = "search"
+harness = false
