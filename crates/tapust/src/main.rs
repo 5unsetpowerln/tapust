@@ -20,6 +20,7 @@ mod selection;
 mod shell;
 mod surface;
 mod theme;
+mod themes;
 mod underline;
 
 use std::error::Error;

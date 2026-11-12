@@ -1,9 +1,12 @@
 //! Copies terminal rows into pane grids, resolving styles to colors.
 
-use term::{Attrs, Cell, Color, CursorShape, Palette, Point, Rgb, Selection, Style, StyleId, Terminal, Underline, Width};
+use term::{
+    Attrs, Cell, Color, CursorShape, Palette, Point, PromptMark, Rgb, Selection, Style, StyleId, Terminal, Underline,
+    Width,
+};
 
-use crate::config::{Config, TerminalColor};
-use crate::frame::{BOLD, CursorStyle, FrameCell, FrameCursor, Grid, ITALIC, STRIKE, WIDE};
+use crate::config::{Config, PaddingColor, TerminalColor};
+use crate::frame::{BOLD, CursorStyle, Extend, FrameCell, FrameCursor, Grid, ITALIC, STRIKE, TRANSLUCENT, WIDE};
 use crate::links::Link;
 use crate::theme;
 
@@ -42,10 +45,13 @@ fn style_colors(style: &Style, palette: &Palette, reverse_video: bool) -> ([u8; 
     (fg, bg)
 }
 
-/// A cell in `style` without its character, which `frame_cell` adds.
-fn styled(style: &Style, palette: &Palette, reverse_video: bool) -> FrameCell {
+/// A cell in `style` without its character, which `frame_cell` adds; its
+/// background takes the background opacity unless it is inverted or, without
+/// `opacity_cells`, set.
+fn styled(style: &Style, palette: &Palette, reverse_video: bool, opacity_cells: bool) -> FrameCell {
     let (fg, bg) = style_colors(style, palette, reverse_video);
     let attrs = style.attrs;
+    let inverted = attrs.contains(Attrs::INVERSE) != reverse_video;
     // ghostty's underline color stays when the colors are inverted or selected.
     let underline_color = match style.underline_color {
         Color::Default => None,
@@ -64,6 +70,9 @@ fn styled(style: &Style, palette: &Palette, reverse_video: bool) -> FrameCell {
     if attrs.contains(Attrs::STRIKE) {
         flags |= STRIKE;
     }
+    if !inverted && (style.bg == Color::Default || opacity_cells) {
+        flags |= TRANSLUCENT;
+    }
     FrameCell { ch: 0, fg, bg, underline_color, underline, flags }
 }
 
@@ -75,7 +84,8 @@ fn frame_cell(cell: Cell, styled: FrameCell) -> FrameCell {
     }
 }
 
-/// Gives the cells of `sel` on `line` the colors `colors` picks for them.
+/// Gives the cells of `sel` on `line` the colors `colors` picks for them,
+/// opaque as ghostty draws the selected cells.
 fn paint(
     out: &mut [FrameCell],
     sel: &Selection,
@@ -88,6 +98,7 @@ fn paint(
     {
         for cell in cells {
             (cell.fg, cell.bg) = colors(cell);
+            cell.flags &= !TRANSLUCENT;
         }
     }
 }
@@ -131,11 +142,11 @@ pub fn copy_pane(
     let reverse_video = term.modes().reverse_video;
     // Blank cells draw nothing in the foreground color, which a selection
     // of the cells' foreground still needs.
-    let (blank_fg, blank_bg) = style_colors(&Style::DEFAULT, palette, reverse_video);
-    let blank = FrameCell { fg: blank_fg, ..FrameCell::blank(blank_bg) };
+    let opacity_cells = config.background_opacity_cells;
+    let blank = styled(&Style::DEFAULT, palette, reverse_video, opacity_cells);
     let colors = |(fg, bg): (Rgb, Rgb)| (rgba(fg), rgba(bg));
     // Cells in a row mostly share their style: resolve it once per run.
-    let mut run = (StyleId::DEFAULT, styled(&Style::DEFAULT, palette, reverse_video));
+    let mut run = (StyleId::DEFAULT, blank);
     for y in 0..grid.rows() {
         if !full && (y >= rows || !term.dirty().is_dirty(y)) {
             continue;
@@ -151,7 +162,7 @@ pub fn copy_pane(
                 continue;
             }
             if cell.style() != run.0 {
-                run = (cell.style(), styled(term.style(cell.style()), palette, reverse_video));
+                run = (cell.style(), styled(term.style(cell.style()), palette, reverse_video, opacity_cells));
             }
             *dst = frame_cell(cell, run.1);
         }
@@ -168,6 +179,36 @@ pub fn copy_pane(
         }
     }
     term.clear_dirty();
+}
+
+/// ghostty's padding_extend for window-padding-color: the sides whose
+/// padding shows the nearest cells' backgrounds. `extend` leaves out the top
+/// and bottom where ghostty's heuristics say the row would look bad
+/// stretched.
+pub fn padding_extend(term: &Terminal, color: PaddingColor) -> Extend {
+    match color {
+        PaddingColor::Background => Extend::default(),
+        PaddingColor::ExtendAlways => Extend { left: true, right: true, up: true, down: true },
+        PaddingColor::Extend => {
+            let last = term.rows().saturating_sub(1);
+            Extend { left: true, right: true, up: row_extends(term, 0), down: row_extends(term, last) }
+        }
+    }
+}
+
+/// The opposite of ghostty's neverExtendBg: a row that is no prompt and
+/// whose every cell has a background of its own, other than the default one,
+/// and no powerline glyph (which fits its cell exactly).
+fn row_extends(term: &Terminal, y: u16) -> bool {
+    if term.line_prompt(term.view_top() + u64::from(y)) != PromptMark::None {
+        return false;
+    }
+    let palette = term.palette();
+    term.row(y).iter().all(|cell| {
+        let powerline = matches!(cell.codepoint(), 0xE0B0..=0xE0C8 | 0xE0CA | 0xE0CC..=0xE0D2 | 0xE0D4);
+        let bg = term.style(cell.style()).bg;
+        !powerline && bg != Color::Default && resolve(bg, palette, palette.background) != rgba(palette.background)
+    })
 }
 
 /// Underlines the visible cells of a hovered link, as ghostty does: every
@@ -337,6 +378,44 @@ mod tests {
 
     fn new_grid() -> Grid {
         Grid::new(0, (0, 0, 120, 40), (0, 0), (12, 2), [0; 4])
+    }
+
+    /// ghostty's bg_alpha: the default background takes the background
+    /// opacity, a set one only with background-opacity-cells, and inverted
+    /// or selected cells never.
+    #[test]
+    fn which_backgrounds_take_the_background_opacity() {
+        let mut t = Terminal::new(12, 2, 10);
+        t.feed(b"a\x1b[44mb\x1b[0m\x1b[7mc\x1b[0md");
+        let top = t.view_top();
+        let selection = Selection { start: Point { line: top, col: 3 }, end: Point { line: top, col: 3 }, rect: false };
+        let mut translucent = |config: &Config| {
+            let mut grid = new_grid();
+            copy_pane(&mut grid, &mut t, true, &[], None, Some(&selection), config);
+            grid.row(0)[..5].iter().map(|c| c.flags & TRANSLUCENT != 0).collect::<Vec<_>>()
+        };
+        assert_eq!(translucent(&Config::default()), [true, false, false, false, true]);
+        let cells = Config { background_opacity_cells: true, ..Config::default() };
+        assert_eq!(translucent(&cells), [true, true, false, false, true]);
+    }
+
+    /// ghostty's window-padding-color: extend stretches the top and bottom
+    /// rows only when every cell has a background of its own.
+    #[test]
+    fn the_padding_extends_as_ghosttys_heuristics_allow() {
+        let mut t = Terminal::new(4, 3, 10);
+        // A full blue row, a row with a default cell, and a prompt row.
+        t.feed(b"\x1b[44m    \x1b[0m\r\n\x1b[44mab\x1b[0m\r\n\x1b]133;A\x07\x1b[41m    \x1b[0m");
+        let all = Extend { left: true, right: true, up: true, down: true };
+        assert_eq!(padding_extend(&t, PaddingColor::Background), Extend::default());
+        assert_eq!(padding_extend(&t, PaddingColor::ExtendAlways), all);
+        assert_eq!(padding_extend(&t, PaddingColor::Extend), Extend { down: false, ..all });
+        let mut t = Terminal::new(4, 2, 10);
+        t.feed(b"\x1b[44m    \x1b[0m\r\n\x1b[44m\xee\x82\xb0   \x1b[0m");
+        assert_eq!(padding_extend(&t, PaddingColor::Extend), Extend { down: false, ..all });
+        let mut t = Terminal::new(4, 2, 10);
+        t.feed(b"ab");
+        assert_eq!(padding_extend(&t, PaddingColor::Extend), Extend { up: false, down: false, ..all });
     }
 
     #[test]

@@ -1,5 +1,5 @@
-//! ghostty's default appearance (colors, font, padding), which the
-//! configuration file can change, and its constants.
+//! ghostty's default appearance (colors, font), which the configuration
+//! file can change, and its constants.
 
 use term::{Palette, Rgb};
 
@@ -27,12 +27,7 @@ pub fn palette() -> [Rgb; 256] {
 
 pub const FONT_FAMILY: &str = "JetBrains Mono";
 pub const FONT_POINTS: f32 = 12.0;
-/// `window-padding-x` / `window-padding-y` (top-left and bottom-right), in points.
-pub const PADDING_POINTS: f64 = 2.0;
 
-/// ghostty's `widget.unfocused-split`: `unfocused-split-fill` (the
-/// background) at opacity `1 - unfocused-split-opacity`.
-pub const UNFOCUSED_ALPHA: f64 = 1.0 - 0.7;
 /// ghostty's drag icon: the surface scaled by 0.2.
 pub const DRAG_PREVIEW_SCALE: f64 = 0.2;
 /// ghostty's GTK stylesheet and its runtime rules.

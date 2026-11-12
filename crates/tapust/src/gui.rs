@@ -15,14 +15,17 @@ use std::time::{Duration, Instant};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use mux::{
-    Command, ConfirmTarget, Copied, CopyResult, Effect, InputKind, KeyResult, ModeKeys, Node, Overlay, PaneId, Rect,
-    Server, Session,
+    Command, ConfirmTarget, Copied, CopyResult, Effect, InputKind, KeyResult, ModeKeys, NewAt, Node, Overlay, PaneId,
+    Rect, Server, Session,
 };
 use term::Rgb;
 
 use crate::attention::Attention;
 use crate::bindings::{Binding, Press, Scroll};
-use crate::config::{self, Command as ConfigCommand, Config, ConfirmClose, Diagnostic, WorkingDirectory};
+use crate::config::{
+    self, Command as ConfigCommand, Config, ConfirmClose, Decoration, Diagnostic, NewTabPosition, ShowTabBar, Subtitle,
+    TabsLocation, Theme, TitlebarStyle, WindowTheme, WorkingDirectory,
+};
 use crate::font;
 use crate::input;
 use crate::notifications;
@@ -92,8 +95,13 @@ pub struct App {
     /// for the first pane, the editor for Open Configuration in New Window.
     command: RefCell<Option<Vec<OsString>>>,
     config: RefCell<Rc<Config>>,
+    /// The configuration was read for a dark style (ghostty's conditional
+    /// theme state).
+    theme_dark: Cell<bool>,
     /// The stylesheet, whose runtime rules follow the configuration.
     css: gtk::CssProvider,
+    /// The gtk-custom-css files, over the stylesheet.
+    custom_css: RefCell<Vec<gtk::CssProvider>>,
     /// ghostty's config errors dialog while it is open, with its text. A
     /// dialog presented as a window does not tell when it closes: it is gone
     /// once its window is.
@@ -113,6 +121,14 @@ struct Window {
     tab_view: adw::TabView,
     toasts: adw::ToastOverlay,
     title: adw::WindowTitle,
+    header: adw::HeaderBar,
+    tab_bar: adw::TabBar,
+    toolbar: adw::ToolbarView,
+    /// The header bar's buttons and the window's at the start and end of
+    /// the tab bar, for gtk-titlebar-style = tabs.
+    tab_bar_buttons: [gtk::Box; 2],
+    /// Where the tab bar is now.
+    tabs_location: Cell<TabsLocation>,
     /// Set while the application changes GTK, so its own changes do not
     /// come back as user actions.
     syncing: Cell<bool>,
@@ -280,6 +296,38 @@ fn split_menu() -> gio::Menu {
     menu
 }
 
+/// ghostty's header bar buttons: New Tab with the split menu, View Open
+/// Tabs and the main menu; `flat` in the tab bar.
+fn header_buttons(overview: &adw::TabOverview, flat: bool) -> (adw::SplitButton, gtk::ToggleButton, gtk::MenuButton) {
+    let new_tab = adw::SplitButton::builder()
+        .icon_name("tab-new-symbolic")
+        .tooltip_text("New Tab")
+        .dropdown_tooltip("New Split")
+        .menu_model(&split_menu())
+        .can_focus(false)
+        .focus_on_click(false)
+        .build();
+    let overview_toggle = gtk::ToggleButton::builder()
+        .icon_name("view-grid-symbolic")
+        .tooltip_text("View Open Tabs")
+        .can_focus(false)
+        .focus_on_click(false)
+        .build();
+    overview.bind_property("open", &overview_toggle, "active").bidirectional().sync_create().build();
+    let menu = gtk::MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .menu_model(&main_menu())
+        .tooltip_text("Main Menu")
+        .can_focus(false)
+        .build();
+    if flat {
+        new_tab.add_css_class("flat");
+        overview_toggle.add_css_class("flat");
+        menu.add_css_class("flat");
+    }
+    (new_tab, overview_toggle, menu)
+}
+
 fn section(items: &[(&str, &str)]) -> gio::Menu {
     let s = gio::Menu::new();
     for (label, action) in items {
@@ -372,7 +420,6 @@ fn main_menu() -> gio::Menu {
 
 impl App {
     pub fn build(application: &adw::Application, command: Option<Vec<OsString>>) -> Rc<App> {
-        let (config, diagnostics) = config::load(&font::family_exists);
         let display = gdk::Display::default().expect("display");
         let css = gtk::CssProvider::new();
         gtk::style_context_add_provider_for_display(&display, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -383,15 +430,20 @@ impl App {
             owners: RefCell::new(HashMap::new()),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             command: RefCell::new(command),
-            config: RefCell::new(Rc::new(config)),
+            config: RefCell::new(Rc::new(Config::default())),
+            theme_dark: Cell::new(false),
             css,
+            custom_css: RefCell::new(Vec::new()),
             errors: RefCell::new(None),
             last_notification: Cell::new(None),
             attention: Attention::new(&display),
         });
         APP.with(|a| *a.borrow_mut() = Some(app.clone()));
-        app.apply_config();
+        let (config, mut diagnostics) = app.read_config();
+        *app.config.borrow_mut() = Rc::new(config);
+        diagnostics.extend(app.apply_config());
         app.add_actions();
+        app.follow_style();
         app.new_window(None);
         // ghostty shows the errors of the configuration it starts with on
         // their own, not knowing whether a window will come.
@@ -403,31 +455,111 @@ impl App {
         self.config.borrow().clone()
     }
 
+    /// The configuration file read over the theme for the style it asks
+    /// for: a light and dark theme pair takes the side the desktop is on,
+    /// unless window-theme forces one.
+    fn read_config(&self) -> (Config, Vec<Diagnostic>) {
+        let style = self.application.style_manager();
+        let dark = style.is_dark();
+        let (config, diagnostics) = config::load(&font::family_exists, dark);
+        self.theme_dark.set(dark);
+        if config.theme.as_ref().is_some_and(Theme::conditional) {
+            style.set_color_scheme(color_scheme(&config));
+            if style.is_dark() != dark {
+                self.theme_dark.set(!dark);
+                return config::load(&font::family_exists, !dark);
+            }
+        }
+        (config, diagnostics)
+    }
+
     /// What the configuration sets for the whole application: ghostty's
-    /// window-theme = auto, its runtime stylesheet, and tmux's prefix and
-    /// mode-keys.
-    fn apply_config(&self) {
+    /// window-theme, its runtime stylesheet, the gtk-custom-css files, and
+    /// tmux's prefix and mode-keys. Returns the stylesheets' errors.
+    fn apply_config(&self) -> Vec<Diagnostic> {
         let config = self.config();
-        // The scheme follows how light the terminal background is
-        // (perceived luminance).
-        let Rgb { r, g, b } = config.background;
-        let luminance = (0.299 * f64::from(r) + 0.587 * f64::from(g) + 0.114 * f64::from(b)) / 255.0;
-        let scheme = if luminance > 0.5 { adw::ColorScheme::PreferLight } else { adw::ColorScheme::PreferDark };
-        self.application.style_manager().set_color_scheme(scheme);
+        self.application.style_manager().set_color_scheme(color_scheme(&config));
+        self.sync_css_scheme();
         self.css.load_from_string(&css(&config));
+        let errors = self.load_custom_css(&config);
         self.server.set_prefix(config.tmux_prefix);
         self.server.set_mode_keys(mode_keys(&config));
+        errors
+    }
+
+    /// ghostty's loadCustomCss: each gtk-custom-css file in a stylesheet over
+    /// tapust's own, with its parsing errors, which ghostty only logs.
+    fn load_custom_css(&self, config: &Config) -> Vec<Diagnostic> {
+        let display = gdk::Display::default().expect("display");
+        for provider in self.custom_css.take() {
+            gtk::style_context_remove_provider_for_display(&display, &provider);
+        }
+        let errors = Rc::new(RefCell::new(Vec::new()));
+        let scheme = css_scheme(&self.application.style_manager());
+        let mut providers = Vec::new();
+        for sheet in &config.gtk_custom_css {
+            let provider = gtk::CssProvider::builder().prefers_color_scheme(scheme).build();
+            let (found, path) = (Rc::downgrade(&errors), sheet.path.clone());
+            // The errors are told once: not again when the style changes and
+            // GTK parses the file anew.
+            provider.connect_parsing_error(move |_, section, error| {
+                let Some(found) = found.upgrade() else { return };
+                let start = section.start_location();
+                let message = format!("css parsing failed at column {}: {}", start.line_chars() + 1, error.message());
+                let location = Some((path.clone(), start.lines() + 1));
+                found.borrow_mut().push(Diagnostic { location, key: String::new(), message });
+            });
+            provider.load_from_string(&sheet.css);
+            gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_USER);
+            providers.push(provider);
+        }
+        *self.custom_css.borrow_mut() = providers;
+        errors.take()
+    }
+
+    /// ghostty's handleStyleManagerDark for the stylesheets: their
+    /// `prefers-color-scheme` media queries follow the style.
+    fn sync_css_scheme(&self) {
+        let scheme = css_scheme(&self.application.style_manager());
+        for provider in std::iter::once(&self.css).chain(self.custom_css.borrow().iter()) {
+            provider.set_prefers_color_scheme(scheme);
+        }
+    }
+
+    /// A light and dark theme pair follows the desktop: once its style
+    /// changes, the configuration is read again (ghostty's soft reload).
+    fn follow_style(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.application.style_manager().connect_dark_notify(move |style| {
+            let Some(app) = weak.upgrade() else { return };
+            app.sync_css_scheme();
+            let conditional = app.config().theme.as_ref().is_some_and(Theme::conditional);
+            if conditional && style.is_dark() != app.theme_dark.get() {
+                // Not while the color scheme that changed it is being set.
+                let weak = Rc::downgrade(&app);
+                glib::idle_add_local_once(move || {
+                    if let Some(app) = weak.upgrade()
+                        && app.application.style_manager().is_dark() != app.theme_dark.get()
+                    {
+                        app.reload_config();
+                    }
+                });
+            }
+        });
     }
 
     /// ghostty's reload_config: the file read again, and what it sets
-    /// applied to the application and every pane, whose programs go on.
+    /// applied to the application, every window and every pane, whose
+    /// programs go on.
     fn reload_config(self: &Rc<Self>) {
-        let (config, diagnostics) = config::load(&font::family_exists);
+        let (config, mut diagnostics) = self.read_config();
         let config = Rc::new(config);
         *self.config.borrow_mut() = config.clone();
-        self.apply_config();
+        diagnostics.extend(self.apply_config());
         let keys = self.server.mode_keys();
         for window in self.windows() {
+            window.sync_appearance();
+            window.queue_reconcile();
             let surfaces: Vec<Rc<Surface>> = window.state.borrow().panes.values().map(|p| p.surface.clone()).collect();
             for surface in surfaces {
                 surface.apply_config(config.clone());
@@ -733,39 +865,34 @@ impl Window {
 
         let title = adw::WindowTitle::new("tapust", "");
         let header = adw::HeaderBar::builder().title_widget(&title).build();
-        let new_tab = adw::SplitButton::builder()
-            .icon_name("tab-new-symbolic")
-            .tooltip_text("New Tab")
-            .dropdown_tooltip("New Split")
-            .menu_model(&split_menu())
-            .can_focus(false)
-            .focus_on_click(false)
-            .build();
+        let overview = adw::TabOverview::builder().view(&tab_view).enable_new_tab(true).build();
+        let (new_tab, overview_toggle, menu) = header_buttons(&overview, false);
         header.pack_start(&new_tab);
         let end = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        let overview_toggle = gtk::ToggleButton::builder()
-            .icon_name("view-grid-symbolic")
-            .tooltip_text("View Open Tabs")
-            .can_focus(false)
-            .focus_on_click(false)
-            .build();
-        let menu = gtk::MenuButton::builder()
-            .icon_name("open-menu-symbolic")
-            .menu_model(&main_menu())
-            .tooltip_text("Main Menu")
-            .can_focus(false)
-            .build();
         end.append(&overview_toggle);
         end.append(&menu);
         header.pack_end(&end);
 
+        // ghostty's tab bar, which takes the header bar's place with
+        // gtk-titlebar-style = tabs: its buttons, flat, and the window's.
         let tab_bar = adw::TabBar::builder().view(&tab_view).autohide(true).expand_tabs(true).build();
-        let toolbar = adw::ToolbarView::builder().top_bar_style(adw::ToolbarStyle::Raised).bottom_bar_style(adw::ToolbarStyle::Raised).build();
+        let (tab_new_tab, tab_overview_toggle, tab_menu) = header_buttons(&overview, true);
+        let start = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        start.append(&gtk::WindowControls::new(gtk::PackType::Start));
+        start.append(&tab_new_tab);
+        let end = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        end.append(&tab_overview_toggle);
+        end.append(&tab_menu);
+        end.append(&gtk::WindowControls::new(gtk::PackType::End));
+
+        let toolbar = adw::ToolbarView::builder()
+            .top_bar_style(adw::ToolbarStyle::Raised)
+            .bottom_bar_style(adw::ToolbarStyle::Raised)
+            .build();
         toolbar.add_top_bar(&header);
         toolbar.add_top_bar(&tab_bar);
         toolbar.set_content(Some(&content));
-        let overview = adw::TabOverview::builder().view(&tab_view).enable_new_tab(true).child(&toolbar).build();
-        overview.bind_property("open", &overview_toggle, "active").bidirectional().sync_create().build();
+        overview.set_child(Some(&toolbar));
 
         let window = adw::ApplicationWindow::builder()
             .application(&app.application)
@@ -776,8 +903,6 @@ impl Window {
         window.set_property("handle-menubar-accel", false);
         window.add_css_class("window");
         window.set_icon_name(Some(theme::ICON));
-        // ghostty's headerbar-visible: never shown while fullscreen.
-        window.connect_fullscreened_notify(move |w| header.set_visible(!w.is_fullscreen()));
         // ghostty's handleActiveState: an active window needs no attention.
         let attention = app.attention.clone();
         window.connect_is_active_notify(move |w| {
@@ -802,6 +927,11 @@ impl Window {
             tab_view,
             toasts,
             title,
+            header,
+            tab_bar,
+            toolbar,
+            tab_bar_buttons: [start, end],
+            tabs_location: Cell::new(TabsLocation::Top),
             syncing: Cell::new(false),
             reconcile_pending: Cell::new(false),
             restore_focus_pending: Cell::new(false),
@@ -813,12 +943,28 @@ impl Window {
             closing: Cell::new(false),
         });
 
+        for button in [new_tab, tab_new_tab] {
+            let weak = Rc::downgrade(&win);
+            button.connect_clicked(move |_| {
+                if let Some(win) = weak.upgrade() {
+                    win.new_tab();
+                }
+            });
+        }
+        // ghostty's syncAppearance follows the window's state too.
         let weak = Rc::downgrade(&win);
-        new_tab.connect_clicked(move |_| {
+        win.window.connect_fullscreened_notify(move |_| {
             if let Some(win) = weak.upgrade() {
-                win.command(Command::NewWindow { cwd_of_active: true, after: true });
+                win.sync_appearance();
             }
         });
+        let weak = Rc::downgrade(&win);
+        win.window.connect_maximized_notify(move |_| {
+            if let Some(win) = weak.upgrade() {
+                win.sync_appearance();
+            }
+        });
+        win.sync_appearance();
         win.connect_tabs(&overview);
         win.connect_overview();
         let weak = Rc::downgrade(&win);
@@ -826,6 +972,72 @@ impl Window {
         win.add_actions();
         win.start_timers();
         win
+    }
+
+    /// ghostty's syncAppearance and the window properties its blueprint
+    /// binds: the decorations, the header bar, the tab bar and its place,
+    /// the bars' style, and the window's background behind a translucent
+    /// terminal.
+    fn sync_appearance(&self) {
+        let config = self.app.config();
+        let window = &self.window;
+        for class in ["ssd", "csd", "solid-csd", "no-border-radius"] {
+            window.remove_css_class(class);
+        }
+        let csd = config.window_decoration != Decoration::None;
+        window.set_decorated(csd);
+        if csd {
+            // GTK's own test for a compositor that shows the shadows.
+            let display = WidgetExt::display(window);
+            window.add_css_class(if display.is_rgba() && display.is_composited() { "csd" } else { "solid-csd" });
+        } else {
+            window.add_css_class("ssd");
+            window.add_css_class("no-border-radius");
+        }
+        let hidden_maximized = window.is_maximized() && config.gtk_titlebar_hide_when_maximized;
+        let tabs_title = config.gtk_titlebar_style == TitlebarStyle::Tabs;
+        let header = csd && !window.is_fullscreen() && !hidden_maximized && !tabs_title && config.gtk_titlebar;
+        self.header.set_visible(header);
+        let (autohide, visible) = match config.window_show_tab_bar {
+            _ if tabs_title => (false, !hidden_maximized),
+            ShowTabBar::Always => (false, true),
+            ShowTabBar::Auto => (true, true),
+            ShowTabBar::Never => (true, false),
+        };
+        self.tab_bar.set_autohide(autohide);
+        self.tab_bar.set_visible(visible);
+        self.tab_bar.set_expand_tabs(config.gtk_wide_tabs);
+        self.tab_bar.set_inverted(config.gtk_tabs_inverted);
+        // ghostty hides the boxes, whose places keep libadwaita's padding.
+        let [start, end] = &self.tab_bar_buttons;
+        self.tab_bar.set_start_action_widget(tabs_title.then_some(start));
+        self.tab_bar.set_end_action_widget(tabs_title.then_some(end));
+        self.overview.set_inverted(config.gtk_tabs_inverted);
+        self.overview.set_show_start_title_buttons(csd);
+        self.overview.set_show_end_title_buttons(csd);
+        self.toolbar.set_top_bar_style(config.gtk_toolbar_style);
+        self.toolbar.set_bottom_bar_style(config.gtk_toolbar_style);
+        if config.background_opacity >= 1.0 {
+            window.add_css_class("background");
+        } else {
+            window.remove_css_class("background");
+        }
+        if self.tabs_location.replace(config.gtk_tabs_location) != config.gtk_tabs_location {
+            self.toolbar.remove(&self.tab_bar);
+            match config.gtk_tabs_location {
+                TabsLocation::Top => self.toolbar.add_top_bar(&self.tab_bar),
+                TabsLocation::Bottom => self.toolbar.add_bottom_bar(&self.tab_bar),
+            }
+        }
+    }
+
+    /// ghostty's new tab, at window-new-tab-position.
+    fn new_tab(self: &Rc<Self>) {
+        let at = match self.app.config().window_new_tab_position {
+            NewTabPosition::Current => NewAt::AfterCurrent,
+            NewTabPosition::End => NewAt::AfterLast,
+        };
+        self.command(Command::NewWindow { cwd_of_active: true, at });
     }
 
     fn connect_tabs(self: &Rc<Self>, overview: &adw::TabOverview) {
@@ -904,7 +1116,7 @@ impl Window {
                 win.state.borrow_mut().session = session;
                 win.apply(effects);
             } else {
-                win.command(Command::NewWindow { cwd_of_active: true, after: true });
+                win.new_tab();
             }
             win.reconcile();
             win.tab_view.selected_page().expect("new tab")
@@ -1043,7 +1255,7 @@ impl Window {
         {
             add(name, Box::new(move |win| win.command(Command::SplitWindow { horizontal, before, full: false, cwd_of_active: true })));
         }
-        add("new-tab", Box::new(|win| win.command(Command::NewWindow { cwd_of_active: true, after: true })));
+        add("new-tab", Box::new(|win| win.new_tab()));
         add("new-window", Box::new(|win| {
             let parent = win.state.borrow().session.active_pane();
             win.app.new_window(Some(parent));
@@ -1151,6 +1363,24 @@ impl Window {
         surface.set_bell_ringing(true);
     }
 
+    /// ghostty's initial_size at the first surface's init: window-width x
+    /// window-height cells and the padding, in logical pixels, and the bars
+    /// above and below the tabs, which ghostty's estimate leaves out so that
+    /// its grid comes out smaller than configured.
+    fn initial_size(&self, (cw, ch): (u32, u32), scale: f64, (pad_x, pad_y): (u32, u32)) {
+        let config = self.app.config();
+        if config.window_width == 0 || config.window_height == 0 {
+            return;
+        }
+        let logical = |cells: u32, cell: u32, pad: u32| (f64::from(cells * cell + pad) / scale).ceil() as i32;
+        // The toolbar view stacks its bars and its content.
+        let natural = |widget: &gtk::Widget| widget.measure(gtk::Orientation::Vertical, -1).1;
+        let content = self.toolbar.content().expect("the toolbar's content");
+        let bars = natural(self.toolbar.upcast_ref()) - natural(&content);
+        let (width, height) = (logical(config.window_width, cw, pad_x), logical(config.window_height, ch, pad_y));
+        self.window.set_default_size(width, height + bars);
+    }
+
     fn window_of_page(&self, page: &adw::TabPage) -> Option<u32> {
         let id = self.tab_of(page)?;
         self.state.borrow().session.windows().into_iter().find(|w| w.id == id).map(|w| w.index)
@@ -1202,11 +1432,12 @@ impl Window {
                 self.queue_reconcile();
                 true
             }
-            Event::CellSize { cell: (cw, ch) } => {
+            Event::CellSize { cell: (cw, ch), scale, padding } => {
                 // ghostty's size_limit at the first surface's init: ten
                 // columns and four rows of device pixels, used as logical.
                 if !self.min_size_set.replace(true) {
                     self.window.set_size_request((cw * 10) as i32, (ch * 4) as i32);
+                    self.initial_size((cw, ch), scale, padding);
                 }
                 true
             }
@@ -1812,6 +2043,12 @@ impl Window {
                 if !detached {
                     self.tab_view.set_selected_page(&page);
                 }
+                // ghostty's computed_subtitle.
+                let subtitle = match self.app.config().window_subtitle {
+                    Subtitle::False => None,
+                    Subtitle::WorkingDirectory => pwd.as_deref(),
+                };
+                self.title.set_subtitle(subtitle.unwrap_or(""));
                 // The override only replaces the header bar's title; the
                 // window keeps the tab's title (ghostty's closureTitle).
                 let shown = self.state.borrow().window_title_override.clone().unwrap_or_else(|| title.clone());
@@ -2440,15 +2677,74 @@ fn wake(pane: PaneId) {
     }
 }
 
-/// ghostty's style.css and runtime CSS rules that apply to tapust: the
-/// unfocused-split-fill is the background.
+/// ghostty's colorScheme: the window's light or dark style. The terminal
+/// background decides for auto and ghostty, except with a light and dark
+/// theme pair, whose side follows the desktop.
+fn color_scheme(config: &Config) -> adw::ColorScheme {
+    match config.window_theme {
+        WindowTheme::Auto | WindowTheme::Ghostty if config.theme.as_ref().is_some_and(Theme::conditional) => {
+            adw::ColorScheme::PreferLight
+        }
+        WindowTheme::Auto | WindowTheme::Ghostty => {
+            // Perceived luminance.
+            let Rgb { r, g, b } = config.background;
+            let luminance = (0.299 * f64::from(r) + 0.587 * f64::from(g) + 0.114 * f64::from(b)) / 255.0;
+            if luminance > 0.5 { adw::ColorScheme::PreferLight } else { adw::ColorScheme::PreferDark }
+        }
+        WindowTheme::System => adw::ColorScheme::PreferLight,
+        WindowTheme::Light => adw::ColorScheme::ForceLight,
+        WindowTheme::Dark => adw::ColorScheme::ForceDark,
+    }
+}
+
+fn css_scheme(style: &adw::StyleManager) -> gtk::InterfaceColorScheme {
+    if style.is_dark() { gtk::InterfaceColorScheme::Dark } else { gtk::InterfaceColorScheme::Light }
+}
+
+/// ghostty's style.css and the runtime CSS rules of loadRuntimeCss that
+/// apply to tapust.
 fn css(config: &Config) -> String {
-    let Rgb { r, g, b } = config.background;
-    format!(
-        "{}\nwidget.unfocused-split {{\n opacity: {:.2};\n background-color: rgb({r},{g},{b});\n}}\n",
-        theme::GHOSTTY_CSS,
-        theme::UNFOCUSED_ALPHA
-    )
+    let rgb = |Rgb { r, g, b }: Rgb| format!("rgb({r},{g},{b})");
+    let mut css = format!("{}\n", theme::GHOSTTY_CSS);
+    if config.window_theme == WindowTheme::Ghostty {
+        let fg = rgb(config.window_titlebar_foreground.unwrap_or(config.foreground));
+        let bg = rgb(config.window_titlebar_background.unwrap_or(config.background));
+        css.push_str(&format!(
+            ":root {{
+  --ghostty-fg: {fg};
+  --ghostty-bg: {bg};
+  --headerbar-fg-color: var(--ghostty-fg);
+  --headerbar-bg-color: var(--ghostty-bg);
+  --headerbar-backdrop-color: oklab(from var(--headerbar-bg-color) calc(l * 0.9) a b / alpha);
+  --overview-fg-color: var(--ghostty-fg);
+  --overview-bg-color: var(--ghostty-bg);
+  --popover-fg-color: var(--ghostty-fg);
+  --popover-bg-color: var(--ghostty-bg);
+  --window-fg-color: var(--ghostty-fg);
+  --window-bg-color: var(--ghostty-bg);
+}}
+listview.command-palette-view {{
+  --view-fg-color: var(--ghostty-fg);
+  --view-bg-color: var(--ghostty-bg);
+}}
+windowhandle {{
+  background-color: var(--headerbar-bg-color);
+  color: var(--headerbar-fg-color);
+}}
+windowhandle:backdrop {{
+ background-color: var(--headerbar-backdrop-color);
+}}
+"
+        ));
+    }
+    let fill = rgb(config.unfocused_split_fill.unwrap_or(config.background));
+    let opacity = 1.0 - config.unfocused_split_opacity;
+    css.push_str(&format!("widget.unfocused-split {{\n opacity: {opacity:.2};\n background-color: {fill};\n}}\n"));
+    if let Some(color) = config.split_divider_color {
+        let color = rgb(color);
+        css.push_str(&format!(".window .split paned > separator {{\n  color: {color};\n  background: {color};\n}}\n"));
+    }
+    css
 }
 
 /// tmux-mode-keys, else tmux's main's choice from $VISUAL or $EDITOR.

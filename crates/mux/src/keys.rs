@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::copy::{self, ModeAction};
 use crate::prompt::PromptKind;
-use crate::{Command, Direction, Effect, Key, KeyCode, KeyResult, Layout, Mods, Session};
+use crate::{Command, Direction, Effect, Key, KeyCode, KeyResult, Layout, Mods, NewAt, Session};
 
 /// The `repeat-time` option.
 pub(crate) const REPEAT_TIME: Duration = Duration::from_millis(500);
@@ -180,7 +180,7 @@ pub(crate) fn prefix_binding(key: Key) -> Option<Binding> {
             'J' => bind(true, Action::Run(Command::ResizePane(Down, 5))),
             'K' => bind(true, Action::Run(Command::ResizePane(Up, 5))),
             'L' => bind(true, Action::Run(Command::ResizePane(Right, 5))),
-            'c' => run(Command::NewWindow { cwd_of_active: true, after: false }),
+            'c' => run(Command::NewWindow { cwd_of_active: true, at: NewAt::Free }),
             'h' => run(Command::SelectPane(Left)),
             'j' => run(Command::SelectPane(Down)),
             'k' => run(Command::SelectPane(Up)),

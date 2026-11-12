@@ -211,6 +211,15 @@ pub struct CopyResult {
     pub search: Option<PaneSearch>,
 }
 
+/// Where new-window puts its window: at the first free index, after the
+/// current window (`-a`), or after the last one (`-a -t :{end}`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewAt {
+    Free,
+    AfterCurrent,
+    AfterLast,
+}
+
 /// A command of the model, named after the tmux command and flags it
 /// reproduces. Every command acts on the current window and its active pane,
 /// as a key binding does.
@@ -224,10 +233,9 @@ pub enum Command {
         full: bool,
         cwd_of_active: bool,
     },
-    /// `new-window`, with `-c "#{pane_current_path}"` when `cwd_of_active`.
-    /// new-window, with `-a` (`after`) to insert it after the current
-    /// window instead of at the first free index.
-    NewWindow { cwd_of_active: bool, after: bool },
+    /// `new-window`, with `-c "#{pane_current_path}"` when `cwd_of_active`,
+    /// at `at`.
+    NewWindow { cwd_of_active: bool, at: NewAt },
     /// `select-pane -L/-R/-U/-D`.
     SelectPane(Direction),
     /// `select-pane -l` (`last-pane`).
@@ -299,8 +307,13 @@ impl fmt::Display for Command {
                 let side = if *horizontal { 'h' } else { 'v' };
                 write!(f, "split-window -{}{}{side}{}", opt(*before, "b"), opt(*full, "f"), opt(*cwd_of_active, CWD))
             }
-            Command::NewWindow { cwd_of_active, after } => {
-                write!(f, "new-window{}{}", opt(*after, " -a"), opt(*cwd_of_active, CWD))
+            Command::NewWindow { cwd_of_active, at } => {
+                let at = match at {
+                    NewAt::Free => "",
+                    NewAt::AfterCurrent => " -a",
+                    NewAt::AfterLast => " -a -t :{end}",
+                };
+                write!(f, "new-window{at}{}", opt(*cwd_of_active, CWD))
             }
             Command::SelectPane(dir) => write!(f, "select-pane {}", flag(*dir)),
             Command::LastPane => f.write_str("last-pane"),

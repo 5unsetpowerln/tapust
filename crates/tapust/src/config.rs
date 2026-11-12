@@ -3,7 +3,7 @@
 //! lines and `#` comments, with ghostty's names and values for the options
 //! ghostty has and tapust's for the tmux ones. A line that cannot be applied
 //! is a diagnostic at its place and leaves its option as it was; the other
-//! lines still apply.
+//! lines still apply. A `theme` is read first, the user's lines over it.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
@@ -16,7 +16,7 @@ use mux::{Key, ModeKeys};
 use term::{CursorShape, Palette, Rgb};
 
 use crate::bindings::{Keybinds, MAX_POINTS, MIN_POINTS};
-use crate::theme;
+use crate::{theme, themes};
 
 /// ghostty's TerminalColor: a color, or the colors of the cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +57,100 @@ pub enum ConfirmClose {
     Always,
 }
 
+/// ghostty's Theme: the theme for a light and for a dark desktop, the same
+/// one unless `light:` and `dark:` name two.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Theme {
+    pub light: String,
+    pub dark: String,
+}
+
+impl Theme {
+    /// The theme follows the desktop's light or dark style.
+    pub fn conditional(&self) -> bool {
+        self.light != self.dark
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowTheme {
+    /// Light or dark as the terminal background is.
+    Auto,
+    System,
+    Light,
+    Dark,
+    /// As auto, with the window in the terminal's colors.
+    Ghostty,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TitlebarStyle {
+    Native,
+    /// The tab bar is the title bar.
+    Tabs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabsLocation {
+    Top,
+    Bottom,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShowTabBar {
+    Always,
+    /// With two tabs or more.
+    Auto,
+    Never,
+}
+
+/// ghostty's window-decoration without `server`: GTK announces client-side
+/// decorations for a libadwaita window, and tapust does not ask the
+/// compositor for its own as ghostty does with KDE's protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decoration {
+    Auto,
+    Client,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Subtitle {
+    False,
+    WorkingDirectory,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewTabPosition {
+    /// After the current tab.
+    Current,
+    End,
+}
+
+/// ghostty's window-padding-balance: leftover space split around the grid,
+/// with `true` keeping the top padding near the side padding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaddingBalance {
+    False,
+    True,
+    Equal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaddingColor {
+    Background,
+    /// The nearest cell's background, unless ghostty's heuristics say no.
+    Extend,
+    ExtendAlways,
+}
+
+/// A `gtk-custom-css` file and its text, read with the configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stylesheet {
+    pub path: PathBuf,
+    pub css: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     /// `font-family`: one family, as tapust has no fallback families.
@@ -71,6 +165,41 @@ pub struct Config {
     pub cursor_style_blink: Option<bool>,
     pub selection_foreground: Option<TerminalColor>,
     pub selection_background: Option<TerminalColor>,
+    /// The theme the colors above were read over, if any.
+    pub theme: Option<Theme>,
+    pub window_theme: WindowTheme,
+    /// ghostty's window-titlebar-background and -foreground for
+    /// window-theme = ghostty; unset, the terminal's colors.
+    pub window_titlebar_background: Option<Rgb>,
+    pub window_titlebar_foreground: Option<Rgb>,
+    pub background_opacity: f64,
+    pub background_opacity_cells: bool,
+    pub unfocused_split_opacity: f64,
+    /// Unset, the background.
+    pub unfocused_split_fill: Option<Rgb>,
+    /// Unset, libadwaita's window background.
+    pub split_divider_color: Option<Rgb>,
+    pub gtk_titlebar: bool,
+    pub gtk_titlebar_hide_when_maximized: bool,
+    pub gtk_titlebar_style: TitlebarStyle,
+    pub gtk_tabs_location: TabsLocation,
+    pub gtk_tabs_inverted: bool,
+    pub gtk_wide_tabs: bool,
+    pub gtk_toolbar_style: adw::ToolbarStyle,
+    pub window_show_tab_bar: ShowTabBar,
+    pub window_decoration: Decoration,
+    pub window_subtitle: Subtitle,
+    pub window_new_tab_position: NewTabPosition,
+    /// The initial grid of a new window, in cells; 0 leaves the size to GTK.
+    pub window_width: u32,
+    pub window_height: u32,
+    /// `window-padding-x` (left, right) and `window-padding-y` (top,
+    /// bottom), in points.
+    pub window_padding_x: (u32, u32),
+    pub window_padding_y: (u32, u32),
+    pub window_padding_balance: PaddingBalance,
+    pub window_padding_color: PaddingColor,
+    pub gtk_custom_css: Vec<Stylesheet>,
     /// `command`: unset, the login shell as a login shell.
     pub command: Option<Command>,
     pub working_directory: WorkingDirectory,
@@ -100,6 +229,33 @@ impl Default for Config {
             cursor_style_blink: None,
             selection_foreground: None,
             selection_background: None,
+            theme: None,
+            window_theme: WindowTheme::Auto,
+            window_titlebar_background: None,
+            window_titlebar_foreground: None,
+            background_opacity: 1.0,
+            background_opacity_cells: false,
+            unfocused_split_opacity: 0.7,
+            unfocused_split_fill: None,
+            split_divider_color: None,
+            gtk_titlebar: true,
+            gtk_titlebar_hide_when_maximized: false,
+            gtk_titlebar_style: TitlebarStyle::Native,
+            gtk_tabs_location: TabsLocation::Top,
+            gtk_tabs_inverted: false,
+            gtk_wide_tabs: true,
+            gtk_toolbar_style: adw::ToolbarStyle::Raised,
+            window_show_tab_bar: ShowTabBar::Auto,
+            window_decoration: Decoration::Auto,
+            window_subtitle: Subtitle::False,
+            window_new_tab_position: NewTabPosition::Current,
+            window_width: 0,
+            window_height: 0,
+            window_padding_x: (2, 2),
+            window_padding_y: (2, 2),
+            window_padding_balance: PaddingBalance::False,
+            window_padding_color: PaddingColor::Background,
+            gtk_custom_css: Vec::new(),
             command: None,
             working_directory: WorkingDirectory::Inherit,
             copy_on_select: CopyOnSelect::Primary,
@@ -179,11 +335,15 @@ pub fn home() -> Option<PathBuf> {
 }
 
 /// Reads the configuration file, which may be missing, and the files its
-/// `config-file` lines name; `font_exists` tells the font families there are.
-pub fn load(font_exists: &dyn Fn(&str) -> bool) -> (Config, Vec<Diagnostic>) {
+/// `config-file` lines name, over the theme they name (its dark one when
+/// `dark`); `font_exists` tells the font families there are.
+pub fn load(font_exists: &dyn Fn(&str) -> bool, dark: bool) -> (Config, Vec<Diagnostic>) {
     let mut loader = Loader::new(font_exists);
     match path() {
-        Ok(path) => loader.load(&path),
+        Ok(path) => {
+            loader.load(&path);
+            loader.load_theme(&path.with_file_name("themes"), dark);
+        }
         Err(message) => loader.error(message),
     }
     (loader.config, loader.diagnostics)
@@ -199,6 +359,14 @@ enum Error {
     Message(String),
 }
 
+/// A line that applied, to apply again over a theme (ghostty's replay step).
+struct Step {
+    key: String,
+    value: Option<String>,
+    dir: PathBuf,
+    location: (PathBuf, usize),
+}
+
 struct Loader<'a> {
     config: Config,
     diagnostics: Vec<Diagnostic>,
@@ -207,12 +375,52 @@ struct Loader<'a> {
     includes: Vec<(PathBuf, bool)>,
     next_include: usize,
     font_exists: &'a dyn Fn(&str) -> bool,
+    steps: Vec<Step>,
+    /// The theme file is being read: it cannot name another theme or file.
+    in_theme: bool,
 }
 
 impl Loader<'_> {
     fn new(font_exists: &dyn Fn(&str) -> bool) -> Loader<'_> {
         let config = Config::default();
-        Loader { config, diagnostics: Vec::new(), includes: Vec::new(), next_include: 0, font_exists }
+        Loader {
+            config,
+            diagnostics: Vec::new(),
+            includes: Vec::new(),
+            next_include: 0,
+            font_exists,
+            steps: Vec::new(),
+            in_theme: false,
+        }
+    }
+
+    /// ghostty's loadTheme: the configuration starts over from the theme's
+    /// file, found by name in `themes` and then among the bundled themes,
+    /// and the lines read so far apply again over it, so that they win
+    /// wherever they are.
+    fn load_theme(&mut self, themes: &Path, dark: bool) {
+        let Some(theme) = self.config.theme.clone() else { return };
+        let name = if dark { &theme.dark } else { &theme.light };
+        let (path, text) = match find_theme(name, themes) {
+            Ok(found) => found,
+            Err(messages) => {
+                // The last theme line is the one that took effect.
+                let location = self.steps.iter().rev().find(|s| s.key == "theme").map(|s| s.location.clone());
+                for message in messages {
+                    self.diagnostics.push(Diagnostic { location: location.clone(), key: "theme".to_owned(), message });
+                }
+                return;
+            }
+        };
+        let steps = std::mem::take(&mut self.steps);
+        self.config = Config::default();
+        self.in_theme = true;
+        self.text(&path, &text);
+        self.in_theme = false;
+        for step in &steps {
+            self.apply(&step.key, step.value.as_deref(), &step.dir, step.location.clone());
+        }
+        self.steps = steps;
     }
 
     fn error(&mut self, message: String) {
@@ -267,22 +475,36 @@ impl Loader<'_> {
                 None => (line, None),
             };
             let dir = path.parent().unwrap_or(Path::new("/"));
-            let Err(err) = self.set(key, value, dir) else { continue };
-            let values = valid_values(key);
-            let message = match err {
-                Error::Unknown => "unknown field".to_owned(),
-                Error::Required => format!("value required{values}"),
-                Error::Invalid => format!("invalid value \"{}\"{values}", value.unwrap_or_default()),
-                Error::Hint(hint) => format!("invalid value \"{}\", {hint}", value.unwrap_or_default()),
-                Error::Message(message) => message,
-            };
-            self.diagnostics.push(Diagnostic { location, key: key.to_owned(), message });
+            let location = (path.to_owned(), n + 1);
+            if self.apply(key, value, dir, location.clone()) && !self.in_theme && key != "config-file" {
+                let value = value.map(str::to_owned);
+                self.steps.push(Step { key: key.to_owned(), value, dir: dir.to_owned(), location });
+            }
         }
+    }
+
+    /// Applies one line, or tells why it could not at `location`.
+    fn apply(&mut self, key: &str, value: Option<&str>, dir: &Path, location: (PathBuf, usize)) -> bool {
+        let Err(err) = self.set(key, value, dir) else { return true };
+        let values = valid_values(key);
+        let message = match err {
+            Error::Unknown => "unknown field".to_owned(),
+            Error::Required => format!("value required{values}"),
+            Error::Invalid => format!("invalid value \"{}\"{values}", value.unwrap_or_default()),
+            Error::Hint(hint) => format!("invalid value \"{}\", {hint}", value.unwrap_or_default()),
+            Error::Message(message) => message,
+        };
+        self.diagnostics.push(Diagnostic { location: Some(location), key: key.to_owned(), message });
+        false
     }
 
     /// Applies one line; an empty value resets the option to its default
     /// (ghostty's parseIntoField), and a key alone sets a boolean.
     fn set(&mut self, key: &str, value: Option<&str>, dir: &Path) -> Result<(), Error> {
+        // ghostty ignores these in a theme without a word.
+        if self.in_theme && matches!(key, "theme" | "config-file") {
+            return Err(Error::Message(format!("a theme file cannot set {key}")));
+        }
         let default = Config::default();
         let c = &mut self.config;
         match key {
@@ -350,19 +572,82 @@ impl Loader<'_> {
                 c.tmux_prefix = or_default(value, default.tmux_prefix, |v| mux::parse_key(v).map_err(Error::Message))?
             }
             "tmux-mode-keys" => c.tmux_mode_keys = optional(value, |v| one_of(v, MODE_KEYS))?,
+            "theme" => c.theme = optional(value, theme)?,
+            "window-theme" => c.window_theme = or_default(value, default.window_theme, |v| one_of(v, WINDOW_THEMES))?,
+            "window-titlebar-background" => c.window_titlebar_background = optional(value, color)?,
+            "window-titlebar-foreground" => c.window_titlebar_foreground = optional(value, color)?,
+            "background-opacity" => {
+                c.background_opacity = or_default(value, default.background_opacity, |v| fraction(v, 0.0))?
+            }
+            "background-opacity-cells" => c.background_opacity_cells = flag(value, default.background_opacity_cells)?,
+            "unfocused-split-opacity" => {
+                // ghostty's lowest: a split any fainter is hard to make out.
+                let parse = |v: &str| fraction(v, 0.15);
+                c.unfocused_split_opacity = or_default(value, default.unfocused_split_opacity, parse)?
+            }
+            "unfocused-split-fill" => c.unfocused_split_fill = optional(value, color)?,
+            "split-divider-color" => c.split_divider_color = optional(value, color)?,
+            "gtk-titlebar" => c.gtk_titlebar = flag(value, default.gtk_titlebar)?,
+            "gtk-titlebar-hide-when-maximized" => {
+                c.gtk_titlebar_hide_when_maximized = flag(value, default.gtk_titlebar_hide_when_maximized)?
+            }
+            "gtk-titlebar-style" => {
+                c.gtk_titlebar_style = or_default(value, default.gtk_titlebar_style, |v| one_of(v, TITLEBAR_STYLES))?
+            }
+            "gtk-tabs-location" => {
+                c.gtk_tabs_location = or_default(value, default.gtk_tabs_location, |v| one_of(v, TABS_LOCATIONS))?
+            }
+            "gtk-tabs-inverted" => c.gtk_tabs_inverted = flag(value, default.gtk_tabs_inverted)?,
+            "gtk-wide-tabs" => c.gtk_wide_tabs = flag(value, default.gtk_wide_tabs)?,
+            "gtk-toolbar-style" => {
+                c.gtk_toolbar_style = or_default(value, default.gtk_toolbar_style, |v| one_of(v, TOOLBAR_STYLES))?
+            }
+            "window-show-tab-bar" => {
+                c.window_show_tab_bar = or_default(value, default.window_show_tab_bar, |v| one_of(v, SHOW_TAB_BAR))?
+            }
+            "window-decoration" => {
+                c.window_decoration = match value {
+                    None => Decoration::Auto,
+                    value => or_default(value, default.window_decoration, decoration)?,
+                }
+            }
+            "window-subtitle" => {
+                c.window_subtitle = or_default(value, default.window_subtitle, |v| one_of(v, SUBTITLES))?
+            }
+            "window-new-tab-position" => {
+                let parse = |v: &str| one_of(v, NEW_TAB_POSITIONS);
+                c.window_new_tab_position = or_default(value, default.window_new_tab_position, parse)?
+            }
+            "window-width" => c.window_width = or_default(value, default.window_width, |v| cells(v, 10, "wide"))?,
+            "window-height" => c.window_height = or_default(value, default.window_height, |v| cells(v, 4, "high"))?,
+            "window-padding-x" => c.window_padding_x = or_default(value, default.window_padding_x, padding)?,
+            "window-padding-y" => c.window_padding_y = or_default(value, default.window_padding_y, padding)?,
+            "window-padding-balance" => {
+                c.window_padding_balance = or_default(value, default.window_padding_balance, |v| match v {
+                    "true" => Ok(PaddingBalance::True),
+                    "false" => Ok(PaddingBalance::False),
+                    _ => one_of(v, PADDING_BALANCE),
+                })?
+            }
+            "window-padding-color" => {
+                let parse = |v: &str| one_of(v, PADDING_COLORS);
+                c.window_padding_color = or_default(value, default.window_padding_color, parse)?
+            }
+            "gtk-custom-css" => match required(value)? {
+                "" => c.gtk_custom_css.clear(),
+                file => {
+                    if let Some((path, optional)) = file_path(file, dir)?
+                        && let Some(css) = stylesheet(&path, optional)?
+                    {
+                        c.gtk_custom_css.push(Stylesheet { path, css });
+                    }
+                }
+            },
             "config-file" => match required(value)? {
                 "" => self.includes.truncate(self.next_include),
                 file => {
-                    let (optional, file) = match file.strip_prefix('?') {
-                        Some(file) => (true, unquote(file)),
-                        None => (false, file),
-                    };
-                    // ghostty ignores an empty path.
-                    if !file.is_empty() {
-                        let path = real_path(&dir.join(expand_home(file)?)).map_err(|err| {
-                            Error::Message(format!("error resolving file path {file}: {err}"))
-                        })?;
-                        self.includes.push((path, optional));
+                    if let Some(include) = file_path(file, dir)? {
+                        self.includes.push(include);
                     }
                 }
             },
@@ -371,6 +656,116 @@ impl Loader<'_> {
         Ok(())
     }
 }
+
+/// ghostty's Path.parse and expand: a file named relative to `dir` or the
+/// home directory, optional with a leading `?`; an empty name, which ghostty
+/// ignores, is none.
+fn file_path(value: &str, dir: &Path) -> Result<Option<(PathBuf, bool)>, Error> {
+    let (optional, file) = match value.strip_prefix('?') {
+        Some(file) => (true, unquote(file)),
+        None => (false, value),
+    };
+    if file.is_empty() {
+        return Ok(None);
+    }
+    let path = real_path(&dir.join(expand_home(file)?))
+        .map_err(|err| Error::Message(format!("error resolving file path {file}: {err}")))?;
+    Ok(Some((path, optional)))
+}
+
+/// ghostty's limit for one gtk-custom-css file.
+const CSS_LIMIT: u64 = 5 * 1024 * 1024;
+
+/// The text of a gtk-custom-css file; none for a missing optional one.
+fn stylesheet(path: &Path, optional: bool) -> Result<Option<String>, Error> {
+    let fail = |err: std::io::Error| {
+        Error::Message(format!("error opening gtk-custom-css file {}: {err}", path.display()))
+    };
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if optional && err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(fail(err)),
+    };
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(file, CSS_LIMIT + 1), &mut bytes).map_err(fail)?;
+    if bytes.len() as u64 > CSS_LIMIT {
+        return Err(Error::Message(format!("gtk-custom-css file {} is larger than 5 MiB", path.display())));
+    }
+    let css = String::from_utf8(bytes)
+        .map_err(|_| Error::Message(format!("gtk-custom-css file {} is not valid UTF-8", path.display())))?;
+    Ok(Some(css))
+}
+
+/// ghostty's Theme.parseCLI: one name or path, or `light:NAME,dark:NAME`
+/// in any order (a `,`, `:` or `=` makes a pair), with `~/` expanded.
+fn theme(value: &str) -> Result<Theme, Error> {
+    let name = |v: &str| -> Result<String, Error> {
+        let v = unquote(v.trim_matches([' ', '\t']));
+        match v.strip_prefix("~/") {
+            Some(_) => Ok(expand_home(v)?.to_string_lossy().into_owned()),
+            None => Ok(v.to_owned()),
+        }
+    };
+    if !value.contains([',', ':', '=']) {
+        let theme = name(value)?;
+        return Ok(Theme { light: theme.clone(), dark: theme });
+    }
+    let (mut light, mut dark) = (None, None);
+    for entry in value.split(',') {
+        let (key, theme) = entry.split_once(':').ok_or(Error::Invalid)?;
+        match key.trim_matches([' ', '\t']) {
+            "light" => light = Some(name(theme)?),
+            "dark" => dark = Some(name(theme)?),
+            _ => return Err(Error::Invalid),
+        }
+    }
+    match (light, dark) {
+        (Some(light), Some(dark)) => Ok(Theme { light, dark }),
+        _ => Err(Error::Hint("a theme pair needs both light: and dark:".to_owned())),
+    }
+}
+
+/// ghostty's theme.open: an absolute path, or a name looked up in the
+/// user's `themes` directory, then among the bundled themes. Returns the
+/// file's path (shown in its errors) and contents, or why there is none.
+fn find_theme(name: &str, themes: &Path) -> Result<(PathBuf, Vec<u8>), Vec<String>> {
+    let failed = |path: &Path, err| Some(format!("failed to load theme from \"{}\": {err}", path.display()));
+    let read = |path: &Path| match std::fs::metadata(path) {
+        Ok(meta) if !meta.is_file() => {
+            Err(Some(format!("not reading theme from \"{}\": it is not a file", path.display())))
+        }
+        Ok(_) => std::fs::read(path).map_err(|err| failed(path, err)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(None),
+        Err(err) => Err(failed(path, err)),
+    };
+    if Path::new(name).is_absolute() {
+        let path = PathBuf::from(name);
+        return match read(&path) {
+            Ok(text) => Ok((path, text)),
+            Err(Some(message)) => Err(vec![message]),
+            Err(None) => Err(vec![format!("failed to load theme from the path \"{name}\"")]),
+        };
+    }
+    if name.contains('/') {
+        return Err(vec![format!("theme \"{name}\" cannot include path separators unless it is an absolute path")]);
+    }
+    let user = themes.join(name);
+    match read(&user) {
+        Ok(text) => return Ok((user, text)),
+        Err(Some(message)) => return Err(vec![message]),
+        Err(None) => {}
+    }
+    match themes::bundled(name) {
+        Some(text) => Ok((Path::new(BUNDLED).join(name), text)),
+        None => Err(vec![
+            format!("theme \"{name}\" not found, tried path \"{}\"", user.display()),
+            format!("theme \"{name}\" not found among the themes bundled with tapust"),
+        ]),
+    }
+}
+
+/// Where the errors of a bundled theme say they are.
+const BUNDLED: &str = "(tapust's themes)";
 
 /// ghostty's Path.expand: the real path of a file, or of a missing one the
 /// path with `.` and `..` folded, so that a cycle is seen whatever the
@@ -433,6 +828,34 @@ const COPY_ON_SELECT: &[(&str, CopyOnSelect)] = &[
 const CONFIRM_CLOSE: &[(&str, ConfirmClose)] =
     &[("false", ConfirmClose::False), ("true", ConfirmClose::True), ("always", ConfirmClose::Always)];
 const MODE_KEYS: &[(&str, ModeKeys)] = &[("emacs", ModeKeys::Emacs), ("vi", ModeKeys::Vi)];
+const WINDOW_THEMES: &[(&str, WindowTheme)] = &[
+    ("auto", WindowTheme::Auto),
+    ("system", WindowTheme::System),
+    ("light", WindowTheme::Light),
+    ("dark", WindowTheme::Dark),
+    ("ghostty", WindowTheme::Ghostty),
+];
+const TITLEBAR_STYLES: &[(&str, TitlebarStyle)] = &[("native", TitlebarStyle::Native), ("tabs", TitlebarStyle::Tabs)];
+const TABS_LOCATIONS: &[(&str, TabsLocation)] = &[("top", TabsLocation::Top), ("bottom", TabsLocation::Bottom)];
+const TOOLBAR_STYLES: &[(&str, adw::ToolbarStyle)] = &[
+    ("flat", adw::ToolbarStyle::Flat),
+    ("raised", adw::ToolbarStyle::Raised),
+    ("raised-border", adw::ToolbarStyle::RaisedBorder),
+];
+const SHOW_TAB_BAR: &[(&str, ShowTabBar)] =
+    &[("always", ShowTabBar::Always), ("auto", ShowTabBar::Auto), ("never", ShowTabBar::Never)];
+const DECORATIONS: &[(&str, Decoration)] =
+    &[("auto", Decoration::Auto), ("client", Decoration::Client), ("none", Decoration::None)];
+const SUBTITLES: &[(&str, Subtitle)] = &[("false", Subtitle::False), ("working-directory", Subtitle::WorkingDirectory)];
+const NEW_TAB_POSITIONS: &[(&str, NewTabPosition)] =
+    &[("current", NewTabPosition::Current), ("end", NewTabPosition::End)];
+const PADDING_BALANCE: &[(&str, PaddingBalance)] =
+    &[("false", PaddingBalance::False), ("true", PaddingBalance::True), ("equal", PaddingBalance::Equal)];
+const PADDING_COLORS: &[(&str, PaddingColor)] = &[
+    ("background", PaddingColor::Background),
+    ("extend", PaddingColor::Extend),
+    ("extend-always", PaddingColor::ExtendAlways),
+];
 
 fn one_of<T: Copy>(value: &str, values: &[(&str, T)]) -> Result<T, Error> {
     values.iter().find(|(name, _)| *name == value).map(|&(_, v)| v).ok_or(Error::Invalid)
@@ -448,6 +871,16 @@ fn valid_values(key: &str) -> String {
         "copy-on-select" => names(COPY_ON_SELECT),
         "confirm-close-surface" => names(CONFIRM_CLOSE),
         "tmux-mode-keys" => names(MODE_KEYS),
+        "window-theme" => names(WINDOW_THEMES),
+        "gtk-titlebar-style" => names(TITLEBAR_STYLES),
+        "gtk-tabs-location" => names(TABS_LOCATIONS),
+        "gtk-toolbar-style" => names(TOOLBAR_STYLES),
+        "window-show-tab-bar" => names(SHOW_TAB_BAR),
+        "window-decoration" => names(DECORATIONS),
+        "window-subtitle" => names(SUBTITLES),
+        "window-new-tab-position" => names(NEW_TAB_POSITIONS),
+        "window-padding-balance" => names(PADDING_BALANCE),
+        "window-padding-color" => names(PADDING_COLORS),
         _ => return String::new(),
     };
     format!(", valid values are: {}", names.join(", "))
@@ -459,6 +892,60 @@ fn boolean(value: &str) -> Result<bool, Error> {
         "1" | "t" | "T" | "true" => Ok(true),
         "0" | "f" | "F" | "false" => Ok(false),
         _ => Err(Error::Invalid),
+    }
+}
+
+/// A boolean option: alone it is true, and an empty value is its default.
+fn flag(value: Option<&str>, default: bool) -> Result<bool, Error> {
+    match value {
+        None => Ok(true),
+        value => or_default(value, default, boolean),
+    }
+}
+
+/// ghostty's WindowDecoration.parseCLI, which takes booleans too.
+fn decoration(value: &str) -> Result<Decoration, Error> {
+    if value == "server" {
+        let hint = "tapust cannot ask the compositor to draw the decorations, valid values are: auto, client, none";
+        return Err(Error::Hint(hint.to_owned()));
+    }
+    match boolean(value) {
+        Ok(true) => Ok(Decoration::Auto),
+        Ok(false) => Ok(Decoration::None),
+        Err(_) => one_of(value, DECORATIONS),
+    }
+}
+
+/// An opacity from `min` to 1, which ghostty would clamp to that range
+/// without a word.
+fn fraction(value: &str, min: f64) -> Result<f64, Error> {
+    let v: f64 = value.parse().map_err(|_| Error::Invalid)?;
+    if !(min..=1.0).contains(&v) {
+        return Err(Error::Hint(format!("it must be from {min} to 1")));
+    }
+    Ok(v)
+}
+
+/// window-width or -height: 0 for none, else at least `min` cells, which
+/// ghostty would make of a smaller size without a word.
+fn cells(value: &str, min: u32, side: &str) -> Result<u32, Error> {
+    let cells = integer(value).ok_or(Error::Invalid)?;
+    if cells != 0 && cells < min {
+        return Err(Error::Hint(format!("a window is at least {min} cells {side}")));
+    }
+    Ok(cells)
+}
+
+/// ghostty's WindowPadding: one number of points for both sides, or two
+/// separated by a comma.
+fn padding(value: &str) -> Result<(u32, u32), Error> {
+    let points = |v: &str| v.trim_matches([' ', '\t']).parse::<u32>().map_err(|_| Error::Invalid);
+    match value.split_once(',') {
+        Some((start, end)) => Ok((points(start)?, points(end)?)),
+        None => {
+            let both = points(value)?;
+            Ok((both, both))
+        }
     }
 }
 
@@ -958,5 +1445,263 @@ mod tests {
         loader.load(&dir.join("config"));
         let error = format!("error reading config file {}/config: Is a directory (os error 21)", dir.display());
         assert_eq!(loader.diagnostics.iter().map(ToString::to_string).collect::<Vec<_>>(), [error]);
+    }
+
+    /// A fresh directory under target/ for a test's files.
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target").join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("themes")).unwrap();
+        std::fs::canonicalize(dir).unwrap()
+    }
+
+    fn write(dir: &Path, name: &str, text: &str) {
+        std::fs::write(dir.join(name), text).unwrap();
+    }
+
+    /// The configuration `dir/config` loads, with `dir/themes` for the
+    /// user's themes, for a light or `dark` desktop.
+    fn load_dir(dir: &Path, dark: bool) -> (Config, Vec<String>) {
+        let mut loader = Loader::new(&fonts);
+        loader.load(&dir.join("config"));
+        loader.load_theme(&dir.join("themes"), dark);
+        (loader.config, loader.diagnostics.iter().map(ToString::to_string).collect())
+    }
+
+    #[test]
+    fn title_bar_and_tab_options() {
+        let c = ok("gtk-titlebar = false\ngtk-titlebar-hide-when-maximized\ngtk-titlebar-style = tabs\n\
+                    gtk-tabs-location = bottom\ngtk-tabs-inverted = true\ngtk-wide-tabs = false\n\
+                    gtk-toolbar-style = raised-border\nwindow-show-tab-bar = always");
+        assert!(!c.gtk_titlebar && c.gtk_titlebar_hide_when_maximized && c.gtk_tabs_inverted && !c.gtk_wide_tabs);
+        assert_eq!((c.gtk_titlebar_style, c.gtk_tabs_location), (TitlebarStyle::Tabs, TabsLocation::Bottom));
+        assert_eq!((c.gtk_toolbar_style, c.window_show_tab_bar), (adw::ToolbarStyle::RaisedBorder, ShowTabBar::Always));
+        assert!(ok("gtk-titlebar = false\ngtk-titlebar").gtk_titlebar);
+        assert!(ok("gtk-wide-tabs = false\ngtk-wide-tabs =").gtk_wide_tabs);
+        assert_eq!(ok("gtk-toolbar-style = flat").gtk_toolbar_style, adw::ToolbarStyle::Flat);
+        assert_eq!(ok("window-show-tab-bar = never").window_show_tab_bar, ShowTabBar::Never);
+        assert_eq!(
+            errors("gtk-titlebar-style = hidden\ngtk-tabs-location = left\ngtk-titlebar = no\nwindow-show-tab-bar"),
+            [
+                "/c/config:1:gtk-titlebar-style: invalid value \"hidden\", valid values are: native, tabs",
+                "/c/config:2:gtk-tabs-location: invalid value \"left\", valid values are: top, bottom",
+                "/c/config:3:gtk-titlebar: invalid value \"no\"",
+                "/c/config:4:window-show-tab-bar: value required, valid values are: always, auto, never",
+            ]
+        );
+    }
+
+    #[test]
+    fn window_colors_and_opacity() {
+        let c = ok("window-theme = ghostty\nbackground-opacity = 0.8\nbackground-opacity-cells\n\
+                    unfocused-split-opacity = 0.4\nunfocused-split-fill = #102030\nsplit-divider-color = red\n\
+                    window-titlebar-background = #000\nwindow-titlebar-foreground = white");
+        assert_eq!((c.window_theme, c.background_opacity), (WindowTheme::Ghostty, 0.8));
+        assert!(c.background_opacity_cells);
+        assert_eq!((c.unfocused_split_opacity, c.unfocused_split_fill), (0.4, Some(rgb(0x102030))));
+        assert_eq!(c.split_divider_color, Some(rgb(0xff0000)));
+        assert_eq!((c.window_titlebar_background, c.window_titlebar_foreground), (Some(rgb(0)), Some(rgb(0xffffff))));
+        let themes = [("auto", WindowTheme::Auto), ("system", WindowTheme::System), ("light", WindowTheme::Light)];
+        for (text, theme) in themes {
+            assert_eq!(ok(&format!("window-theme = {text}")).window_theme, theme);
+        }
+        assert_eq!(ok("background-opacity = 0\nunfocused-split-opacity = 1").background_opacity, 0.0);
+        assert_eq!(ok("background-opacity = 0.5\nbackground-opacity =").background_opacity, 1.0);
+        assert_eq!(ok("split-divider-color = red\nsplit-divider-color =").split_divider_color, None);
+        assert_eq!(
+            errors("background-opacity = 1.5\nunfocused-split-opacity = 0.1\nbackground-opacity = NaN\nwindow-theme=X"),
+            [
+                "/c/config:1:background-opacity: invalid value \"1.5\", it must be from 0 to 1",
+                "/c/config:2:unfocused-split-opacity: invalid value \"0.1\", it must be from 0.15 to 1",
+                "/c/config:3:background-opacity: invalid value \"NaN\", it must be from 0 to 1",
+                "/c/config:4:window-theme: invalid value \"X\", valid values are: auto, system, light, dark, ghostty",
+            ]
+        );
+    }
+
+    #[test]
+    fn window_decoration_takes_booleans_but_not_server() {
+        for (text, decoration) in [
+            ("window-decoration", Decoration::Auto),
+            ("window-decoration = true", Decoration::Auto),
+            ("window-decoration = false", Decoration::None),
+            ("window-decoration = client", Decoration::Client),
+            ("window-decoration = none\nwindow-decoration =", Decoration::Auto),
+        ] {
+            assert_eq!(ok(text).window_decoration, decoration, "{text}");
+        }
+        assert_eq!(
+            errors("window-decoration = server\nwindow-decoration = ssd"),
+            [
+                concat!(
+                    "/c/config:1:window-decoration: invalid value \"server\", tapust cannot ask the compositor to ",
+                    "draw the decorations, valid values are: auto, client, none"
+                ),
+                "/c/config:2:window-decoration: invalid value \"ssd\", valid values are: auto, client, none",
+            ]
+        );
+    }
+
+    #[test]
+    fn window_size_padding_subtitle_and_new_tabs() {
+        let c = ok("window-width = 100\nwindow-height = 0x20\nwindow-padding-x = 4\nwindow-padding-y = 1, 6\n\
+                    window-padding-balance = true\nwindow-padding-color = extend-always\n\
+                    window-subtitle = working-directory\nwindow-new-tab-position = end");
+        assert_eq!((c.window_width, c.window_height), (100, 32));
+        assert_eq!((c.window_padding_x, c.window_padding_y), ((4, 4), (1, 6)));
+        assert_eq!(c.window_padding_balance, PaddingBalance::True);
+        assert_eq!(c.window_padding_color, PaddingColor::ExtendAlways);
+        assert_eq!((c.window_subtitle, c.window_new_tab_position), (Subtitle::WorkingDirectory, NewTabPosition::End));
+        assert_eq!(ok("window-padding-balance = equal").window_padding_balance, PaddingBalance::Equal);
+        assert_eq!(ok("window-width = 0\nwindow-height = 4").window_height, 4);
+        assert_eq!(ok("window-padding-x = 9\nwindow-padding-x =").window_padding_x, (2, 2));
+        assert_eq!(
+            errors("window-width = 9\nwindow-height = 3\nwindow-padding-x = 1,x\nwindow-padding-y = -1\n\
+                    window-padding-color = extended\nwindow-new-tab-position = start"),
+            [
+                "/c/config:1:window-width: invalid value \"9\", a window is at least 10 cells wide",
+                "/c/config:2:window-height: invalid value \"3\", a window is at least 4 cells high",
+                "/c/config:3:window-padding-x: invalid value \"1,x\"",
+                "/c/config:4:window-padding-y: invalid value \"-1\"",
+                concat!(
+                    "/c/config:5:window-padding-color: invalid value \"extended\", ",
+                    "valid values are: background, extend, extend-always"
+                ),
+                "/c/config:6:window-new-tab-position: invalid value \"start\", valid values are: current, end",
+            ]
+        );
+    }
+
+    #[test]
+    fn themes_parse_as_a_name_or_a_light_and_dark_pair() {
+        let same = |name: &str| Some(Theme { light: name.to_owned(), dark: name.to_owned() });
+        assert_eq!(parse("theme = Tomorrow Night").0.theme, same("Tomorrow Night"));
+        assert_eq!(parse("theme = \"  Nord  \"").0.theme, same("Nord"));
+        assert_eq!(parse("theme = /t/x").0.theme, same("/t/x"));
+        let home = home().unwrap().join("t").to_string_lossy().into_owned();
+        assert_eq!(parse("theme = ~/t").0.theme, same(&home));
+        let pair = Theme { light: "Day".to_owned(), dark: "Night Owl".to_owned() };
+        assert!(pair.conditional() && !Theme { light: "x".to_owned(), dark: "x".to_owned() }.conditional());
+        assert_eq!(parse("theme = dark : Night Owl,  light:Day ").0.theme, Some(pair));
+        assert_eq!(parse("theme = Nord\ntheme =").0.theme, None);
+        assert_eq!(
+            parse("theme = light:Day\ntheme = light:Day,dusk:Night\ntheme = Day=Night").1,
+            [
+                "/c/config:1:theme: invalid value \"light:Day\", a theme pair needs both light: and dark:",
+                "/c/config:2:theme: invalid value \"light:Day,dusk:Night\"",
+                "/c/config:3:theme: invalid value \"Day=Night\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bundled_theme_sets_its_colors_and_the_configuration_wins() {
+        let dir = test_dir("test-theme-bundled");
+        // Lines before and after the theme line both override it.
+        write(&dir, "config", "background = #123456\ntheme = Tomorrow Night\npalette = 1=#010101\ncursor-color =\n");
+        let (c, d) = load_dir(&dir, false);
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!((c.background, c.foreground), (rgb(0x123456), rgb(0xc5c8c6)));
+        assert_eq!((c.palette[0], c.palette[1], c.palette[8]), (rgb(0), rgb(0x010101), rgb(0x4c4c4c)));
+        assert_eq!(c.palette[16], theme::palette()[16]);
+        assert_eq!(c.cursor_color, None);
+        assert_eq!(c.selection_background, Some(TerminalColor::Rgb(rgb(0x373b41))));
+        // An empty palette line resets the theme's palette too, as in ghostty.
+        write(&dir, "config", "theme = Tomorrow Night\npalette =\n");
+        assert_eq!(load_dir(&dir, false).0.palette, theme::palette());
+    }
+
+    #[test]
+    fn the_users_themes_come_before_the_bundled_ones() {
+        let dir = test_dir("test-theme-user");
+        write(&dir, "themes/Tomorrow Night", "background = #000001\n");
+        write(&dir, "config", "theme = Tomorrow Night\n");
+        let (c, d) = load_dir(&dir, false);
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!((c.background, c.foreground), (rgb(0x000001), Config::default().foreground));
+        write(&dir, "elsewhere", "background = #000002\n");
+        write(&dir, "config", &format!("theme = {}/elsewhere\n", dir.display()));
+        assert_eq!(load_dir(&dir, false).0.background, rgb(0x000002));
+    }
+
+    #[test]
+    fn a_theme_pair_takes_the_desktops_side() {
+        let dir = test_dir("test-theme-pair");
+        write(&dir, "themes/Mine", "background = #000003\n");
+        write(&dir, "config", "theme = light:Mine,dark:Tomorrow Night\n");
+        assert_eq!(load_dir(&dir, false).0.background, rgb(0x000003));
+        let (c, d) = load_dir(&dir, true);
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(c.background, rgb(0x1d1f21));
+        assert!(c.theme.unwrap().conditional());
+    }
+
+    #[test]
+    fn theme_errors() {
+        let dir = test_dir("test-theme-errors");
+        write(&dir, "config", "font-size = 13\ntheme = Nope\ntheme = Missing\n");
+        let (c, d) = load_dir(&dir, false);
+        let (config, themes) = (dir.join("config"), dir.join("themes"));
+        let at = format!("{}:3:theme: theme \"Missing\" not found", config.display());
+        assert_eq!(
+            d,
+            [
+                format!("{at}, tried path \"{}/Missing\"", themes.display()),
+                format!("{at} among the themes bundled with tapust"),
+            ]
+        );
+        assert_eq!((c.font_size, c.background), (13.0, Config::default().background));
+        write(&dir, "config", "theme = sub/Nope\n");
+        let separator = "theme: theme \"sub/Nope\" cannot include path separators unless it is an absolute path";
+        assert_eq!(load_dir(&dir, false).1, [format!("{}:1:{separator}", config.display())]);
+        write(&dir, "config", &format!("theme = {}/none\n", dir.display()));
+        let absent = format!("{}:1:theme: failed to load theme from the path", config.display());
+        assert_eq!(load_dir(&dir, false).1, [format!("{absent} \"{}/none\"", dir.display())]);
+        // A theme cannot name another theme or file; its own errors name it.
+        write(&dir, "themes/Bad", "theme = Nord\nconfig-file = x\nbackground = nope\nforeground = #010101\n");
+        write(&dir, "config", "theme = Bad\n");
+        let (c, d) = load_dir(&dir, false);
+        let bad = themes.join("Bad");
+        assert_eq!(
+            d,
+            [
+                format!("{}:1:theme: a theme file cannot set theme", bad.display()),
+                format!("{}:2:config-file: a theme file cannot set config-file", bad.display()),
+                format!("{}:3:background: invalid value \"nope\"", bad.display()),
+            ]
+        );
+        assert_eq!(c.foreground, rgb(0x010101));
+    }
+
+    #[test]
+    fn custom_css_files_read_with_the_configuration() {
+        let dir = test_dir("test-custom-css");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        write(&dir, "style.css", "window { opacity: 0.5; }");
+        write(&dir, "sub/more.css", "label { color: red; }");
+        write(&dir, "sub/config", "gtk-custom-css = more.css\n");
+        write(
+            &dir,
+            "config",
+            "gtk-custom-css = ./style.css\ngtk-custom-css = ?absent.css\ngtk-custom-css = gone.css\n\
+             gtk-custom-css = ?\nconfig-file = sub/config\n",
+        );
+        let (c, d) = load_dir(&dir, false);
+        let sheets: Vec<(PathBuf, &str)> = c.gtk_custom_css.iter().map(|s| (s.path.clone(), s.css.as_str())).collect();
+        assert_eq!(
+            sheets,
+            [(dir.join("style.css"), "window { opacity: 0.5; }"), (dir.join("sub/more.css"), "label { color: red; }")]
+        );
+        assert_eq!(
+            d,
+            [format!(
+                "{}/config:3:gtk-custom-css: error opening gtk-custom-css file {}/gone.css: {}",
+                dir.display(),
+                dir.display(),
+                "No such file or directory (os error 2)"
+            )]
+        );
+        write(&dir, "config", "gtk-custom-css = style.css\ngtk-custom-css =\n");
+        assert_eq!(load_dir(&dir, false).0.gtk_custom_css, []);
     }
 }

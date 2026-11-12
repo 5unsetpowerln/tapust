@@ -16,7 +16,7 @@ use glow::HasContext;
 use term::Underline;
 
 use crate::font::{Face, Fonts, face_for};
-use crate::frame::{BOLD, CursorStyle, Frame, FrameCell, Grid, ITALIC, STRIKE, WIDE};
+use crate::frame::{BOLD, CursorStyle, Frame, FrameCell, Grid, ITALIC, STRIKE, TRANSLUCENT, WIDE};
 use crate::underline;
 
 const ATLAS_SIZE: i32 = 2048;
@@ -84,6 +84,7 @@ struct BgUniforms {
     cell: glow::UniformLocation,
     viewport: glow::UniformLocation,
     pad_bg: glow::UniformLocation,
+    extend: glow::UniformLocation,
 }
 
 pub struct Renderer {
@@ -126,15 +127,26 @@ uniform vec2 u_origin;
 uniform vec2 u_cell;
 uniform vec2 u_viewport;
 uniform vec4 u_pad_bg;
+// The sides whose padding takes the nearest cell's background: 1 left,
+// 2 right, 4 up, 8 down (ghostty's cell_bg).
+uniform int u_extend;
 out vec4 frag;
 void main() {
     vec2 px = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
     ivec2 cell = ivec2(floor((px - u_origin) / u_cell));
-    if (any(lessThan(cell, ivec2(0))) || any(greaterThanEqual(cell, textureSize(u_bg, 0)))) {
-        frag = u_pad_bg;
-    } else {
-        frag = texelFetch(u_bg, cell, 0);
+    ivec2 size = textureSize(u_bg, 0);
+    bool pad = false;
+    if (cell.x < 0) {
+        if ((u_extend & 1) != 0) cell.x = 0; else pad = true;
+    } else if (cell.x >= size.x) {
+        if ((u_extend & 2) != 0) cell.x = size.x - 1; else pad = true;
     }
+    if (cell.y < 0) {
+        if ((u_extend & 4) != 0) cell.y = 0; else pad = true;
+    } else if (cell.y >= size.y) {
+        if ((u_extend & 8) != 0) cell.y = size.y - 1; else pad = true;
+    }
+    frag = pad ? u_pad_bg : texelFetch(u_bg, cell, 0);
 }
 "#;
 
@@ -253,6 +265,13 @@ fn box_arms(ch: u32) -> Option<[bool; 4]> {
     })
 }
 
+/// An opaque color at `alpha`, premultiplied as GTK takes the GLArea's
+/// pixels.
+fn premultiply(c: [u8; 4], alpha: u8) -> [u8; 4] {
+    let mul = |v: u8| ((u16::from(v) * u16::from(alpha) + 127) / 255) as u8;
+    [mul(c[0]), mul(c[1]), mul(c[2]), alpha]
+}
+
 fn bytes_of<T: Copy>(slice: &[T]) -> &[u8] {
     // SAFETY: only used with plain-old-data types without padding (`Instance`, `[u8; 4]`).
     unsafe { std::slice::from_raw_parts(slice.as_ptr().cast(), std::mem::size_of_val(slice)) }
@@ -268,6 +287,7 @@ impl Renderer {
                 cell: uniform(&gl, bg_program, "u_cell"),
                 viewport: uniform(&gl, bg_program, "u_viewport"),
                 pad_bg: uniform(&gl, bg_program, "u_pad_bg"),
+                extend: uniform(&gl, bg_program, "u_extend"),
             };
             let fg_program = program(&gl, FG_VS, FG_FS);
             let fg_viewport = uniform(&gl, fg_program, "u_viewport");
@@ -491,8 +511,9 @@ impl Renderer {
         cache.rows[y as usize] = out;
     }
 
-    /// Uploads the dirty background rows of `grid`, (re)creating its cache.
-    fn upload_background(&mut self, grid: &mut Grid) {
+    /// Uploads the dirty background rows of `grid`, (re)creating its cache;
+    /// translucent cells take `opacity`.
+    fn upload_background(&mut self, grid: &mut Grid, opacity: u8) {
         let (cols, rows) = (grid.cols(), grid.rows());
         let gl = &self.gl;
         let cache = self.grids.entry(grid.id).or_insert_with(|| GridCache {
@@ -528,7 +549,8 @@ impl Renderer {
         }
         for y in (0..rows).filter(|&y| grid.is_dirty(y)) {
             self.bg_row.clear();
-            self.bg_row.extend(grid.row(y).iter().map(|c| c.bg));
+            let texel = |c: &FrameCell| if c.flags & TRANSLUCENT != 0 { premultiply(c.bg, opacity) } else { c.bg };
+            self.bg_row.extend(grid.row(y).iter().map(texel));
             unsafe {
                 gl.tex_sub_image_2d(
                     glow::TEXTURE_2D,
@@ -557,7 +579,7 @@ impl Renderer {
         });
         // All background rows first: loading a glyph switches the active texture unit.
         for grid in &mut frame.grids {
-            self.upload_background(grid);
+            self.upload_background(grid, frame.opacity);
         }
         if self.underlines.is_empty() {
             self.underlines = self.build_underlines();
@@ -612,7 +634,7 @@ impl Renderer {
         let gl = &self.gl;
         let (vw, vh) = (self.viewport.0 as f32, self.viewport.1 as f32);
         unsafe {
-            let bg = frame.window_bg.map(|c| c as f32 / 255.0);
+            let bg = premultiply(frame.window_bg, frame.opacity).map(|c| c as f32 / 255.0);
             gl.disable(glow::BLEND);
             gl.clear_color(bg[0], bg[1], bg[2], bg[3]);
             gl.clear(glow::COLOR_BUFFER_BIT);
@@ -627,8 +649,11 @@ impl Renderer {
                 gl.uniform_2_f32(Some(&self.bg_uniforms.origin), grid.x as f32, grid.y as f32);
                 let (x, y, w, h) = grid.pane;
                 gl.uniform_4_f32(Some(&self.bg_uniforms.rect), x as f32, y as f32, w as f32, h as f32);
-                let pad = grid.bg.map(|c| c as f32 / 255.0);
+                let pad = premultiply(grid.bg, frame.opacity).map(|c| c as f32 / 255.0);
                 gl.uniform_4_f32(Some(&self.bg_uniforms.pad_bg), pad[0], pad[1], pad[2], pad[3]);
+                let e = grid.extend;
+                let extend = e.left as i32 | (e.right as i32) << 1 | (e.up as i32) << 2 | (e.down as i32) << 3;
+                gl.uniform_1_i32(Some(&self.bg_uniforms.extend), extend);
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
             }
             if !upload.is_empty() {
@@ -656,5 +681,17 @@ impl Renderer {
             }
         }
         self.upload = upload;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::premultiply;
+
+    #[test]
+    fn colors_are_premultiplied_by_the_opacity() {
+        assert_eq!(premultiply([40, 44, 52, 255], 255), [40, 44, 52, 255]);
+        assert_eq!(premultiply([40, 44, 52, 255], 204), [32, 35, 42, 204]);
+        assert_eq!(premultiply([255, 0, 128, 255], 0), [0, 0, 0, 0]);
     }
 }

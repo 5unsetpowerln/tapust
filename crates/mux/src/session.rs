@@ -8,7 +8,7 @@ use crate::keys::KeyState;
 use crate::layout::Layout;
 use crate::split::Side;
 use crate::window::{Pane, Window};
-use crate::{format, paste, Command, CopyCommand, Direction, Effect, PaneId, Server, Session};
+use crate::{format, paste, Command, CopyCommand, Direction, Effect, NewAt, PaneId, Server, Session};
 
 /// session_create: a session with no window yet.
 pub(crate) fn blank(server: &Server) -> Session {
@@ -282,9 +282,13 @@ impl Session {
             Command::SplitWindow { horizontal, before, full, cwd_of_active } => {
                 self.split_window(Side { horizontal, before }, full, cwd_of_active)
             }
-            Command::NewWindow { cwd_of_active, after } => {
+            Command::NewWindow { cwd_of_active, at } => {
                 let parent = self.cur().active;
-                let idx = if after { self.shuffle_up(self.curw + 1) } else { self.free_index() };
+                let idx = match at {
+                    NewAt::Free => self.free_index(),
+                    NewAt::AfterCurrent => self.shuffle_up(self.curw + 1),
+                    NewAt::AfterLast => self.winlinks.keys().next_back().expect("a window") + 1,
+                };
                 self.spawn_window(idx, Some(parent), cwd_of_active);
                 self.set_current(idx);
                 Ok(())

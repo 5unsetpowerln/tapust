@@ -9,6 +9,10 @@ pub const ITALIC: u16 = 1 << 1;
 pub const STRIKE: u16 = 1 << 2;
 /// The cell holds the left half of a double-width glyph.
 pub const WIDE: u16 = 1 << 3;
+/// The cell's background takes the background opacity: the terminal's
+/// default background, or with background-opacity-cells any but a selected
+/// or inverted cell's (ghostty's bg_alpha).
+pub const TRANSLUCENT: u16 = 1 << 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
@@ -29,9 +33,20 @@ impl FrameCell {
     }
 }
 
+/// The sides of a grid whose padding shows the nearest cells' backgrounds
+/// (ghostty's padding_extend).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Extend {
+    pub left: bool,
+    pub right: bool,
+    pub up: bool,
+    pub down: bool,
+}
+
 /// A pane's cells, drawn with cell (0, 0) at (`x`, `y`) in window pixels,
 /// inside the pane's rectangle `pane` (x, y, width, height), which shows `bg`
-/// around the cells (ghostty's padding).
+/// around the cells (ghostty's padding), or the cells' own on the sides of
+/// `extend`.
 pub struct Grid {
     /// Identifies the pane across frames, so the renderer can keep its work.
     pub id: u32,
@@ -39,6 +54,7 @@ pub struct Grid {
     pub y: i32,
     pub pane: (i32, i32, u32, u32),
     pub bg: [u8; 4],
+    pub extend: Extend,
     cols: u16,
     rows: u16,
     cells: Vec<FrameCell>,
@@ -53,6 +69,7 @@ impl Grid {
             y,
             pane,
             bg,
+            extend: Extend::default(),
             cols,
             rows,
             cells: vec![FrameCell::blank(bg); cols as usize * rows as usize],
@@ -124,10 +141,13 @@ pub struct Frame {
     pub cursors: Vec<FrameCursor>,
     /// The window background, wherever no pane is.
     pub window_bg: [u8; 4],
+    /// background-opacity, for the window background, the padding and the
+    /// translucent cells.
+    pub opacity: u8,
 }
 
 impl Frame {
-    pub fn new(window_bg: [u8; 4]) -> Frame {
-        Frame { grids: Vec::new(), cursors: Vec::new(), window_bg }
+    pub fn new(window_bg: [u8; 4], opacity: u8) -> Frame {
+        Frame { grids: Vec::new(), cursors: Vec::new(), window_bg, opacity }
     }
 }

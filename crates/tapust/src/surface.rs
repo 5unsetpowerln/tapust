@@ -17,7 +17,7 @@ use term::{Point, Selection};
 
 use crate::bindings::{self, Binding, FontSize, Press, Scroll};
 use crate::compose;
-use crate::config::{Config, CopyOnSelect};
+use crate::config::{Config, CopyOnSelect, PaddingBalance};
 use crate::copy::CopyMode;
 use crate::font::Fonts;
 use crate::frame::{Frame, Grid};
@@ -59,8 +59,9 @@ pub enum Event {
     /// A right click not reported to the program opens the context menu.
     ContextMenu { pane: PaneId, x: f64, y: f64 },
     /// The cell size in device pixels is known or changed (ghostty's
-    /// cell_size action).
-    CellSize { cell: (u32, u32) },
+    /// cell_size action), with the scale and the padding around the grid
+    /// (horizontal, vertical) in device pixels.
+    CellSize { cell: (u32, u32), scale: f64, padding: (u32, u32) },
     /// The child exited banner's Close button: close without confirmation.
     ChildExitedClose { pane: PaneId },
     /// The wheel in copy mode, sent as `count` presses of Up (or Down), as
@@ -204,6 +205,8 @@ pub struct Surface {
     pub focused: Cell<bool>,
     split: Cell<bool>,
     size: Cell<(u16, u16)>,
+    /// The padding around the grid, from the last size.
+    pad: Cell<Padding>,
     /// The GLArea's size in device pixels.
     pixels: Cell<(i32, i32)>,
 }
@@ -279,15 +282,52 @@ fn background(config: &Config) -> [u8; 4] {
     compose::resolve(term::Color::Default, &palette, palette.background)
 }
 
-fn padding(scale: f64) -> u32 {
-    // ghostty converts the padding from points at 96 dpi and floors it.
-    (theme::PADDING_POINTS * 96.0 / 72.0 * scale).floor() as u32
+fn opacity(config: &Config) -> u8 {
+    (config.background_opacity * 255.0).round() as u8
 }
 
-/// The grid `width` x `height` device pixels hold inside the padding.
-fn fit(width: u32, height: u32, (cw, ch): (u32, u32), pad: u32) -> (u16, u16) {
-    let fit = |size: u32, cell: u32| (size.saturating_sub(2 * pad) / cell.max(1)).max(1) as u16;
-    (fit(width, cw), fit(height, ch))
+/// The space around the grid in device pixels (ghostty's renderer Padding).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Padding {
+    top: u32,
+    bottom: u32,
+    left: u32,
+    right: u32,
+}
+
+/// ghostty's scaledPadding: window-padding-x and -y from points at 96 dpi,
+/// floored.
+fn explicit_padding(config: &Config, scale: f64) -> Padding {
+    let px = |points: u32| (f64::from(points) * 96.0 / 72.0 * scale).floor() as u32;
+    let ((left, right), (top, bottom)) = (config.window_padding_x, config.window_padding_y);
+    Padding { top: px(top), bottom: px(bottom), left: px(left), right: px(right) }
+}
+
+/// The grid `width` x `height` device pixels hold inside the padding `pad`,
+/// and the padding then: ghostty's balancePadding splits what the grid
+/// leaves evenly around it, with `true` moving what the top gets beyond the
+/// side padding and half a cell to the bottom.
+fn layout(
+    width: u32,
+    height: u32,
+    (cw, ch): (u32, u32),
+    pad: Padding,
+    balance: PaddingBalance,
+) -> ((u16, u16), Padding) {
+    let fit = |size: u32, start: u32, end: u32, cell: u32| (size.saturating_sub(start + end) / cell.max(1)).max(1);
+    let (cols, rows) = (fit(width, pad.left, pad.right, cw), fit(height, pad.top, pad.bottom, ch));
+    let grid = (cols as u16, rows as u16);
+    if balance == PaddingBalance::False {
+        return (grid, pad);
+    }
+    let (x, y) = (width.saturating_sub(cols * cw) / 2, height.saturating_sub(rows * ch) / 2);
+    let mut balanced = Padding { top: y, bottom: y, left: x, right: x };
+    if balance == PaddingBalance::True {
+        let shift = balanced.top.saturating_sub((pad.left + pad.right + cw) / 2);
+        balanced.top -= shift;
+        balanced.bottom += shift;
+    }
+    (grid, balanced)
 }
 
 /// ghostty's calcDropDirection: the side nearest to (`x`, `y`), compared
@@ -311,7 +351,7 @@ impl Surface {
     /// A pane's surface with its fonts at `font_points`, which reset_font_size
     /// goes back to.
     pub fn new(pane: PaneId, config: Rc<Config>, font_points: f32, handler: Handler) -> Rc<Surface> {
-        let term_bg = background(&config);
+        let (term_bg, opacity) = (background(&config), opacity(&config));
         let area = gtk::GLArea::builder().hexpand(true).vexpand(true).focusable(true).focus_on_click(true).build();
         area.set_allowed_apis(gdk::GLAPI::GL);
         area.set_required_version(3, 3);
@@ -495,7 +535,7 @@ impl Surface {
             handler: handler.clone(),
             draw: RefCell::new(Draw {
                 renderer: None,
-                frame: Frame::new(term_bg),
+                frame: Frame::new(term_bg, opacity),
                 shared: None,
                 term_bg,
                 full: true,
@@ -505,6 +545,7 @@ impl Surface {
             focused: Cell::new(false),
             split: Cell::new(false),
             size: Cell::new((0, 0)),
+            pad: Cell::new(Padding::default()),
             pixels: Cell::new((0, 0)),
         });
         surface.connect(handler);
@@ -861,10 +902,14 @@ impl Surface {
             s.cell_idle.set(false);
             let Some((cw, ch)) = s.cell_size() else { return };
             let scale = s.font_scale.get();
-            let pad = 2 * padding(1.0) as i32;
+            let config = s.config.borrow().clone();
+            let pad = explicit_padding(&config, 1.0);
             let logical = |px: u32| (f64::from(px) / scale).ceil() as i32;
-            s.outer.set_size_request(logical(cw) + pad, logical(ch) + pad);
-            (s.handler)(Event::CellSize { cell: (cw, ch) });
+            let (x, y) = ((pad.left + pad.right) as i32, (pad.top + pad.bottom) as i32);
+            s.outer.set_size_request(logical(cw) + x, logical(ch) + y);
+            let pad = explicit_padding(&config, scale);
+            let padding = (pad.left + pad.right, pad.top + pad.bottom);
+            (s.handler)(Event::CellSize { cell: (cw, ch), scale, padding });
         });
     }
 
@@ -887,10 +932,14 @@ impl Surface {
             }
             renderer.resize(width as u32, height as u32);
             let (cw, ch) = renderer.cell_size();
-            let pad = padding(scale);
-            let (cols, rows) = fit(width.max(0) as u32, height.max(0) as u32, (cw, ch), pad);
+            let config = self.config.borrow();
+            let pad = explicit_padding(&config, scale);
+            let size = (width.max(0) as u32, height.max(0) as u32);
+            let ((cols, rows), pad) = layout(size.0, size.1, (cw, ch), pad, config.window_padding_balance);
+            self.pad.set(pad);
             let bg = d.term_bg;
-            d.frame.grids = vec![Grid::new(self.pane, (0, 0, width as u32, height as u32), (pad as i32, pad as i32), (cols, rows), bg)];
+            let origin = (pad.left as i32, pad.top as i32);
+            d.frame.grids = vec![Grid::new(self.pane, (0, 0, size.0, size.1), origin, (cols, rows), bg)];
             d.full = true;
             (cols, rows, (cw, ch))
         };
@@ -937,6 +986,7 @@ impl Surface {
             let mut d = self.draw.borrow_mut();
             d.term_bg = bg;
             d.frame.window_bg = bg;
+            d.frame.opacity = opacity(&config);
             for grid in &mut d.frame.grids {
                 grid.bg = bg;
             }
@@ -947,6 +997,12 @@ impl Surface {
         let points = if self.font_adjusted.get() { self.font_points.get() } else { self.font_base.get() };
         if family_changed || points != self.font_points.get() {
             self.set_fonts(points);
+        } else if self.draw.borrow().renderer.is_some() {
+            // The padding may have changed: the grid is laid out again.
+            self.schedule_cell_size();
+            let (width, height) = self.pixels.get();
+            self.area.make_current();
+            self.resized(width, height);
         }
         self.area.queue_render();
     }
@@ -1249,8 +1305,8 @@ impl Surface {
     fn drag_point(&self, term: &term::Terminal, x: f64, y: f64) -> Option<DragPoint> {
         let (cw, ch) = self.cell_size()?;
         let scale = self.font_scale.get();
-        let pad = f64::from(padding(scale));
-        let (px, py) = (x * scale - pad, y * scale - pad);
+        let pad = self.pad.get();
+        let (px, py) = (x * scale - f64::from(pad.left), y * scale - f64::from(pad.top));
         let col = ((px / f64::from(cw)).floor().max(0.0) as u16).min(term.cols() - 1);
         let row = ((py / f64::from(ch)).floor().max(0.0) as u16).min(term.rows() - 1);
         Some(DragPoint { cell: Point { line: term.view_top() + u64::from(row), col }, x: px })
@@ -1893,9 +1949,9 @@ impl Surface {
     fn pointer_cell(&self, term: &term::Terminal) -> ((u16, u16), (i32, i32)) {
         let Some((cw, ch)) = self.cell_size() else { return ((0, 0), (0, 0)) };
         let scale = self.font_scale.get();
-        let pad = f64::from(padding(scale));
+        let pad = self.pad.get();
         let (x, y) = self.pointer.get();
-        let (px, py) = (x * scale - pad, y * scale - pad);
+        let (px, py) = (x * scale - f64::from(pad.left), y * scale - f64::from(pad.top));
         let col = (px / f64::from(cw)).floor().max(0.0) as u16;
         let row = (py / f64::from(ch)).floor().max(0.0) as u16;
         let cell = (col.min(term.cols().saturating_sub(1)), row.min(term.rows().saturating_sub(1)));
@@ -1921,14 +1977,14 @@ impl Surface {
         let (cw, ch) = renderer.cell_size();
         let (cw, ch) = (f64::from(cw), f64::from(ch));
         let scale = self.font_scale.get();
-        let pad = f64::from(padding(scale));
+        let pad = self.pad.get();
         let (x, y) = {
             let term = shared.term.lock();
             let cursor = term.cursor();
             (f64::from(cursor.x), f64::from(cursor.y))
         };
-        let px = (x * cw + pad + cw / 2.0) / scale;
-        let bottom = (y * ch + pad + ch) / scale;
+        let px = (x * cw + f64::from(pad.left) + cw / 2.0) / scale;
+        let bottom = (y * ch + f64::from(pad.top) + ch) / scale;
         let top = (bottom - ch / scale).floor();
         let height = (bottom.ceil() - top).max(1.0);
         self.im.set_cursor_location(&gdk::Rectangle::new(px.floor() as i32, top as i32, 1, height as i32));
@@ -2043,7 +2099,9 @@ impl Surface {
     pub fn grid(&self, width: u32, height: u32) -> Option<(u16, u16)> {
         let scale = self.font_scale.get();
         let device = |px: u32| (f64::from(px) * scale).round() as u32;
-        Some(fit(device(width), device(height), self.cell_size()?, padding(scale)))
+        let config = self.config.borrow();
+        let pad = explicit_padding(&config, scale);
+        Some(layout(device(width), device(height), self.cell_size()?, pad, config.window_padding_balance).0)
     }
 
     fn render(&self) {
@@ -2062,12 +2120,14 @@ impl Surface {
             let (x, y) = mode.cursor();
             let term = mode.term_mut();
             let selection = term.selection();
-            compose::copy_pane(grid, term, d.full, &marks, current, selection.as_ref(), &self.config.borrow());
+            let config = self.config.borrow();
+            compose::copy_pane(grid, term, d.full, &marks, current, selection.as_ref(), &config);
+            grid.extend = compose::padding_extend(term, config.window_padding_color);
             if let Some(link) = self.hover.borrow().as_ref() {
                 compose::underline(grid, term, link);
             }
             if !focused || d.blink_on {
-                d.frame.cursors.extend(compose::copy_cursor(term, 0, x, y, focused, &self.config.borrow()));
+                d.frame.cursors.extend(compose::copy_cursor(term, 0, x, y, focused, &config));
             }
         } else if let Some(shared) = &d.shared {
             use std::sync::atomic::Ordering;
@@ -2079,6 +2139,7 @@ impl Surface {
             let found = self.found.borrow();
             let config = self.config.borrow();
             compose::copy_pane(grid, &mut term, d.full, &found.matches, found.current, selection.as_ref(), &config);
+            grid.extend = compose::padding_extend(&term, config.window_padding_color);
             if let Some(link) = self.hover.borrow().as_ref() {
                 compose::underline(grid, &term, link);
             }
@@ -2109,12 +2170,29 @@ impl Surface {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_path;
+    use super::*;
 
     #[test]
     fn paths_resolve_like_zig() {
         assert_eq!(resolve_path("/a/b", "./c"), "/a/b/c");
         assert_eq!(resolve_path("/a/b/", "../c//d"), "/a/c/d");
         assert_eq!(resolve_path("/", "../x"), "/x");
+    }
+
+    #[test]
+    fn padding_from_points_and_balanced_as_ghostty() {
+        let config = Config { window_padding_x: (3, 6), window_padding_y: (0, 12), ..Config::default() };
+        let pad = explicit_padding(&config, 2.0);
+        assert_eq!(pad, Padding { top: 0, bottom: 32, left: 8, right: 16 });
+        assert_eq!(explicit_padding(&Config::default(), 1.0), Padding { top: 2, bottom: 2, left: 2, right: 2 });
+        // 100 x 107 pixels of 10 x 20 cells inside 2 pixels on every side.
+        let two = Padding { top: 2, bottom: 2, left: 2, right: 2 };
+        assert_eq!(layout(100, 107, (10, 20), two, PaddingBalance::False), ((9, 5), two));
+        let equal = Padding { top: 3, bottom: 3, left: 5, right: 5 };
+        assert_eq!(layout(100, 107, (10, 20), two, PaddingBalance::Equal), ((9, 5), equal));
+        // true keeps the top within half the side padding and a cell.
+        let tall = layout(100, 199, (10, 20), two, PaddingBalance::True);
+        assert_eq!(tall, ((9, 9), Padding { top: 7, bottom: 11, left: 5, right: 5 }));
+        assert_eq!(layout(5, 5, (10, 20), two, PaddingBalance::Equal).0, (1, 1));
     }
 }
