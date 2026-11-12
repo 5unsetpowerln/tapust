@@ -424,16 +424,19 @@ impl Parser {
         }
     }
 
+    /// Keeps at most `MAX_OSC` bytes of the string, noting an overflow.
     fn osc_put(&mut self, s: &[u8]) {
-        if self.osc.len() + s.len() > MAX_OSC {
+        let room = MAX_OSC - self.osc.len();
+        if s.len() > room {
             self.osc_overflow = true;
-        } else {
-            self.osc.extend_from_slice(s);
         }
+        self.osc.extend_from_slice(&s[..s.len().min(room)]);
     }
 
     fn osc_end(&mut self, t: &mut Term, bel: bool) {
-        if !self.osc_overflow {
+        if self.osc_overflow {
+            t.osc_overflow(&self.osc);
+        } else {
             t.osc_dispatch(&self.osc, bel);
         }
     }

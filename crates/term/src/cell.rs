@@ -3,6 +3,9 @@
 //! A cell is a single `u64` so that bulk printing writes one word per column
 //! and rendering reads one word per column. Colors and attributes live in a
 //! per-terminal style table referenced by a 16-bit id; id 0 is the default style.
+//! An OSC 8 hyperlink is a 16-bit id into the terminal's link table.
+
+use std::num::NonZeroU16;
 
 /// Width class of a cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,7 +29,7 @@ pub enum Width {
 /// - bits 24..26: [`Semantic`] content (OSC 133) of a printed cell
 /// - bits 26..32: reserved
 /// - bits 32..48: style id (0 = default style)
-/// - bits 48..64: reserved
+/// - bits 48..64: hyperlink id (0 = no link)
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct Cell(pub u64);
@@ -40,6 +43,7 @@ impl Cell {
     const STYLE_SHIFT: u32 = 32;
     pub(crate) const SEMANTIC_SHIFT: u32 = 24;
     pub(crate) const SEMANTIC_MASK: u64 = 3 << Self::SEMANTIC_SHIFT;
+    pub(crate) const LINK_SHIFT: u32 = 48;
 
     #[inline(always)]
     pub const fn new(cp: u32, width: Width, style: StyleId) -> Cell {
@@ -94,6 +98,12 @@ impl Cell {
     pub const fn style(self) -> StyleId {
         StyleId((self.0 >> Self::STYLE_SHIFT) as u16)
     }
+
+    /// The OSC 8 hyperlink the cell was printed with.
+    #[inline(always)]
+    pub fn link(self) -> Option<LinkId> {
+        NonZeroU16::new((self.0 >> Self::LINK_SHIFT) as u16).map(LinkId)
+    }
 }
 
 impl std::fmt::Debug for Cell {
@@ -103,6 +113,7 @@ impl std::fmt::Debug for Cell {
             .field("width", &self.width())
             .field("grapheme", &self.has_grapheme())
             .field("style", &self.style().0)
+            .field("link", &self.link().map(|l| l.0))
             .finish()
     }
 }
@@ -113,6 +124,12 @@ pub struct StyleId(pub u16);
 impl StyleId {
     pub const DEFAULT: StyleId = StyleId(0);
 }
+
+/// An OSC 8 hyperlink: cells printed under the same id and URI share one,
+/// and every start without an id makes a new one.
+/// [`crate::Terminal::link_uri`] gives its URI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LinkId(pub(crate) NonZeroU16);
 
 /// A color as written by the application; the renderer resolves it with the
 /// terminal's [`crate::Palette`].

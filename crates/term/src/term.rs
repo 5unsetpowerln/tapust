@@ -6,6 +6,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::cell::{Cell, Semantic, StyleId, Width};
 use crate::grid::{Grid, PromptMark, attach_mark, blankify};
+use crate::link::{LinkTable, MAX_ID, MAX_URI};
 use crate::palette::{default_palette, parse_color};
 use crate::parser::Params;
 use crate::style::{Pen, StyleTable, apply_sgr};
@@ -20,6 +21,7 @@ const WIDE: u64 = (Width::Wide as u64) << WIDTH_SHIFT;
 const SPACER_TAIL: u64 = (Width::SpacerTail as u64) << WIDTH_SHIFT;
 const SPACER_HEAD: u64 = (Width::SpacerHead as u64) << WIDTH_SHIFT;
 const STYLE_MASK: u64 = 0xFFFF << 32;
+const LINK_MASK: u64 = 0xFFFF << Cell::LINK_SHIFT;
 /// `char_width` result for characters that are not printed.
 const UNPRINTABLE: u8 = 0xFF;
 
@@ -60,7 +62,7 @@ fn widen(row: &mut [Cell], x: usize) {
     if row[x + 1].width() == Width::Wide && x + 2 < row.len() {
         row[x + 2] = blankify(row[x + 2]);
     }
-    row[x + 1] = Cell((base.0 & STYLE_MASK) | SPACER_TAIL);
+    row[x + 1] = Cell((base.0 & (STYLE_MASK | LINK_MASK)) | SPACER_TAIL);
 }
 
 /// Cursor state saved by DECSC.
@@ -209,13 +211,15 @@ pub(crate) struct Term {
     pen: Pen,
     /// The pen `tpl` was resolved from.
     tpl_pen: Pen,
-    /// Cell template for printing: the pen's style id, no content.
+    /// Cell template for printing: the pen's style id, the semantic
+    /// content and the hyperlink, no content.
     tpl: u64,
     pen_dirty: bool,
     /// Erased cells: no content, the pen's background.
     blank: Cell,
     blank_dirty: bool,
     pub styles: StyleTable,
+    pub links: LinkTable,
     charsets: [Charset; 4],
     gl: u8,
     single_shift: u8,
@@ -282,6 +286,7 @@ impl Term {
             blank: Cell::EMPTY,
             blank_dirty: false,
             styles: StyleTable::new(),
+            links: LinkTable::new(),
             charsets: [Charset::Ascii; 4],
             gl: 0,
             single_shift: 0,
@@ -393,7 +398,7 @@ impl Term {
         self.other.remap_styles(&remap);
         // Printing may hold the template across this call, so resolve it now.
         let id = self.styles.intern(self.pen).unwrap_or(StyleId::DEFAULT);
-        self.tpl = (id.0 as u64) << 32 | self.semantic_bits();
+        self.tpl = self.template(id);
         self.tpl_pen = self.pen;
         self.pen_dirty = false;
         self.blank_dirty = true;
@@ -406,10 +411,15 @@ impl Term {
             self.pen_dirty = false;
             if self.pen != self.tpl_pen {
                 let pen = self.pen;
-                self.tpl = (self.intern(pen).0 as u64) << 32 | self.semantic_bits();
+                let id = self.intern(pen);
+                self.tpl = self.template(id);
                 self.tpl_pen = pen;
             }
         }
+    }
+
+    fn template(&self, style: StyleId) -> u64 {
+        (style.0 as u64) << 32 | self.semantic_bits() | (self.tpl & LINK_MASK)
     }
 
     #[inline]
@@ -435,6 +445,59 @@ impl Term {
             || !self.autowrap
             || self.single_shift != 0
             || self.charsets[self.gl as usize] != Charset::Ascii;
+    }
+
+    // ---- Hyperlinks ----------------------------------------------------
+
+    /// OSC 8: `params;URI` makes the cells printed next a hyperlink to the
+    /// URI, named by the `id` of the `:`-separated `key=value` params; an
+    /// empty URI ends it. A start whose URI or id is too long, or whose URI
+    /// is not UTF-8, makes no link but still ends the current one.
+    fn hyperlink(&mut self, rest: &[u8]) {
+        let Some(semi) = rest.iter().position(|&b| b == b';') else { return };
+        let (params, uri) = (&rest[..semi], &rest[semi + 1..]);
+        // ghostty keeps the last non-empty id.
+        let id = params.split(|&b| b == b':').filter_map(|kv| kv.strip_prefix(b"id=")).rfind(|id| !id.is_empty());
+        let link = match std::str::from_utf8(uri) {
+            Ok(uri) if !uri.is_empty() && uri.len() <= MAX_URI && id.is_none_or(|id| id.len() <= MAX_ID) => {
+                self.new_link(uri, id)
+            }
+            _ => 0,
+        };
+        self.set_link(link);
+    }
+
+    /// The link a start of `uri` with `id` prints with; 0 when the table is full.
+    fn new_link(&mut self, uri: &str, id: Option<&[u8]>) -> u16 {
+        if let Some(n) = self.links.find(uri, id) {
+            return n;
+        }
+        if self.links.wants_sweep(uri, id) {
+            self.sweep_links();
+        }
+        self.links.insert(uri, id)
+    }
+
+    /// Frees the links that neither a cell nor the template uses.
+    fn sweep_links(&mut self) {
+        let mut live = vec![false; self.links.len()];
+        live[(self.tpl >> Cell::LINK_SHIFT) as usize] = true;
+        for c in self.grid.cells().iter().chain(self.other.cells()) {
+            live[(c.0 >> Cell::LINK_SHIFT) as usize] = true;
+        }
+        self.links.sweep(&live);
+    }
+
+    fn set_link(&mut self, link: u16) {
+        self.tpl = (self.tpl & !LINK_MASK) | (link as u64) << Cell::LINK_SHIFT;
+    }
+
+    /// An OSC longer than the parser keeps, starting with `head`: a
+    /// hyperlink start too long to keep still ends the current link.
+    pub fn osc_overflow(&mut self, head: &[u8]) {
+        if head.starts_with(b"8;") {
+            self.set_link(0);
+        }
     }
 
     // ---- Printing ------------------------------------------------------
@@ -1205,6 +1268,8 @@ impl Term {
         if alt == self.alt_active {
             return;
         }
+        // ghostty ends the hyperlink on a screen switch.
+        self.set_link(0);
         self.other_cursor = self.screen_cursor();
         std::mem::swap(&mut self.grid, &mut self.other);
         self.alt_active = alt;
@@ -1634,6 +1699,7 @@ impl Term {
                 self.mark_all_dirty();
             }
             7 => self.report_pwd(rest),
+            8 if has_rest => self.hyperlink(rest),
             9 if has_rest => match parse_osc9(rest) {
                 Osc9::Notification(body) => self.desktop_notification(b"", body),
                 Osc9::Progress(report) => self.messages.push(Message::ProgressReport(report)),

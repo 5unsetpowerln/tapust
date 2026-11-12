@@ -1,6 +1,6 @@
 use crate::{
-    Attrs, Cell, Color, CursorShape, Message, MouseEncoding, MouseMode, Palette, Point, ProgressReport, Rgb, Selection,
-    Style, Terminal, Underline, Width,
+    Attrs, Cell, Color, CursorShape, LinkId, Message, MouseEncoding, MouseMode, Palette, Point, ProgressReport, Rgb,
+    Selection, Style, Terminal, Underline, Width,
 };
 
 fn term(cols: u16, rows: u16) -> Terminal {
@@ -1331,6 +1331,177 @@ fn ris_removes_the_progress_report() {
     // The reset action resets without telling the surface.
     t.full_reset();
     assert_eq!(t.take_messages(), []);
+}
+
+// ---- Hyperlinks (OSC 8) -----------------------------------------------------
+
+fn link(t: &Terminal, x: u16, y: u16) -> Option<LinkId> {
+    cell(t, x, y).link()
+}
+
+fn uri(t: &Terminal, x: u16, y: u16) -> Option<&str> {
+    t.link_uri(link(t, x, y)?)
+}
+
+fn start(uri: &str) -> String {
+    format!("\x1b]8;;{uri}\x1b\\")
+}
+
+const END: &str = "\x1b]8;;\x1b\\";
+
+#[test]
+fn osc_8_starts_and_ends_a_link_with_either_terminator() {
+    let mut t = term(10, 2);
+    feed(&mut t, &format!("{}ab{END}c\x1b]8;;gemini://b\x07de\x1b]8;;\x07f", start("gemini://a")));
+    assert_eq!(screen(&t), ["abcdef"]);
+    assert_eq!([uri(&t, 0, 0), uri(&t, 1, 0)], [Some("gemini://a"); 2]);
+    assert_eq!(link(&t, 0, 0), link(&t, 1, 0));
+    assert_eq!([uri(&t, 2, 0), uri(&t, 5, 0)], [None; 2]);
+    assert_eq!([uri(&t, 3, 0), uri(&t, 4, 0)], [Some("gemini://b"); 2]);
+    // A start ends the link before it; the URI keeps its semicolons.
+    feed(&mut t, &format!("\r\n{}g{}h{END}", start("gemini://c"), start("gemini://d;e")));
+    assert_eq!([uri(&t, 0, 1), uri(&t, 1, 1)], [Some("gemini://c"), Some("gemini://d;e")]);
+    // Without the separator before the URI, the sequence is ignored.
+    feed(&mut t, &format!("{}i\x1b]8;gemini://f\x1b\\j{END}", start("gemini://g")));
+    assert_eq!([uri(&t, 2, 1), uri(&t, 3, 1)], [Some("gemini://g"); 2]);
+}
+
+#[test]
+fn osc_8_links_are_the_same_only_with_the_same_id_and_uri() {
+    let mut t = term(12, 4);
+    let named = |id: &str, uri: &str, text: &str| format!("\x1b]8;id={id};{uri}\x1b\\{text}{END}");
+    // Far apart under the same id and URI: one link. Another id, another
+    // URI, or no id: other links. An empty id is no id; other keys are skipped.
+    feed(&mut t, &named("x", "gemini://a", "ab"));
+    feed(&mut t, &format!("-\r\n{}", named("x", "gemini://a", "c")));
+    feed(&mut t, &named("x", "gemini://b", "d"));
+    feed(&mut t, &named("y", "gemini://a", "e"));
+    feed(&mut t, &format!("{}f{END}{}g{END}", start("gemini://a"), start("gemini://a")));
+    feed(&mut t, &format!("\x1b]8;id=;gemini://a\x1b\\h{END}\x1b]8;k=v:id=x:z;gemini://a\x1b\\i{END}"));
+    assert_eq!(screen(&t), ["ab-", "cdefghi"]);
+    let a = link(&t, 0, 0).unwrap();
+    assert_eq!([link(&t, 1, 0), link(&t, 0, 1), link(&t, 6, 1)], [Some(a); 3]);
+    let others = [1, 2, 3, 4, 5].map(|x| link(&t, x, 1).unwrap());
+    for (i, l) in others.iter().enumerate() {
+        assert_ne!(*l, a, "cell {}", i + 1);
+        assert!(others[i + 1..].iter().all(|m| m != l), "cell {}", i + 1);
+    }
+    assert_eq!(uri(&t, 5, 1), Some("gemini://a"));
+    // One start without an id covers every cell printed under it.
+    feed(&mut t, &format!("\r\n{}0123456789abcd{END}", start("gemini://long")));
+    let l = link(&t, 0, 2);
+    assert!(l.is_some());
+    assert!((0..12).all(|x| link(&t, x, 2) == l) && (0..2).all(|x| link(&t, x, 3) == l));
+}
+
+#[test]
+fn osc_8_ignores_links_too_long_and_ends_the_current_one() {
+    let mut t = term(10, 5);
+    let longest = format!("gemini://{}", "a".repeat(2048 - 9));
+    let id = |n: usize| format!("\x1b]8;id={};gemini://b\x1b\\", "i".repeat(n));
+    feed(&mut t, &format!("{}a{}b{END}", start(&longest), id(250)));
+    assert_eq!([uri(&t, 0, 0), uri(&t, 1, 0)], [Some(longest.as_str()), Some("gemini://b")]);
+    // Too long a URI or id, a URI that is not UTF-8, or more than the
+    // parser keeps: no link for the cells after it.
+    let refused: [Vec<u8>; 4] = [
+        start(&format!("{longest}a")).into(),
+        id(251).into(),
+        b"\x1b]8;;gemini://\xff\x1b\\".to_vec(),
+        start(&"a".repeat(5000)).into(),
+    ];
+    for (y, seq) in (1..).zip(refused) {
+        feed(&mut t, &format!("\r\n{}c", start("gemini://c")));
+        t.feed(&seq);
+        feed(&mut t, &format!("d{END}"));
+        assert_eq!([uri(&t, 0, y), uri(&t, 1, y)], [Some("gemini://c"), None], "row {y}");
+    }
+    // Other commands longer than the parser keeps are still ignored.
+    feed(&mut t, &format!("\x1b]2;{}\x1b\\", "a".repeat(5000)));
+    assert_eq!(t.title(), "");
+}
+
+#[test]
+fn ris_and_a_screen_switch_end_the_link() {
+    let mut t = term(10, 2);
+    feed(&mut t, &format!("{}a\x1bcb", start("gemini://a")));
+    assert_eq!(screen(&t), ["b"]);
+    assert_eq!(link(&t, 0, 0), None);
+    // Switching to the alternate screen and back.
+    feed(&mut t, &format!("\r{}a\x1b[?1049h\x1b[Hb", start("gemini://a")));
+    assert_eq!(screen(&t), ["b"]);
+    assert_eq!(uri(&t, 0, 0), None);
+    feed(&mut t, &format!("{}c\x1b[?1049ld", start("gemini://b")));
+    assert_eq!(screen(&t), ["ad"]);
+    assert_eq!([uri(&t, 0, 0), uri(&t, 1, 0)], [Some("gemini://a"), None]);
+    // As in ghostty, DECSTR keeps it and DECRC does not restore the link
+    // of DECSC.
+    feed(&mut t, &format!("\r\n{}a\x1b[!pb{END}\x1b7{}\x1b8c{END}", start("gemini://b"), start("gemini://c")));
+    let uris = [0, 1, 2].map(|x| uri(&t, x, 1));
+    assert_eq!(uris, [Some("gemini://b"), Some("gemini://b"), Some("gemini://c")]);
+}
+
+#[test]
+fn erasing_or_overwriting_a_cell_removes_its_link() {
+    let mut t = term(10, 2);
+    feed(&mut t, &format!("{}abcdefgh{END}\rX\x1b[2CY\x1b[1X\x1b[3C\x1b[K", start("gemini://a")));
+    assert_eq!(screen(&t), ["XbcY fg"]);
+    let linked: Vec<bool> = (0..8).map(|x| link(&t, x, 0).is_some()).collect();
+    assert_eq!(linked, [false, true, true, false, false, true, true, false]);
+    // A wide character's tail is part of its link, also once VS16 widens it.
+    feed(&mut t, &format!("\r\n{}\u{4e00}\u{2764}\u{fe0f}{END}", start("gemini://w")));
+    assert_eq!((0..4).map(|x| uri(&t, x, 1)).collect::<Vec<_>>(), [Some("gemini://w"); 4]);
+    assert_wide_pairs(&t);
+}
+
+#[test]
+fn links_no_cell_uses_are_reclaimed() {
+    // Many long links over the same cell: the held bytes trigger sweeps.
+    let mut t = term(10, 2);
+    let long = "a".repeat(1000);
+    for i in 0..3000 {
+        feed(&mut t, &format!("\r{}x{END}", start(&format!("gemini://{i}/{long}"))));
+    }
+    assert!(t.term.links.held() <= (1 << 20) / 1000 + 1, "{}", t.term.links.held());
+    assert_eq!(uri(&t, 0, 0), Some(format!("gemini://2999/{long}").as_str()));
+    // More short links than ids over the same cell: running out of ids
+    // triggers a sweep. A named link no cell uses is forgotten with its id,
+    // so the same id and URI later make a new link, not one to a reused id.
+    let mut t = term(10, 2);
+    feed(&mut t, &format!("\r\n\x1b]8;id=n;gemini://n\x1b\\y{END}\ry"));
+    let mut s = String::new();
+    for i in 0..70_000 {
+        s.push_str(&format!("\r{}x{END}", start(&format!("gemini://{i}"))));
+    }
+    feed(&mut t, &s);
+    assert!(t.term.links.held() < 5000, "{}", t.term.links.held());
+    assert_eq!(uri(&t, 0, 1), Some("gemini://69999"));
+    feed(&mut t, &format!("\x1b]8;id=n;gemini://n\x1b\\z{END}"));
+    assert_eq!(uri(&t, 1, 1), Some("gemini://n"));
+}
+
+#[test]
+fn links_in_use_survive_sweeps_and_a_full_table_refuses_new_ones() {
+    // Every cell of the screen and scrollback keeps its own link: past the
+    // ids, new links are refused until cells free some.
+    let mut t = Terminal::new(100, 10, 700);
+    let mut s = String::new();
+    for i in 0..70_000 {
+        s.push_str(&format!("{}x{END}", start(&format!("gemini://{i}"))));
+    }
+    feed(&mut t, &s);
+    let top = t.first_line();
+    let uri_of = |i: u64| t.line(top + i / 100).unwrap()[(i % 100) as usize].link().and_then(|l| t.link_uri(l));
+    assert_eq!(uri_of(0), Some("gemini://0"));
+    assert_eq!(uri_of(65_534), Some("gemini://65534"));
+    assert_eq!(uri_of(65_535), None);
+    assert_eq!(t.term.links.held(), 65_535);
+    // Clearing the scrollback frees the ids once enough links were asked for.
+    feed(&mut t, "\x1b[3J\x1b[2J\x1b[H");
+    for i in 0..4096 {
+        feed(&mut t, &format!("\r{}x{END}", start(&format!("gemini://new{i}"))));
+    }
+    assert_eq!(uri(&t, 0, 0), Some("gemini://new4095"));
+    assert!(t.term.links.held() < 4096);
 }
 
 // ---- Selection --------------------------------------------------------------

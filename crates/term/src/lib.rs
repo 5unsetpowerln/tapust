@@ -8,6 +8,7 @@
 
 pub mod cell;
 mod grid;
+mod link;
 mod palette;
 mod parser;
 #[cfg(test)]
@@ -19,7 +20,7 @@ mod term;
 #[cfg(test)]
 mod tests;
 
-pub use cell::{Attrs, Cell, Color, Semantic, Style, StyleId, Underline, Width};
+pub use cell::{Attrs, Cell, Color, LinkId, Semantic, Style, StyleId, Underline, Width};
 pub use grid::PromptMark;
 pub use selection::{Point, Selection};
 pub use term::PromptClick;
@@ -236,6 +237,13 @@ impl Terminal {
     /// The style of a style id found in a cell; id 0 is [`Style::DEFAULT`].
     pub fn style(&self, id: StyleId) -> &Style {
         self.term.styles.get(id)
+    }
+
+    /// The URI of a hyperlink found in a cell. The terminal reuses the id
+    /// of a link once no cell has it, so a link kept across output may be
+    /// gone or another one.
+    pub fn link_uri(&self, link: LinkId) -> Option<&str> {
+        self.term.links.uri(link.0.get())
     }
 
     pub fn palette(&self) -> &Palette {
