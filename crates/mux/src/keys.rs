@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::copy::{self, ModeAction};
 use crate::prompt::PromptKind;
-use crate::{Command, Direction, Key, KeyCode, KeyResult, Layout, Session};
+use crate::{Command, Direction, Effect, Key, KeyCode, KeyResult, Layout, Session};
 
 /// The `repeat-time` option.
 pub(crate) const REPEAT_TIME: Duration = Duration::from_millis(500);
@@ -80,8 +80,23 @@ fn split(horizontal: bool, full: bool) -> Option<Binding> {
     run(Command::SplitWindow { horizontal, before: false, full, cwd_of_active: true })
 }
 
-pub(crate) fn is_prefix(key: Key) -> bool {
+/// Whether `key` is the `prefix` option (C-b).
+pub fn is_prefix(key: Key) -> bool {
     key.code == KeyCode::Char('b') && key.mods.ctrl && !key.mods.meta
+}
+
+/// The command the prefix table binds `key` to, as tmux's list-keys shows
+/// it; `None` when `key` is unbound or bound to what the model does not do.
+pub fn prefix_command(key: Key) -> Option<String> {
+    Some(match prefix_binding(key)?.action {
+        Action::Run(cmd) => cmd.to_string(),
+        Action::RenamePrompt { session: true } => r##"command-prompt -I "#S" { rename-session -- "%%" }"##.to_owned(),
+        Action::RenamePrompt { session: false } => r##"command-prompt -I "#W" { rename-window -- "%%" }"##.to_owned(),
+        Action::ConfirmKill { window: true } => r##"confirm-before -p "kill-window #W? (y/n)" kill-window"##.to_owned(),
+        Action::ConfirmKill { window: false } => r##"confirm-before -p "kill-pane #P? (y/n)" kill-pane"##.to_owned(),
+        Action::AlertWindow { next } => format!("{}-window -a", if next { "next" } else { "previous" }),
+        Action::Mode(_) | Action::Unsupported => return None,
+    })
 }
 
 /// The prefix table: tmux 3.6 defaults with tmux-pain-control on top.
@@ -252,6 +267,15 @@ impl Session {
             }
             return KeyResult::Forward(self.cur().active);
         }
+    }
+
+    /// Session::run_prefix_binding: the binding runs as from the prefix
+    /// table, which leaves the key tables at the root without repeating.
+    pub(crate) fn run_binding(&mut self, key: Key, now: Instant) -> Vec<Effect> {
+        self.tick(now);
+        let Some(binding) = prefix_binding(key) else { return Vec::new() };
+        self.keys = KeyState::default();
+        self.op(|s| s.dispatch(binding.action, now))
     }
 
     fn dispatch(&mut self, action: Action, now: Instant) {

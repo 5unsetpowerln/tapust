@@ -24,6 +24,7 @@ pub enum Binding {
     Scroll(Scroll),
     SelectAll,
     FontSize(FontSize),
+    ToggleCommandPalette,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +68,7 @@ pub fn binding(keyval: gdk::Key, state: gdk::ModifierType) -> Option<Binding> {
         _ if ctrl_shift && keyval.to_lower() == K::c => Binding::Copy { performable: true },
         _ if ctrl_shift && keyval.to_lower() == K::v => Binding::Paste { primary: false },
         _ if ctrl_shift && keyval.to_lower() == K::a => Binding::SelectAll,
+        _ if ctrl_shift && keyval.to_lower() == K::p => Binding::ToggleCommandPalette,
         // By the character typed, whether the layout needs shift for it or
         // not: ctrl++ is ctrl+shift+= on a US layout, ctrl+= on a German one.
         _ if held.difference(M::SHIFT_MASK) == M::CONTROL_MASK => match keyval.to_unicode()? {
@@ -165,6 +167,8 @@ mod tests {
         assert_eq!(binding(K::Down, ctrl_shift()), Some(Binding::Scroll(Scroll::NextPrompt)));
         assert_eq!(binding(K::A, ctrl_shift()), Some(Binding::SelectAll));
         assert_eq!(binding(K::F, ctrl_shift()), Some(Binding::StartSearch));
+        assert_eq!(binding(K::P, ctrl_shift()), Some(Binding::ToggleCommandPalette));
+        assert_eq!(binding(K::p, CTRL), None);
         assert_eq!(binding(K::Page_Up, M::empty()), None);
         assert_eq!(binding(K::Page_Up, CTRL), None);
         assert_eq!(binding(K::Up, SHIFT), None);

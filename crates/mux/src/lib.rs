@@ -16,6 +16,7 @@
 //! paste buffers, and the GUI reports what each command did.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::time::Instant;
 
 mod copy;
@@ -33,6 +34,7 @@ mod window;
 mod tests;
 
 pub use copy::{CopyCommand, ModeKeys, SearchArg};
+pub use keys::{is_prefix, prefix_command};
 pub use layout::Layout;
 pub use server::Server;
 pub use split::{f16, Node, Split};
@@ -281,6 +283,55 @@ pub enum Command {
     DeleteBuffer,
 }
 
+/// The command as tmux's list-keys shows it.
+impl fmt::Display for Command {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const CWD: &str = " -c \"#{pane_current_path}\"";
+        let flag = |dir: Direction| match dir {
+            Direction::Left => "-L",
+            Direction::Right => "-R",
+            Direction::Up => "-U",
+            Direction::Down => "-D",
+        };
+        let opt = |on: bool, text: &'static str| if on { text } else { "" };
+        match self {
+            Command::SplitWindow { horizontal, before, full, cwd_of_active } => {
+                let side = if *horizontal { 'h' } else { 'v' };
+                write!(f, "split-window -{}{}{side}{}", opt(*before, "b"), opt(*full, "f"), opt(*cwd_of_active, CWD))
+            }
+            Command::NewWindow { cwd_of_active, after } => {
+                write!(f, "new-window{}{}", opt(*after, " -a"), opt(*cwd_of_active, CWD))
+            }
+            Command::SelectPane(dir) => write!(f, "select-pane {}", flag(*dir)),
+            Command::LastPane => f.write_str("last-pane"),
+            Command::NextPane => f.write_str("select-pane -t :.+"),
+            Command::ResizePane(dir, 1) => write!(f, "resize-pane {}", flag(*dir)),
+            Command::ResizePane(dir, cells) => write!(f, "resize-pane {} {cells}", flag(*dir)),
+            Command::ZoomPane => f.write_str("resize-pane -Z"),
+            Command::KillPane => f.write_str("kill-pane"),
+            Command::KillWindow => f.write_str("kill-window"),
+            Command::BreakPane => f.write_str("break-pane"),
+            Command::SwapPane { up } => write!(f, "swap-pane {}", if *up { "-U" } else { "-D" }),
+            Command::RotateWindow { down } => write!(f, "rotate-window{}", opt(*down, " -D")),
+            Command::SelectWindow(index) => write!(f, "select-window -t :={index}"),
+            Command::NextWindow => f.write_str("next-window"),
+            Command::PreviousWindow => f.write_str("previous-window"),
+            Command::LastWindow => f.write_str("last-window"),
+            Command::SwapWindow(offset) => write!(f, "swap-window -d -t {offset:+}"),
+            Command::SelectLayout(layout) => write!(f, "select-layout {}", layout.name()),
+            Command::NextLayout => f.write_str("next-layout"),
+            Command::PreviousLayout => f.write_str("previous-layout"),
+            Command::SpreadOut => f.write_str("select-layout -E"),
+            Command::RenameWindow(name) => write!(f, "rename-window -- {name:?}"),
+            Command::RenameSession(name) => write!(f, "rename-session -- {name:?}"),
+            Command::SendPrefix => f.write_str("send-prefix"),
+            Command::CopyMode { page_up } => write!(f, "copy-mode{}", opt(*page_up, " -u")),
+            Command::PasteBuffer { bracket } => write!(f, "paste-buffer{}", opt(*bracket, " -p")),
+            Command::DeleteBuffer => f.write_str("delete-buffer"),
+        }
+    }
+}
+
 /// Result of [`Session::command`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandOutput {
@@ -454,6 +505,13 @@ impl Session {
     /// Offers a key to the key tables (prefix, repeat, prompts, copy mode).
     pub fn key(&mut self, key: Key, now: Instant) -> KeyResult {
         self.handle_key(key, now)
+    }
+
+    /// Runs what the prefix table binds `key` to, as the prefix and then
+    /// `key` would, but without the repeat time of a `-r` binding: the
+    /// binding was picked from a list, such as the GUI's command palette.
+    pub fn run_prefix_binding(&mut self, key: Key, now: Instant) -> Vec<Effect> {
+        self.run_binding(key, now)
     }
 
     /// Whether the pane is in copy mode.

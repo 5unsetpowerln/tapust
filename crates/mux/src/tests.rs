@@ -531,6 +531,50 @@ fn prefix_prefix_writes_ctrl_b() {
 }
 
 #[test]
+fn prefix_commands_read_as_tmux_lists_them() {
+    let cwd = " -c \"#{pane_current_path}\"";
+    let command = |k: Key| prefix_command(k).unwrap();
+    assert_eq!(command(ch('|')), format!("split-window -h{cwd}"));
+    assert_eq!(command(ch('"')), format!("split-window -v{cwd}"));
+    assert_eq!(command(ch('\\')), format!("split-window -fh{cwd}"));
+    assert_eq!(command(ch('c')), format!("new-window{cwd}"));
+    assert_eq!(command(ch('H')), "resize-pane -L 5");
+    assert_eq!(command(Key { code: KeyCode::Up, mods: Mods { ctrl: true, ..Mods::default() } }), "resize-pane -U");
+    assert_eq!(command(ch('<')), "swap-window -d -t -1");
+    assert_eq!(command(ch('>')), "swap-window -d -t +1");
+    assert_eq!(command(ch('o')), "select-pane -t :.+");
+    assert_eq!(command(ctrl('o')), "rotate-window");
+    assert_eq!(command(meta(KeyCode::Char('5'))), "select-layout tiled");
+    assert_eq!(command(key(KeyCode::PageUp)), "copy-mode -u");
+    assert_eq!(command(ch('x')), "confirm-before -p \"kill-pane #P? (y/n)\" kill-pane");
+    assert_eq!(command(ch(',')), "command-prompt -I \"#W\" { rename-window -- \"%%\" }");
+    // Unbound keys, and defaults the model does not implement.
+    assert_eq!(prefix_command(ch('Y')), None);
+    assert_eq!(prefix_command(ch('d')), None);
+    assert_eq!(prefix_command(ctrl('z')), None);
+}
+
+#[test]
+fn a_prefix_binding_run_from_a_list_leaves_no_repeat() {
+    let t = Instant::now();
+    let mut s = new_session();
+    ok(&mut s, split(true));
+    select_index(&mut s, 0);
+    let resize = vec![Effect::ResizeSplit { pane: 0, horizontal: true, cells: 5 }];
+    assert_eq!(s.run_prefix_binding(ch('L'), t), resize);
+    assert_eq!(s.deadline(), None);
+    assert_eq!(s.key(ch('L'), t), KeyResult::Forward(0));
+    // A prefix pressed before ends with the binding, as a key would end it.
+    s.key(ctrl('b'), t);
+    s.run_prefix_binding(ch('z'), t);
+    assert!(s.windows()[0].zoomed);
+    assert_eq!(s.key(ch('z'), t), KeyResult::Forward(0));
+    // A binding that asks first opens its prompt.
+    s.run_prefix_binding(ch('x'), t);
+    assert!(matches!(s.overlay(), Some(Overlay::Confirm { target: ConfirmTarget::Pane, .. })));
+}
+
+#[test]
 fn confirm_kill_pane() {
     let t = Instant::now();
     let mut s = new_session();

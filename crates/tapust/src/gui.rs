@@ -23,6 +23,7 @@ use crate::bindings::{self, Binding, Scroll};
 use crate::compose;
 use crate::input;
 use crate::notifications;
+use crate::palette::{self, Run};
 use crate::pty::{ChildExit, PaneIo, Pty};
 use crate::surface::{Event, Surface};
 use crate::theme;
@@ -552,6 +553,21 @@ impl App {
             window.close();
         }
     }
+
+    /// ghostty's jump commands for the command palette: one for every
+    /// terminal of every window, under its title override or title.
+    fn focus_entries(&self) -> Vec<palette::Entry> {
+        let mut entries = Vec::new();
+        for window in self.windows() {
+            let st = window.state.borrow();
+            // A pane hidden by a zoomed split cannot be presented.
+            for p in st.panes.values().filter(|p| p.surface.outer.is_ancestor(&window.window)) {
+                let title = p.title_override.as_deref().unwrap_or(&p.title);
+                entries.push(palette::focus(p.surface.id, title, p.pwd.as_deref()));
+            }
+        }
+        entries
+    }
 }
 
 impl Window {
@@ -880,6 +896,12 @@ impl Window {
             win.app.new_window(Some(parent));
         }));
         add("close", Box::new(|win| win.window.close()));
+        add("toggle-fullscreen", Box::new(|win| win.window.set_fullscreened(!win.window.is_fullscreen())));
+        add("toggle-tab-overview", Box::new(|win| win.overview.set_open(!win.overview.is_open())));
+        add("toggle-command-palette", Box::new(|win| {
+            let pane = win.state.borrow().session.active_pane();
+            win.open_palette(pane);
+        }));
         add("close-split", Box::new(|win| win.confirm_close_split()));
         add("copy", Box::new(|win| {
             if let Some(surface) = win.active_surface() {
@@ -1116,8 +1138,43 @@ impl Window {
             Binding::Scroll(scroll) => surface.scroll(scroll),
             Binding::SelectAll => surface.select_all(),
             Binding::FontSize(change) => surface.set_font_points(bindings::font_points(surface.font_points(), change)),
+            Binding::ToggleCommandPalette => self.open_palette(pane),
         }
         true
+    }
+
+    /// ghostty's toggleCommandPalette, which opens it here: ctrl+shift+p in
+    /// the palette closes it. Its entries run on `pane`, where it was opened
+    /// (ghostty runs them on the window's active surface then).
+    fn open_palette(self: &Rc<Self>, pane: PaneId) {
+        let mut entries = palette::commands();
+        entries.extend(self.app.focus_entries());
+        let weak = Rc::downgrade(self);
+        palette::present(&self.window, entries, move |run| {
+            if let Some(win) = weak.upgrade() {
+                win.run_entry(pane, run);
+            }
+        });
+    }
+
+    /// Runs a command palette entry as its key binding or menu item does;
+    /// nothing runs on a pane that went away while the palette was open.
+    fn run_entry(self: &Rc<Self>, pane: PaneId, run: Run) {
+        let Some(surface) = self.state.borrow().panes.get(&pane).map(|p| p.surface.clone()) else { return };
+        match run {
+            Run::Binding(binding) => {
+                self.perform(pane, binding);
+            }
+            Run::Prefix(key) => {
+                let effects = self.state.borrow_mut().session.run_prefix_binding(key, Instant::now());
+                self.apply(effects);
+                self.queue_reconcile();
+                self.schedule_tick();
+            }
+            // The surface's widget reaches its own actions, the window's and the application's.
+            Run::Action(name) => surface.area.activate_action(name, None).expect("an action of the palette"),
+            Run::Focus(id) => self.app.present_surface(id),
+        }
     }
 
     fn send_key(self: &Rc<Self>, pane: PaneId, key: mux::Key, text: Option<String>) {

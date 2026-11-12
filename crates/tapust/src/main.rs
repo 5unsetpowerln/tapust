@@ -10,6 +10,7 @@ mod input;
 mod links;
 mod mouse;
 mod notifications;
+mod palette;
 mod pty;
 mod renderer;
 mod scroll;
