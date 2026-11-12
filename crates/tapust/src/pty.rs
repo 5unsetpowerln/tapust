@@ -133,6 +133,11 @@ impl Pty {
         cvt(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), &size) })?;
         let master = unsafe { OwnedFd::from_raw_fd(master) };
         let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        // Before any child exists: a child holding the master would keep the
+        // PTY open after tapust dies, so its programs would never hang up.
+        for fd in [&master, &slave] {
+            cvt(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) })?;
+        }
         let mut tio: libc::termios = unsafe { std::mem::zeroed() };
         cvt(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut tio) })?;
         tio.c_iflag |= libc::IUTF8;
@@ -169,7 +174,6 @@ impl Pty {
         let fd = master.as_raw_fd();
         let flags = cvt(unsafe { libc::fcntl(fd, libc::F_GETFL) })?;
         cvt(unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) })?;
-        cvt(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) })?;
         Ok(Pty { master, child, started })
     }
 
