@@ -14,6 +14,7 @@ use gtk::{gdk, gio, glib, graphene};
 use mux::{Direction, PaneId};
 use term::{Point, Selection};
 
+use crate::bindings::{self, Binding, Scroll};
 use crate::compose;
 use crate::font::Fonts;
 use crate::frame::{Frame, Grid};
@@ -171,6 +172,9 @@ pub struct Surface {
     /// ghostty's context_menu, made on the first right click.
     menu: RefCell<Option<gtk::PopoverMenu>>,
     last_blink_reset: Cell<Option<Instant>>,
+    /// The pane's font size (ghostty's font_size), which its fonts are
+    /// loaded at, multiplied by `font_scale`.
+    font_points: Cell<f32>,
     font_scale: Cell<f64>,
     cell_idle: Cell<bool>,
     handler: Handler,
@@ -244,8 +248,8 @@ fn button_of(number: u32) -> Option<mouse::Button> {
     }
 }
 
-fn load_fonts(scale: f64) -> Option<Fonts> {
-    Fonts::new(theme::FONT_FAMILY, theme::FONT_POINTS, scale)
+fn load_fonts(points: f32, scale: f64) -> Option<Fonts> {
+    Fonts::new(theme::FONT_FAMILY, points, scale)
         .inspect_err(|err| eprintln!("tapust: cannot load fonts: {err}"))
         .ok()
 }
@@ -273,7 +277,7 @@ fn drop_direction(x: f64, y: f64, w: f64, h: f64) -> Direction {
 }
 
 impl Surface {
-    pub fn new(pane: PaneId, term_bg: [u8; 4], handler: Handler) -> Rc<Surface> {
+    pub fn new(pane: PaneId, term_bg: [u8; 4], font_points: f32, handler: Handler) -> Rc<Surface> {
         let area = gtk::GLArea::builder().hexpand(true).vexpand(true).focusable(true).focus_on_click(true).build();
         area.set_allowed_apis(gdk::GLAPI::GL);
         area.set_required_version(3, 3);
@@ -431,6 +435,7 @@ impl Surface {
             hover: RefCell::new(None),
             menu: RefCell::new(None),
             last_blink_reset: Cell::new(None),
+            font_points: Cell::new(font_points),
             font_scale: Cell::new(0.0),
             cell_idle: Cell::new(false),
             handler: handler.clone(),
@@ -463,7 +468,7 @@ impl Surface {
                 return;
             }
             let scale = area.native().and_then(|n| n.surface()).map_or(1.0, |s| s.scale());
-            let Some(fonts) = load_fonts(scale) else { return };
+            let Some(fonts) = load_fonts(s.font_points.get(), scale) else { return };
             s.draw.borrow_mut().renderer = Some(Renderer::new(crate::gl::context(), fonts));
             s.im.set_client_widget(Some(area));
             s.font_scale.set(scale);
@@ -477,41 +482,11 @@ impl Surface {
                 s.im.set_client_widget(None::<&gtk::Widget>);
             }
         });
-        let (weak, h) = (Rc::downgrade(self), handler.clone());
-        self.area.connect_resize(move |area, width, height| {
-            let Some(s) = weak.upgrade() else { return };
-            let scale = area.native().and_then(|n| n.surface()).map_or(1.0, |s| s.scale());
-            let (cols, rows, cell) = {
-                let mut d = s.draw.borrow_mut();
-                let Some(renderer) = d.renderer.as_mut() else { return };
-                // ghostty's content scale callback: a new scale needs fonts
-                // rasterized for it.
-                if scale != s.font_scale.get()
-                    && let Some(fonts) = load_fonts(scale)
-                {
-                    renderer.set_fonts(fonts);
-                    s.font_scale.set(scale);
-                    s.schedule_cell_size();
-                }
-                renderer.resize(width as u32, height as u32);
-                let (cw, ch) = renderer.cell_size();
-                let pad = padding(scale);
-                let fit = |size: i32, cell: u32| ((size.max(0) as u32).saturating_sub(2 * pad) / cell.max(1)).max(1) as u16;
-                let (cols, rows) = (fit(width, cw), fit(height, ch));
-                let bg = d.term_bg;
-                d.frame.grids = vec![Grid::new(s.pane, (0, 0, width as u32, height as u32), (pad as i32, pad as i32), (cols, rows), bg)];
-                d.full = true;
-                (cols, rows, (cw, ch))
-            };
-            s.size.set((cols, rows));
-            // ghostty shows the overlay whenever the pixel size changes,
-            // except for the first size.
-            let old = s.pixels.replace((width, height));
-            if old != (width, height) && old != (0, 0) && s.created.elapsed() >= theme::RESIZE_OVERLAY_DELAY {
-                s.schedule_resize_overlay();
+        let weak = Rc::downgrade(self);
+        self.area.connect_resize(move |_, width, height| {
+            if let Some(s) = weak.upgrade() {
+                s.resized(width, height);
             }
-            h(Event::Resized { pane: s.pane, cols, rows, cell });
-            s.refresh_search();
         });
         let weak = Rc::downgrade(self);
         self.area.connect_render(move |_, _| {
@@ -778,7 +753,7 @@ impl Surface {
             let enter = matches!(keyval, gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::ISO_Enter);
             if enter && state.contains(gdk::ModifierType::SHIFT_MASK) {
                 s.navigate_search(false);
-            } else if search::is_start_search(keyval, state) {
+            } else if bindings::binding(keyval, state) == Some(Binding::StartSearch) {
                 s.start_search();
             } else {
                 return glib::Propagation::Proceed;
@@ -835,6 +810,69 @@ impl Surface {
             s.outer.set_size_request(logical(cw) + pad, logical(ch) + pad);
             (s.handler)(Event::CellSize { cell: (cw, ch) });
         });
+    }
+
+    /// The grid that fits `width` x `height` device pixels of the GLArea
+    /// with the cell size of its fonts, told to the application. GTK asks
+    /// for this with the GL context current.
+    fn resized(self: &Rc<Self>, width: i32, height: i32) {
+        let scale = self.area.native().and_then(|n| n.surface()).map_or(1.0, |s| s.scale());
+        let (cols, rows, cell) = {
+            let mut d = self.draw.borrow_mut();
+            let Some(renderer) = d.renderer.as_mut() else { return };
+            // ghostty's content scale callback: a new scale needs fonts
+            // rasterized for it.
+            if scale != self.font_scale.get()
+                && let Some(fonts) = load_fonts(self.font_points.get(), scale)
+            {
+                renderer.set_fonts(fonts);
+                self.font_scale.set(scale);
+                self.schedule_cell_size();
+            }
+            renderer.resize(width as u32, height as u32);
+            let (cw, ch) = renderer.cell_size();
+            let pad = padding(scale);
+            let fit = |size: i32, cell: u32| ((size.max(0) as u32).saturating_sub(2 * pad) / cell.max(1)).max(1) as u16;
+            let (cols, rows) = (fit(width, cw), fit(height, ch));
+            let bg = d.term_bg;
+            d.frame.grids = vec![Grid::new(self.pane, (0, 0, width as u32, height as u32), (pad as i32, pad as i32), (cols, rows), bg)];
+            d.full = true;
+            (cols, rows, (cw, ch))
+        };
+        self.size.set((cols, rows));
+        // ghostty shows the overlay whenever the pixel size changes,
+        // except for the first size.
+        let old = self.pixels.replace((width, height));
+        if old != (width, height) && old != (0, 0) && self.created.elapsed() >= theme::RESIZE_OVERLAY_DELAY {
+            self.schedule_resize_overlay();
+        }
+        (self.handler)(Event::Resized { pane: self.pane, cols, rows, cell });
+        self.refresh_search();
+    }
+
+    pub fn font_points(&self) -> f32 {
+        self.font_points.get()
+    }
+
+    /// ghostty's setFontSize: the fonts at `points`, and the grid that fits
+    /// the same pixels with their cell size; the split keeps its size.
+    pub fn set_font_points(self: &Rc<Self>, points: f32) {
+        if points == self.font_points.get() {
+            return;
+        }
+        let Some(fonts) = load_fonts(points, self.font_scale.get()) else { return };
+        {
+            let mut d = self.draw.borrow_mut();
+            let Some(renderer) = d.renderer.as_mut() else { return };
+            self.area.make_current();
+            renderer.set_fonts(fonts);
+        }
+        self.font_points.set(points);
+        self.schedule_cell_size();
+        let (width, height) = self.pixels.get();
+        self.resized(width, height);
+        self.area.queue_render();
+        self.sync_scrollbar();
     }
 
     /// ghostty's ResizeOverlay.schedule: GtkGLArea emits `resize` while the
@@ -981,6 +1019,17 @@ impl Surface {
         let term = shared.term.lock();
         let text = selection::text(&term, &term.selection()?);
         (!text.is_empty()).then_some(text)
+    }
+
+    /// ghostty's select_all, copied to the primary selection like a
+    /// selection made with the mouse.
+    pub fn select_all(&self) {
+        let Some(shared) = self.draw.borrow().shared.clone() else { return };
+        let all = selection::all(&shared.term.lock());
+        if all.is_some() {
+            self.set_selection(all);
+            self.copy_primary();
+        }
     }
 
     /// ghostty's copy-on-select = primary.
@@ -1367,21 +1416,32 @@ impl Surface {
         }
     }
 
-    /// ghostty's scroll-to-bottom on a keystroke that writes to the PTY.
-    pub fn scroll_to_bottom(&self) {
+    /// Moves the view `delta` lines up into the scrollback (negative: down)
+    /// as far as it goes; returns whether it moved.
+    fn scroll_view(&self, delta: impl FnOnce(&term::Terminal) -> isize) -> bool {
         {
             let mut d = self.draw.borrow_mut();
-            let Some(shared) = d.shared.clone() else { return };
+            let Some(shared) = d.shared.clone() else { return false };
             let mut term = shared.term.lock();
-            let offset = term.view_offset() as isize;
-            if offset == 0 {
-                return;
+            let before = term.view_offset();
+            let delta = delta(&term);
+            term.scroll_view(delta);
+            if term.view_offset() == before {
+                return false;
             }
-            term.scroll_view(-offset);
             d.full = true;
         }
         self.area.queue_render();
-        self.sync_scrollbar();
+        true
+    }
+
+    /// ghostty's scroll_page_up and _down, scroll_to_top and _bottom (also
+    /// scroll-to-bottom on a keystroke that writes to the PTY) and
+    /// jump_to_prompt.
+    pub fn scroll(&self, scroll: Scroll) {
+        if self.scroll_view(|term| bindings::scroll_delta(term, scroll)) {
+            self.sync_scrollbar();
+        }
     }
 
     /// ghostty's setScrollbar from the terminal's scrollback.
@@ -1398,20 +1458,11 @@ impl Surface {
 
     /// ghostty's scroll_to_row from the scrollbar: `value` is the top row.
     fn scroll_to_row(&self, value: f64) {
-        {
-            let mut d = self.draw.borrow_mut();
-            let Some(shared) = d.shared.clone() else { return };
-            let mut term = shared.term.lock();
+        self.scroll_view(|term| {
             let history = term.history_len();
             let row = (value.round().max(0.0) as usize).min(history);
-            let delta = (history - row) as isize - term.view_offset() as isize;
-            if delta == 0 {
-                return;
-            }
-            term.scroll_view(delta);
-            d.full = true;
-        }
-        self.area.queue_render();
+            (history - row) as isize - term.view_offset() as isize
+        });
     }
 
     /// ghostty's start_search: shows the search overlay and focuses its entry

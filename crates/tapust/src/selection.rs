@@ -311,7 +311,7 @@ pub fn drag_lines(term: &Terminal, click: Point, drag: Point) -> Option<Selectio
 
 /// PromptIterator(.left_up): the first line of the prompt at or above
 /// `line`, walking a run of continuation lines up to its prompt line.
-fn prompt_above(term: &Terminal, line: u64) -> Option<u64> {
+pub fn prompt_above(term: &Terminal, line: u64) -> Option<u64> {
     let first = term.first_line();
     let mut l = line;
     loop {
@@ -337,7 +337,7 @@ fn prompt_above(term: &Terminal, line: u64) -> Option<u64> {
 
 /// PromptIterator(.right_down): the first line of the first prompt at or
 /// below `line`, and the line after its run of continuation lines.
-fn prompt_below(term: &Terminal, line: u64) -> Option<(u64, u64)> {
+pub fn prompt_below(term: &Terminal, line: u64) -> Option<(u64, u64)> {
     let start = (line..term.end_line()).find(|&l| term.line_prompt(l) != PromptMark::None)?;
     let after = (start + 1..term.end_line()).find(|&l| term.line_prompt(l) != PromptMark::Continuation);
     Some((start, after.unwrap_or(term.end_line())))
@@ -403,6 +403,21 @@ pub fn drag_output(term: &Terminal, click: Point, drag: Point) -> Option<Selecti
         sel.end = current.end;
     }
     Some(sel)
+}
+
+/// Screen.selectAll: the scrollback and the screen from the first to the
+/// last cell with text other than whitespace.
+pub fn all(term: &Terminal) -> Option<Selection> {
+    let cols = term.cols();
+    let lines = term.first_line()..term.end_line();
+    let mut cells = lines.flat_map(|line| (0..cols).map(move |col| Point { line, col }));
+    let text = |p: &Point| {
+        term.line(p.line).and_then(|row| char_at(row[p.col as usize])).is_some_and(|c| !LINE_WHITESPACE.contains(&c))
+    };
+    let start = cells.find(text)?;
+    // Only the cells after `start` are left, and none of them may hold text.
+    let end = cells.rfind(text).unwrap_or(start);
+    Some(Selection { start, end, rect: false })
 }
 
 /// The selected text as ghostty copies it (plain, unwrapped, trimmed):
@@ -544,6 +559,23 @@ mod tests {
         // Inside one cell, crossing 60% selects it; staying before does not.
         assert!(drag_cells(&t, p(1, 11.0), p(1, 15.0), false, 10).is_none());
         assert!(drag_cells(&t, p(1, 11.0), p(1, 17.0), false, 10).is_some());
+    }
+
+    #[test]
+    fn all_spans_the_scrollback_without_the_whitespace_around() {
+        let mut t = term(10, 3, "\r\n  first\r\n");
+        for i in 0..5 {
+            t.feed(format!("{i}\r\n").as_bytes());
+        }
+        t.feed(b"last \t \r\n");
+        let s = all(&t).unwrap();
+        assert_eq!((s.start, s.end), (Point { line: 1, col: 2 }, Point { line: 7, col: 3 }));
+        assert!(t.view_top() > 1);
+        assert_eq!(text(&t, &s), "first\n0\n1\n2\n3\n4\nlast");
+        assert!(all(&term(10, 3, " \t ")).is_none());
+        let t = term(10, 3, "  x");
+        let s = all(&t).unwrap();
+        assert_eq!((s.start, s.end), (at(&t, 0, 2), at(&t, 0, 2)));
     }
 
     #[test]

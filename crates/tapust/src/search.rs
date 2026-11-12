@@ -4,17 +4,10 @@
 use std::time::Instant;
 
 use adw::prelude::*;
-use gtk::{gdk, glib};
+use gtk::glib;
 use term::{Selection, Terminal};
 
 use crate::theme;
-
-/// ghostty's default start_search trigger, ctrl+shift+f.
-pub fn is_start_search(keyval: gdk::Key, state: gdk::ModifierType) -> bool {
-    use gdk::ModifierType as M;
-    let held = state & (M::CONTROL_MASK | M::SHIFT_MASK | M::ALT_MASK | M::SUPER_MASK | M::HYPER_MASK | M::META_MASK);
-    held == M::CONTROL_MASK | M::SHIFT_MASK && keyval.to_lower() == gdk::Key::f
-}
 
 /// ghostty's GhosttySearchOverlay: an entry, the match count and buttons at
 /// the top right of the surface, shown while a search is open.

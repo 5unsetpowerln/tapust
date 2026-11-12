@@ -324,8 +324,8 @@ impl Renderer {
         }
     }
 
-    /// Switches to fonts of another scale: every cached glyph and grid is
-    /// drawn again. Needs the GL context current.
+    /// Switches to fonts of another size or scale: every cached glyph and
+    /// grid is drawn again. Needs the GL context current.
     pub fn set_fonts(&mut self, fonts: Fonts) {
         self.fonts = fonts;
         *self.ascii = [[None; 128]; 4];

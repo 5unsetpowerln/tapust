@@ -29,7 +29,7 @@ pub(crate) fn new_session() -> (Session, Vec<Effect>) {
     };
     let effects = s.op(|s| {
         let idx = s.free_index();
-        s.spawn_window(idx, None);
+        s.spawn_window(idx, None, false);
         s.curw = idx;
     });
     (s, effects)
@@ -59,9 +59,9 @@ impl Session {
         for pane in before.difference(&after) {
             effects.push(Effect::Destroy { pane: *pane });
         }
-        for (pane, cwd_of) in spawned {
+        for (pane, parent, inherit_cwd) in spawned {
             if after.contains(&pane) {
-                effects.push(Effect::Spawn { pane, cwd_of });
+                effects.push(Effect::Spawn { pane, parent, inherit_cwd });
             }
         }
         effects.append(&mut self.writes);
@@ -112,7 +112,7 @@ impl Session {
 
     /// spawn_window for a new window at `idx`, sized for the client; the
     /// caller selects it.
-    fn spawn_window(&mut self, idx: u32, cwd_of: Option<PaneId>) {
+    fn spawn_window(&mut self, idx: u32, parent: Option<PaneId>, inherit_cwd: bool) {
         let pane = self.new_pane();
         let id = pane.id;
         let mut w = Window::new(self.next_window_id, pane);
@@ -121,7 +121,7 @@ impl Session {
         w.panes[0].active_point = self.next_active_point;
         self.next_active_point = self.next_active_point.wrapping_add(1);
         self.winlinks.insert(idx, w);
-        self.spawned.push((id, cwd_of));
+        self.spawned.push((id, parent, inherit_cwd));
     }
 
     /// winlink_shuffle_up without `before`: frees the index after the
@@ -246,9 +246,9 @@ impl Session {
                 self.split_window(Side { horizontal, before }, full, cwd_of_active)
             }
             Command::NewWindow { cwd_of_active, after } => {
-                let cwd_of = cwd_of_active.then(|| self.cur().active);
+                let parent = self.cur().active;
                 let idx = if after { self.shuffle_up() } else { self.free_index() };
-                self.spawn_window(idx, cwd_of);
+                self.spawn_window(idx, Some(parent), cwd_of_active);
                 self.set_current(idx);
                 Ok(())
             }
@@ -340,7 +340,7 @@ impl Session {
         w.add_pane(pane, wp, side, full);
         w.set_active(id, point);
         w.pop_zoom(point);
-        self.spawned.push((id, cwd_of_active.then_some(wp)));
+        self.spawned.push((id, Some(wp), cwd_of_active));
         Ok(())
     }
 

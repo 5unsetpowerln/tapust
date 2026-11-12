@@ -90,10 +90,12 @@ pub struct Mods {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     /// A new pane: make its surface, and start a shell once GTK gives it a
-    /// size. `cwd_of` names the pane whose current directory
-    /// (`#{pane_current_path}`) to start in; `None` means the session's
-    /// default directory.
-    Spawn { pane: PaneId, cwd_of: Option<PaneId> },
+    /// size. `parent` is the pane it was made from (the split pane, or the
+    /// active pane of the window current at new-window), whose font size it
+    /// takes (ghostty's window-inherit-font-size); with `inherit_cwd`
+    /// (`-c "#{pane_current_path}"`) it starts in the parent's current
+    /// directory, else in the session's default directory.
+    Spawn { pane: PaneId, parent: Option<PaneId>, inherit_cwd: bool },
     /// `resize-pane`: move the divider nearest to `pane` with that
     /// orientation by `cells` cells (negative is left or up), as ghostty's
     /// resize_split does with pixels; the GUI answers with [`Session::resize_split`].
@@ -248,8 +250,8 @@ pub struct Session {
     dead: bool,
     /// The active pane when the session died.
     last_active: PaneId,
-    /// Panes created by the running operation, with `cwd_of`.
-    spawned: Vec<(PaneId, Option<PaneId>)>,
+    /// Panes created by the running operation, with `parent` and `inherit_cwd`.
+    spawned: Vec<(PaneId, Option<PaneId>, bool)>,
     /// Write effects of the running operation.
     writes: Vec<Effect>,
 }

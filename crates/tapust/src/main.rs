@@ -1,3 +1,4 @@
+mod bindings;
 mod compose;
 mod font;
 mod frame;

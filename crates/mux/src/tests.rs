@@ -305,7 +305,7 @@ fn new_window_fills_gap() {
 #[test]
 fn new_session_spawns_first_pane() {
     let (s, effects) = Session::new();
-    assert_eq!(effects, [Effect::Spawn { pane: 0, cwd_of: None }]);
+    assert_eq!(effects, [Effect::Spawn { pane: 0, parent: None, inherit_cwd: false }]);
     assert_eq!(s.active_pane(), 0);
 }
 
@@ -314,7 +314,10 @@ fn split_effects() {
     let mut s = new_session();
     let effects =
         ok(&mut s, Command::SplitWindow { horizontal: true, before: false, full: false, cwd_of_active: true });
-    assert_eq!(effects, [Effect::Spawn { pane: 1, cwd_of: Some(0) }]);
+    assert_eq!(effects, [Effect::Spawn { pane: 1, parent: Some(0), inherit_cwd: true }]);
+    // Without -c the new window still comes from the active pane.
+    let effects = ok(&mut s, Command::NewWindow { cwd_of_active: false, after: false });
+    assert_eq!(effects, [Effect::Spawn { pane: 2, parent: Some(1), inherit_cwd: false }]);
 }
 
 #[test]
@@ -344,7 +347,7 @@ fn prefix_then_split() {
     let mut s = new_session();
     assert_eq!(s.key(ctrl('b'), t), KeyResult::Handled(vec![]));
     let KeyResult::Handled(effects) = s.key(ch('%'), t) else { panic!() };
-    assert_eq!(effects, [Effect::Spawn { pane: 1, cwd_of: Some(0) }]);
+    assert_eq!(effects, [Effect::Spawn { pane: 1, parent: Some(0), inherit_cwd: true }]);
     assert_eq!(ids(&s).len(), 2);
     assert_eq!(s.key(ch('a'), t), KeyResult::Forward(1));
 }

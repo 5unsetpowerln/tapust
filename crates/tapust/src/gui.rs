@@ -10,14 +10,14 @@ use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
-use gtk::{gio, glib};
+use gtk::{gdk, gio, glib};
 use mux::{Command, ConfirmTarget, Effect, KeyResult, Node, Overlay, PaneId, Rect, Session};
 
+use crate::bindings::{self, Binding, Scroll};
 use crate::compose;
 use crate::input;
 use crate::notifications;
 use crate::pty::{ChildExit, PaneIo, Pty};
-use crate::search;
 use crate::surface::{Event, Surface};
 use crate::theme;
 
@@ -568,8 +568,12 @@ impl App {
         }));
         add("close", Box::new(|app| app.window.close()));
         add("close-split", Box::new(|app| app.confirm_close_split()));
-        add("copy", Box::new(|app| app.copy()));
-        add("paste", Box::new(|app| app.paste()));
+        add("copy", Box::new(|app| {
+            if let Some(surface) = app.active_surface() {
+                app.copy(&surface);
+            }
+        }));
+        add("paste", Box::new(|app| app.paste(app.window.clipboard())));
         add("reset", Box::new(|app| app.reset()));
         add("clear", Box::new(|app| app.clear()));
         add("prompt-tab-title", Box::new(|app| app.title_dialog(TitleTarget::Tab(app.current_window_id()))));
@@ -693,12 +697,7 @@ impl App {
                 true
             }
             Event::PastePrimary => {
-                let weak = Rc::downgrade(self);
-                self.window.primary_clipboard().read_text_async(gio::Cancellable::NONE, move |text| {
-                    if let (Some(app), Ok(Some(text))) = (weak.upgrade(), text) {
-                        app.paste_text(&text, false);
-                    }
-                });
+                self.paste(self.window.primary_clipboard());
                 true
             }
             Event::SwipeTab { next } => {
@@ -775,13 +774,11 @@ impl App {
 
     /// A key press; `commit` is the input method's text for it, which is
     /// typed as it is (a dead key or a direct input method).
-    fn key(self: &Rc<Self>, pane: PaneId, keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType, commit: Option<String>) -> bool {
-        // ghostty's start_search binding comes before the tmux key tables.
-        if search::is_start_search(keyval, state) {
-            let surface = self.state.borrow().panes.get(&pane).map(|p| p.surface.clone());
-            if let Some(surface) = surface {
-                surface.start_search();
-            }
+    fn key(self: &Rc<Self>, pane: PaneId, keyval: gdk::Key, state: gdk::ModifierType, commit: Option<String>) -> bool {
+        // ghostty's bindings come before the tmux key tables.
+        if let Some(binding) = bindings::binding(keyval, state)
+            && self.perform(pane, binding)
+        {
             return true;
         }
         let (key, text) = match commit {
@@ -798,6 +795,22 @@ impl App {
             },
         };
         self.send_key(pane, key, text);
+        true
+    }
+
+    /// Carries out a binding on the pane; returns false when it does not
+    /// apply, and the key goes on as if it had none.
+    fn perform(self: &Rc<Self>, pane: PaneId, binding: Binding) -> bool {
+        let Some(surface) = self.state.borrow().panes.get(&pane).map(|p| p.surface.clone()) else { return false };
+        match binding {
+            Binding::StartSearch => surface.start_search(),
+            Binding::Copy { performable } => return self.copy(&surface) || !performable,
+            Binding::Paste { primary: false } => self.paste(self.window.clipboard()),
+            Binding::Paste { primary: true } => self.paste(self.window.primary_clipboard()),
+            Binding::Scroll(scroll) => surface.scroll(scroll),
+            Binding::SelectAll => surface.select_all(),
+            Binding::FontSize(change) => surface.set_font_points(bindings::font_points(surface.font_points(), change)),
+        }
         true
     }
 
@@ -839,7 +852,7 @@ impl App {
                 // the selection updates the Copy action).
                 if let Some(surface) = typed {
                     surface.clear_selection();
-                    surface.scroll_to_bottom();
+                    surface.scroll(Scroll::Bottom);
                 }
             }
             KeyResult::Handled(effects) => {
@@ -1038,17 +1051,19 @@ impl App {
     fn apply(self: &Rc<Self>, effects: Vec<Effect>) {
         for effect in effects {
             match effect {
-                Effect::Spawn { pane, cwd_of } => {
+                Effect::Spawn { pane, parent, inherit_cwd } => {
                     let mut st = self.state.borrow_mut();
-                    let cwd = cwd_of
-                        .and_then(|p| st.panes.get(&p))
+                    let parent = parent.and_then(|p| st.panes.get(&p));
+                    let points = parent.map_or(theme::FONT_POINTS, |p| p.surface.font_points());
+                    let cwd = parent
+                        .filter(|_| inherit_cwd)
                         .and_then(|p| p.io.as_ref())
                         .and_then(|io| io.pty.foreground_cwd())
                         .unwrap_or_else(|| st.cwd.clone());
                     let weak = Rc::downgrade(self);
                     let handler: crate::surface::Handler =
                         Rc::new(move |event| weak.upgrade().is_some_and(|app| app.handle(event)));
-                    let surface = Surface::new(pane, st.term_bg, handler);
+                    let surface = Surface::new(pane, st.term_bg, points, handler);
                     st.panes.insert(
                         pane,
                         Pane { surface, io: None, cwd, title: String::new(), title_override: None, pwd: None, child_exited: false },
@@ -1548,12 +1563,13 @@ impl App {
         st.panes.get(&st.session.active_pane()).map(|p| p.surface.clone())
     }
 
-    /// ghostty's Copy: the selection to the clipboard, with a toast.
-    fn copy(&self) {
-        if let Some(text) = self.active_surface().and_then(|s| s.selection_text()) {
-            self.window.clipboard().set_text(&text);
-            self.toast("Copied to clipboard");
-        }
+    /// ghostty's copy_to_clipboard: the surface's selection to the
+    /// clipboard, with a toast; returns whether it had one.
+    fn copy(&self, surface: &Surface) -> bool {
+        let Some(text) = surface.selection_text() else { return false };
+        self.window.clipboard().set_text(&text);
+        self.toast("Copied to clipboard");
+        true
     }
 
     /// ghostty's syncActions: Copy is enabled while the surface has a
@@ -1565,8 +1581,9 @@ impl App {
         }
     }
 
-    fn paste(self: &Rc<Self>) {
-        let clipboard = self.window.clipboard();
+    /// ghostty's paste_from_clipboard, or paste_from_selection with the
+    /// primary selection.
+    fn paste(self: &Rc<Self>, clipboard: gdk::Clipboard) {
         let weak = Rc::downgrade(self);
         clipboard.read_text_async(gio::Cancellable::NONE, move |text| {
             let (Some(app), Ok(Some(text))) = (weak.upgrade(), text) else { return };
