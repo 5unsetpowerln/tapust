@@ -1768,3 +1768,27 @@ fn xtversion_and_xtgettcap_replies() {
     assert_eq!(t.line(t.view_top()).unwrap()[0].char(), Some('o'));
 }
 
+
+#[test]
+fn a_snapshot_keeps_the_active_screen_as_it_was() {
+    let mut t = term(10, 3);
+    feed(&mut t, "\x1b[7ma\x1b[0m1\r\n2\r\n3\r\n4\x1b]8;;gemini://x\x1b\\5\x1b]8;;\x1b\\");
+    t.set_selection(Some(Selection { start: Point { line: 1, col: 0 }, end: Point { line: 2, col: 0 }, rect: false }));
+    let mut s = t.snapshot();
+    feed(&mut t, "\r\n6\r\n7");
+    assert_eq!(screen(&t), ["45", "6", "7"]);
+    assert_eq!(screen(&s), ["2", "3", "45"]);
+    assert_eq!((s.first_line(), s.history_len(), s.view_top()), (0, 1, 1));
+    assert_eq!((s.cursor().x, s.cursor().y), (2, 2));
+    assert_eq!(s.selection(), None);
+    // The styles and links come along.
+    let top = s.first_line();
+    assert!(s.style(s.line(top).unwrap()[0].style()).attrs.contains(Attrs::INVERSE));
+    assert_eq!(s.link_uri(s.line(top + 3).unwrap()[1].link().unwrap()), Some("gemini://x"));
+    s.scroll_view(5);
+    assert_eq!((screen(&s), s.view_offset()), (vec!["a1".to_owned(), "2".to_owned(), "3".to_owned()], 1));
+    // The alternate screen is copied without the primary screen's scrollback.
+    feed(&mut t, "\x1b[?1049h\x1b[Halt");
+    let s = t.snapshot();
+    assert_eq!((screen(&s), s.history_len(), s.modes().alt_screen), (vec!["alt".to_owned()], 0, false));
+}

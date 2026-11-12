@@ -177,6 +177,7 @@ pub(crate) fn blankify(c: Cell) -> Cell {
 /// than moving the region.
 const FEW_ROWS: usize = 2;
 
+#[derive(Clone)]
 pub(crate) struct Grid {
     cols: usize,
     rows: usize,

@@ -20,6 +20,7 @@ const SWEEP_BATCH: usize = 4096;
 /// makes a new link. Nothing is freed while printing: the terminal sweeps
 /// the ids no cell uses once the held bytes pass twice those left by the
 /// last sweep (and 1 MiB), or when the ids or bytes run out.
+#[derive(Clone)]
 pub(crate) struct LinkTable {
     /// The URI of each id in use.
     uris: Vec<Option<Box<str>>>,

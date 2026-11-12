@@ -193,6 +193,15 @@ impl Terminal {
         }
     }
 
+    /// A frozen copy of the active screen, as tmux's copy mode takes one of
+    /// its pane (window_copy_clone_screen): its scrollback and screen, with
+    /// their line numbers, become the copy's primary screen, with the cursor
+    /// and the styles, links and colors to draw them. The copy has no
+    /// selection and reports no mouse.
+    pub fn snapshot(&self) -> Terminal {
+        Terminal { parser: parser::Parser::new(), term: self.term.snapshot() }
+    }
+
     /// Parses PTY output and applies it. Escape and UTF-8 sequences may be
     /// split across calls.
     pub fn feed(&mut self, bytes: &[u8]) {

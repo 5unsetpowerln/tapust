@@ -129,6 +129,7 @@ const CACHE: usize = 256;
 const NO_PEN: u128 = u128::MAX;
 
 /// Append-only table of styles; id 0 is the default style.
+#[derive(Clone)]
 pub(crate) struct StyleTable {
     styles: Vec<Style>,
     ids: HashMap<u128, StyleId, BuildHasherDefault<KeyHasher>>,

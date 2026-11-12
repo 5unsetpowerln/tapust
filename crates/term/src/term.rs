@@ -329,6 +329,20 @@ impl Term {
         t
     }
 
+    /// The active screen as the primary screen of a new terminal, with the
+    /// cursor, styles, links and colors.
+    pub fn snapshot(&self) -> Term {
+        let mut t = Term::new(self.cols, self.rows, 0);
+        t.grid = self.grid.clone();
+        t.styles = self.styles.clone();
+        t.links = self.links.clone();
+        t.palette = self.palette.clone();
+        t.base_palette = self.base_palette.clone();
+        t.modes.reverse_video = self.modes.reverse_video;
+        (t.x, t.y) = (self.x, self.y);
+        t
+    }
+
     // ---- Queries -------------------------------------------------------
 
     /// The slot shown on viewport row `y`.
