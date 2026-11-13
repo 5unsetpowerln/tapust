@@ -156,7 +156,9 @@ struct SplitWidget {
     index: usize,
     /// ghostty's priv.ratio: the tree's when built, then the last one written.
     ratio: Cell<f64>,
-    limits_changed: Cell<bool>,
+    /// The position was set to follow the tree's ratio (after a limit
+    /// changed or the tree got a new ratio), not dragged.
+    followed: Cell<bool>,
     pos_changed: Cell<bool>,
     idle: RefCell<Option<glib::SourceId>>,
     app: Weak<App>,
@@ -182,7 +184,7 @@ impl SplitWidget {
             window,
             index,
             ratio: Cell::new(ratio),
-            limits_changed: Cell::new(false),
+            followed: Cell::new(false),
             pos_changed: Cell::new(false),
             idle: RefCell::new(None),
             app: Rc::downgrade(app),
@@ -193,7 +195,7 @@ impl SplitWidget {
                 if let Some(s) = weak.upgrade() {
                     // A resize of the paned or of a child's minimum: the
                     // position follows the ratio right away.
-                    s.limits_changed.set(true);
+                    s.followed.set(true);
                     s.sync(Sync::TreeToWidget);
                     s.queue_idle();
                 }
@@ -217,13 +219,21 @@ impl SplitWidget {
         let id = glib::idle_add_local_once(move || {
             let Some(s) = weak.upgrade() else { return };
             s.idle.take();
-            let (limits, pos) = (s.limits_changed.replace(false), s.pos_changed.replace(false));
+            let (followed, pos) = (s.followed.replace(false), s.pos_changed.replace(false));
             // Only the position changed: the user dragged the divider.
-            if !limits && pos {
+            if !followed && pos {
                 s.sync(Sync::WidgetToTree);
             }
         });
         *self.idle.borrow_mut() = Some(id);
+    }
+
+    /// The tree got a new ratio (a resize by key): the divider moves to it.
+    fn follow(self: &Rc<Self>, ratio: f64) {
+        self.ratio.set(ratio);
+        self.followed.set(true);
+        self.sync(Sync::TreeToWidget);
+        self.queue_idle();
     }
 
     /// ghostty's syncSplitRatio.
@@ -2076,8 +2086,25 @@ impl Window {
             let Some((tree, zoomed, _)) = st.session.tree(index) else { return };
             (tree.clone(), zoomed)
         };
-        let unchanged = self.state.borrow().tabs.get(&id).and_then(|t| t.built.as_ref()) == Some(&(tree.clone(), zoomed));
-        if unchanged {
+        let ratios_only = match self.state.borrow().tabs.get(&id).and_then(|t| t.built.as_ref()) {
+            Some((built, z)) if *z == zoomed && *built == tree => return,
+            Some((built, z)) => *z == zoomed && built.same_shape(&tree),
+            None => false,
+        };
+        if ratios_only {
+            // Only ratios changed: moving the dividers there are keeps every
+            // pane's GL area, which a rebuild would realize again.
+            let mut ratios = Vec::new();
+            tree.ratios(&mut ratios);
+            let splits = {
+                let mut st = self.state.borrow_mut();
+                let tab = st.tabs.get_mut(&id).expect("tab");
+                tab.built = Some((tree, zoomed));
+                tab.splits.clone()
+            };
+            for split in &splits {
+                split.follow(ratios[split.index]);
+            }
             return;
         }
         let mut splits = Vec::new();
