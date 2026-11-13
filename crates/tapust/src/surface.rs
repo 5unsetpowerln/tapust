@@ -39,6 +39,8 @@ pub enum Event {
     /// A key press; returns whether it was used. `text` is what the input
     /// method committed for it, if anything.
     Key { pane: PaneId, press: Press, text: Option<String> },
+    /// A key was released.
+    KeyReleased { keycode: u32 },
     /// Text the input method committed outside a plain key press (a
     /// finished composition).
     Text { pane: PaneId, text: String },
@@ -683,9 +685,11 @@ impl Surface {
             glib::Propagation::Proceed
         });
         let weak = Rc::downgrade(self);
-        keys.connect_key_released(move |keys, _, _, _| {
+        let h = handler.clone();
+        keys.connect_key_released(move |keys, _, keycode, _| {
             if let (Some(s), Some(event)) = (weak.upgrade(), keys.current_event()) {
                 s.im.filter_keypress(&event);
+                h(Event::KeyReleased { keycode });
             }
         });
         self.area.add_controller(keys);

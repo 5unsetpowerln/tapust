@@ -133,6 +133,8 @@ struct Window {
     /// come back as user actions.
     syncing: Cell<bool>,
     reconcile_pending: Cell<bool>,
+    /// The keycode of the last key pressed and not released yet.
+    held_key: Cell<Option<u32>>,
     restore_focus_pending: Cell<bool>,
     /// The window's minimum size was set from the first surface.
     min_size_set: Cell<bool>,
@@ -978,6 +980,7 @@ impl Window {
             tabs_location: Cell::new(TabsLocation::Top),
             syncing: Cell::new(false),
             reconcile_pending: Cell::new(false),
+            held_key: Cell::new(None),
             restore_focus_pending: Cell::new(false),
             min_size_set: Cell::new(false),
             context_page: RefCell::new(None),
@@ -985,6 +988,16 @@ impl Window {
             overview_focus: RefCell::new(None),
             session_ended: Cell::new(false),
             closing: Cell::new(false),
+        });
+
+        // A key released while the window is not active ends its repeats too.
+        let weak = Rc::downgrade(&win);
+        win.window.connect_is_active_notify(move |w| {
+            if !w.is_active()
+                && let Some(win) = weak.upgrade()
+            {
+                win.held_key.set(None);
+            }
         });
 
         for button in [new_tab, tab_new_tab] {
@@ -1432,11 +1445,23 @@ impl Window {
 
     fn handle(self: &Rc<Self>, event: Event) -> bool {
         match event {
-            Event::Key { pane, press, text } => self.key(pane, press, text),
+            Event::Key { pane, press, text } => {
+                // GTK marks no automatic repeat: it is a press without a
+                // release, of a key the window's keyboard holds down, so
+                // that a binding moving the focus to another pane keeps it.
+                let repeat = self.held_key.replace(Some(press.keycode)) == Some(press.keycode);
+                self.key(pane, press, text, repeat)
+            }
+            Event::KeyReleased { keycode } => {
+                if self.held_key.get() == Some(keycode) {
+                    self.held_key.set(None);
+                }
+                false
+            }
             Event::Text { pane, text } => {
                 for c in text.chars() {
                     let key = mux::Key { code: mux::KeyCode::Char(c), mods: mux::Mods::default() };
-                    self.send_key(pane, key, Some(c.to_string()));
+                    self.send_key(pane, key, Some(c.to_string()), false);
                 }
                 true
             }
@@ -1525,7 +1550,7 @@ impl Window {
             Event::WheelKeys { pane, up, count } => {
                 let code = if up { mux::KeyCode::Up } else { mux::KeyCode::Down };
                 for _ in 0..count {
-                    self.send_key(pane, mux::Key { code, mods: mux::Mods::default() }, None);
+                    self.send_key(pane, mux::Key { code, mods: mux::Mods::default() }, None, false);
                 }
                 true
             }
@@ -1534,7 +1559,7 @@ impl Window {
 
     /// A key press; `commit` is the input method's text for it, which is
     /// typed as it is (a dead key or a direct input method).
-    fn key(self: &Rc<Self>, pane: PaneId, press: Press, commit: Option<String>) -> bool {
+    fn key(self: &Rc<Self>, pane: PaneId, press: Press, commit: Option<String>, repeat: bool) -> bool {
         // ghostty's bindings come before the tmux key tables. A performable
         // one that could not be performed is no binding, and an unconsumed
         // one lets the key go on too.
@@ -1549,7 +1574,7 @@ impl Window {
             Some(text) => {
                 for c in text.chars() {
                     let key = mux::Key { code: mux::KeyCode::Char(c), mods: mux::Mods::default() };
-                    self.send_key(pane, key, Some(c.to_string()));
+                    self.send_key(pane, key, Some(c.to_string()), repeat);
                 }
                 return true;
             }
@@ -1558,7 +1583,7 @@ impl Window {
                 None => return false,
             },
         };
-        self.send_key(pane, key, text);
+        self.send_key(pane, key, text, repeat);
         true
     }
 
@@ -1616,14 +1641,16 @@ impl Window {
         }
     }
 
-    fn send_key(self: &Rc<Self>, pane: PaneId, key: mux::Key, text: Option<String>) {
+    /// `repeat` is an automatic repeat of a key held down.
+    fn send_key(self: &Rc<Self>, pane: PaneId, key: mux::Key, text: Option<String>, repeat: bool) {
         // Any key the terminal uses stops the bell (ghostty's keyEvent).
         let surface = self.state.borrow().panes.get(&pane).map(|p| p.surface.clone());
         if let Some(surface) = surface {
             surface.set_bell_ringing(false);
         }
         let mut st = self.state.borrow_mut();
-        match st.session.key(key, Instant::now()) {
+        let result = if repeat { st.session.key_repeat(key, Instant::now()) } else { st.session.key(key, Instant::now()) };
+        match result {
             KeyResult::Forward(id) => {
                 let target = if st.panes.contains_key(&id) { id } else { pane };
                 let mut typed = None;
