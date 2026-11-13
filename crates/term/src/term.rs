@@ -240,6 +240,8 @@ pub(crate) struct Term {
     cursor_is_default: bool,
     /// Whether the terminal's surface has focus (for DEC 1004 reports).
     pub focused: bool,
+    /// When a synchronized update (DECSET 2026) was last begun.
+    pub sync_begun: Option<std::time::Instant>,
     /// The pointer's CSS cursor name (OSC 22, mouse reporting).
     pub mouse_shape: &'static str,
     /// ghostty's cursor semantic_content: what the shell is printing now
@@ -309,6 +311,7 @@ impl Term {
             default_cursor: (CursorShape::Block, None),
             cursor_is_default: true,
             focused: true,
+            sync_begun: None,
             mouse_shape: "text",
             semantic: Semantic::Output,
             semantic_clear_eol: false,
@@ -1452,7 +1455,10 @@ impl Term {
             }
             1007 => m.alternate_scroll = on,
             2004 => m.bracketed_paste = on,
-            2026 => m.sync_update = on,
+            2026 => {
+                m.sync_update = on;
+                self.sync_begun = on.then(std::time::Instant::now);
+            }
             47 => self.switch_screen(on),
             1047 => {
                 if !on && self.alt_active {

@@ -364,6 +364,16 @@ impl Terminal {
         self.term.focused = focused;
     }
 
+    /// When the synchronized update (DECSET 2026) in progress was last begun.
+    pub fn sync_begun(&self) -> Option<std::time::Instant> {
+        self.term.sync_begun.filter(|_| self.term.modes.sync_update)
+    }
+
+    /// Ends a synchronized update; ghostty ends one a second after it began.
+    pub fn end_sync(&mut self) {
+        self.term.modes.sync_update = false;
+    }
+
     /// Whether there is news besides the cells: a title or working directory
     /// other than at the last call, or a bell or messages not taken yet. The
     /// application reads these when woken, which it must be for them even
