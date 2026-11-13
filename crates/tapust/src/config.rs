@@ -1415,6 +1415,16 @@ mod tests {
     }
 
     #[test]
+    fn split_resize_step() {
+        assert_eq!(Config::default().split_resize_step, None);
+        assert_eq!(ok("split-resize-step = 40px").split_resize_step, Some(40.0));
+        assert_eq!(ok("split-resize-step = 12.5").split_resize_step, Some(12.5));
+        assert_eq!(ok("split-resize-step = 40px\nsplit-resize-step =").split_resize_step, None);
+        assert_eq!(errors("split-resize-step = 0px").len(), 1);
+        assert_eq!(errors("split-resize-step = wide"), ["/c/config:1:split-resize-step: invalid value \"wide\""]);
+    }
+
+    #[test]
     fn split_resize_transition() {
         use std::time::Duration;
         assert_eq!(Config::default().split_resize_transition, Duration::ZERO);
