@@ -37,6 +37,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some((flag, rest)) if flag == "-e" && !rest.is_empty() => Some(rest.to_vec()),
         Some(_) => return Err("usage: tapust [-e PROGRAM [ARGS...]]".into()),
     };
+    pty::disable_vulkan();
     font::register_embedded_fonts()?;
     let application = adw::Application::builder()
         .application_id("dev.tapust.tapust")

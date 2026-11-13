@@ -73,6 +73,25 @@ fn login_shell() -> io::Result<PathBuf> {
     Ok(PathBuf::from(OsStr::from_bytes(shell.to_bytes())))
 }
 
+/// GDK_DISABLE as tapust found it, before `disable_vulkan`.
+static GDK_DISABLE: OnceLock<Option<OsString>> = OnceLock::new();
+
+/// Keeps GTK from setting up Vulkan, as ghostty does: the window is then
+/// drawn with GL like the panes, without Vulkan's start-up time or a copy
+/// of each pane's GL texture into Vulkan. Must run before GTK starts and
+/// before any thread does.
+pub fn disable_vulkan() {
+    let found = std::env::var_os("GDK_DISABLE");
+    let mut value = found.clone().filter(|v| !v.is_empty()).unwrap_or_default();
+    if !value.is_empty() {
+        value.push(",");
+    }
+    value.push("vulkan");
+    // SAFETY: no other thread runs yet, so none reads the environment.
+    unsafe { std::env::set_var("GDK_DISABLE", value) };
+    let _ = GDK_DISABLE.set(found);
+}
+
 /// Variables that identify another terminal or multiplexer to its programs.
 const OTHER_TERMINALS: [&str; 19] = [
     "TMUX",
@@ -181,6 +200,12 @@ impl Pty {
         for var in OTHER_TERMINALS {
             command.env_remove(var);
         }
+        // GTK programs started in the pane get the GDK_DISABLE tapust found.
+        match GDK_DISABLE.get() {
+            Some(Some(value)) => command.env("GDK_DISABLE", value),
+            Some(None) => command.env_remove("GDK_DISABLE"),
+            None => &mut command,
+        };
         unsafe {
             command.pre_exec(|| {
                 // A new session with the PTY as its controlling terminal.
