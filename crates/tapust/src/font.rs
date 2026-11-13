@@ -135,6 +135,9 @@ pub struct Fonts(Rc<Loaded>);
 
 pub struct Loaded {
     rasterizer: RefCell<Rasterizer>,
+    family: String,
+    /// The em size in pixels, as crossfont sets it in FreeType.
+    pixels: f64,
     faces: [FontKey; 4],
     size: Size,
     pub cell_width: u32,
@@ -201,6 +204,8 @@ impl Loaded {
         let strike_y = baseline - metrics.strikeout_position.round() as i32;
         Ok(Loaded {
             rasterizer: RefCell::new(rasterizer),
+            family: family.to_owned(),
+            pixels: f64::from(size.as_px()),
             faces: [regular, bold, italic, bold_italic],
             size,
             cell_width,
@@ -221,6 +226,62 @@ impl Loaded {
             Err(_) => return None,
         };
         Some(to_bitmap(glyph))
+    }
+}
+
+impl Loaded {
+    /// Rasterizes a grapheme cluster of several codepoints in `face` with
+    /// Pango, which shapes it with fontconfig's fallback fonts: combining
+    /// marks over their base, flags, emoji with modifiers, ZWJ sequences.
+    pub fn rasterize_cluster(&self, text: &str, face: Face) -> Option<Bitmap> {
+        use pangocairo::{cairo, pango};
+        use pango::prelude::FontMapExt;
+        let context = pangocairo::FontMap::default().create_context();
+        let mut desc = pango::FontDescription::new();
+        desc.set_family(&self.family);
+        desc.set_absolute_size(self.pixels * f64::from(pango::SCALE));
+        if face & 1 != 0 {
+            desc.set_weight(pango::Weight::Bold);
+        }
+        if face & 2 != 0 {
+            desc.set_style(pango::Style::Italic);
+        }
+        let layout = pango::Layout::new(&context);
+        layout.set_font_description(Some(&desc));
+        layout.set_text(text);
+        let (ink, _) = layout.pixel_extents();
+        if ink.width() <= 0 || ink.height() <= 0 {
+            return Some(Bitmap { width: 0, height: 0, left: 0, top: 0, colored: false, rgba: Vec::new() });
+        }
+        let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, ink.width(), ink.height()).ok()?;
+        {
+            let cr = cairo::Context::new(&surface).ok()?;
+            // Red text: its pixels have no green or blue, while a color
+            // glyph's have, even a gray one's (Noto's families).
+            cr.set_source_rgb(1.0, 0.0, 0.0);
+            cr.move_to(-f64::from(ink.x()), -f64::from(ink.y()));
+            pangocairo::functions::show_layout(&cr, &layout);
+        }
+        surface.flush();
+        let (width, height, stride) = (ink.width() as usize, ink.height() as usize, surface.stride() as usize);
+        let data = surface.data().ok()?;
+        let mut rgba = Vec::with_capacity(width * height * 4);
+        let mut colored = false;
+        for row in data.chunks(stride).take(height) {
+            for px in row[..width * 4].chunks_exact(4) {
+                // Cairo's ARGB32 is a native-endian u32: B, G, R, A in memory here.
+                let [b, g, r, a] = [px[0], px[1], px[2], px[3]];
+                colored |= g != 0 || b != 0;
+                rgba.extend_from_slice(&[r, g, b, a]);
+            }
+        }
+        if !colored {
+            for px in rgba.chunks_exact_mut(4) {
+                px[..3].fill(255);
+            }
+        }
+        let baseline = layout.baseline() / pango::SCALE;
+        Some(Bitmap { width: width as u32, height: height as u32, left: ink.x(), top: baseline - ink.y(), colored, rgba })
     }
 }
 

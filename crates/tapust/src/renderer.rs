@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use glow::HasContext;
 use term::Underline;
 
-use crate::font::{Face, Fonts, face_for};
-use crate::frame::{BOLD, CursorStyle, Frame, FrameCell, Grid, ITALIC, STRIKE, TRANSLUCENT, WIDE};
+use crate::font::{Bitmap, Face, Fonts, face_for};
+use crate::frame::{BOLD, CLUSTER, CursorStyle, Frame, FrameCell, Grid, ITALIC, STRIKE, TRANSLUCENT, WIDE};
 use crate::underline;
 
 const ATLAS_SIZE: i32 = 2048;
@@ -103,6 +103,7 @@ pub struct Renderer {
     atlas: Atlas,
     ascii: Box<[[Option<Glyph>; 128]; 4]>,
     glyphs: HashMap<(u32, Face), Option<Glyph>>,
+    clusters: HashMap<(Box<str>, Face), Option<Glyph>>,
     /// The instance of each underline kind (by `Underline as usize`) for a
     /// cell at (0, 0) in color 0, measured from `fonts`; empty until the
     /// first frame drawn with these fonts.
@@ -337,6 +338,7 @@ impl Renderer {
                 atlas: Atlas { texture: atlas_texture, x: 0, y: 0, shelf_height: 0 },
                 ascii: Box::new([[None; 128]; 4]),
                 glyphs: HashMap::new(),
+                clusters: HashMap::new(),
                 underlines: Vec::new(),
                 upload: Vec::new(),
                 viewport: (1, 1),
@@ -350,6 +352,7 @@ impl Renderer {
         self.fonts = fonts;
         *self.ascii = [[None; 128]; 4];
         self.glyphs.clear();
+        self.clusters.clear();
         self.underlines.clear();
         for (_, cache) in self.grids.drain() {
             unsafe { self.gl.delete_texture(cache.texture) };
@@ -386,8 +389,22 @@ impl Renderer {
         glyph
     }
 
+    fn cluster_glyph(&mut self, text: &str, face: Face) -> Option<Glyph> {
+        if let Some(glyph) = self.clusters.get(&(text.into(), face)) {
+            return *glyph;
+        }
+        let glyph = self.fonts.rasterize_cluster(text, face).and_then(|b| self.place(b));
+        self.clusters.insert((text.into(), face), glyph);
+        glyph
+    }
+
     fn load_glyph(&mut self, ch: u32, face: Face) -> Option<Glyph> {
         let bitmap = self.fonts.rasterize(char::from_u32(ch)?, face)?;
+        self.place(bitmap)
+    }
+
+    /// The glyph of `bitmap`, put in the atlas.
+    fn place(&mut self, bitmap: Bitmap) -> Option<Glyph> {
         if bitmap.width == 0 || bitmap.height == 0 {
             // Blank glyphs are cached as empty, not as None, so they are not rasterized again.
             return Some(Glyph { uv: [0, 0], size: [0, 0], offset: [0, 0], colored: false });
@@ -455,7 +472,8 @@ impl Renderer {
 
     /// The instances of `cell` with its top-left corner at (`px`, `py`), in
     /// the cell's colors or all in `over`.
-    fn push_cell(&mut self, out: &mut Vec<Instance>, px: i32, py: i32, cell: &FrameCell, over: Option<[u8; 4]>) {
+    /// `cluster` is the cell's grapheme cluster when it has the CLUSTER flag.
+    fn push_cell(&mut self, out: &mut Vec<Instance>, px: i32, py: i32, cell: &FrameCell, cluster: Option<&str>, over: Option<[u8; 4]>) {
         let (cw, chh) = (self.fonts.cell_width as i32, self.fonts.cell_height as i32);
         let fg = over.unwrap_or(cell.fg);
         // ghostty draws underlines under the glyphs, so that a colored one
@@ -482,7 +500,11 @@ impl Renderer {
             }
         } else if cell.ch > b' ' as u32 {
             let face = face_for(cell.flags & BOLD != 0, cell.flags & ITALIC != 0);
-            if let Some(g) = self.glyph(cell.ch, face).filter(|g| g.size[0] > 0) {
+            let glyph = match cluster {
+                Some(text) => self.cluster_glyph(text, face),
+                None => self.glyph(cell.ch, face),
+            };
+            if let Some(g) = glyph.filter(|g| g.size[0] > 0) {
                 out.push(Instance {
                     pos: [(px + g.offset[0] as i32) as i16, (py + g.offset[1] as i32) as i16],
                     size: g.size,
@@ -505,7 +527,8 @@ impl Renderer {
         let py = grid.y + y as i32 * ch;
         for (x, cell) in grid.row(y).iter().enumerate() {
             if cell.ch != 0 || cell.underline != Underline::None || cell.flags & STRIKE != 0 {
-                self.push_cell(&mut out, grid.x + x as i32 * cw, py, cell, None);
+                let cluster = if cell.flags & CLUSTER != 0 { grid.cluster(x as u16, y) } else { None };
+                self.push_cell(&mut out, grid.x + x as i32 * cw, py, cell, cluster, None);
             }
         }
         cache.rows[y as usize] = out;
@@ -610,7 +633,9 @@ impl Renderer {
                     // Both cells of a wide character, as each draws its own underline.
                     let cells = grid.row(cursor.y)[cursor.x as usize..].iter().take(1 + cursor.wide as usize);
                     for (i, cell) in cells.enumerate() {
-                        self.push_cell(&mut upload, x + i as i32 * cw, y, cell, Some(cursor.text_color));
+                        let column = cursor.x + i as u16;
+                        let cluster = if cell.flags & CLUSTER != 0 { grid.cluster(column, cursor.y) } else { None };
+                        self.push_cell(&mut upload, x + i as i32 * cw, y, cell, cluster, Some(cursor.text_color));
                     }
                 }
                 CursorStyle::Underline => upload.push(Self::rect(x, y + ch - 2, width, 2, cursor.color)),
@@ -619,7 +644,7 @@ impl Renderer {
                     // ghostty renders U+F023 (the Nerd Font lock) in the
                     // cursor color in place of a cursor shape.
                     let lock = FrameCell { ch: 0xF023, fg: cursor.color, ..FrameCell::blank([0; 4]) };
-                    self.push_cell(&mut upload, x, y, &lock, None);
+                    self.push_cell(&mut upload, x, y, &lock, None, None);
                 }
                 CursorStyle::Hollow => {
                     // A 1px outline, like ghostty's block_hollow with cursor_thickness 1.

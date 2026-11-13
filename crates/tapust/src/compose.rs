@@ -6,7 +6,7 @@ use term::{
 };
 
 use crate::config::{Config, PaddingColor, TerminalColor};
-use crate::frame::{BOLD, CursorStyle, Extend, FrameCell, FrameCursor, Grid, ITALIC, STRIKE, TRANSLUCENT, WIDE};
+use crate::frame::{BOLD, CLUSTER, CursorStyle, Extend, FrameCell, FrameCursor, Grid, ITALIC, STRIKE, TRANSLUCENT, WIDE};
 use crate::links::Link;
 use crate::theme;
 
@@ -76,10 +76,14 @@ fn styled(style: &Style, palette: &Palette, reverse_video: bool, opacity_cells: 
     FrameCell { ch: 0, fg, bg, underline_color, underline, flags }
 }
 
+fn cluster(cell: Cell) -> u16 {
+    if cell.has_grapheme() { CLUSTER } else { 0 }
+}
+
 fn frame_cell(cell: Cell, styled: FrameCell) -> FrameCell {
     match cell.width() {
-        Width::Narrow => FrameCell { ch: cell.codepoint(), ..styled },
-        Width::Wide => FrameCell { ch: cell.codepoint(), flags: styled.flags | WIDE, ..styled },
+        Width::Narrow => FrameCell { ch: cell.codepoint(), flags: styled.flags | cluster(cell), ..styled },
+        Width::Wide => FrameCell { ch: cell.codepoint(), flags: styled.flags | WIDE | cluster(cell), ..styled },
         Width::SpacerTail | Width::SpacerHead => styled,
     }
 }
@@ -151,12 +155,13 @@ pub fn copy_pane(
         if !full && (y >= rows || !term.dirty().is_dirty(y)) {
             continue;
         }
-        let out = grid.row_mut(y);
+        let (out, clusters) = grid.row_and_clusters_mut(y);
+        clusters.clear();
         if y >= rows {
             out.fill(blank);
             continue;
         }
-        for (dst, &cell) in out.iter_mut().zip(&term.row(y)[..cols]) {
+        for (x, (dst, &cell)) in out.iter_mut().zip(&term.row(y)[..cols]).enumerate() {
             if cell == Cell::EMPTY && !reverse_video {
                 *dst = blank;
                 continue;
@@ -165,6 +170,9 @@ pub fn copy_pane(
                 run = (cell.style(), styled(term.style(cell.style()), palette, reverse_video, opacity_cells));
             }
             *dst = frame_cell(cell, run.1);
+            if let Some(text) = cell.has_grapheme().then(|| term.grapheme(y, x as u16)).flatten() {
+                clusters.push((x as u16, text.into()));
+            }
         }
         out[cols..].fill(blank);
         let line = term.view_top() + u64::from(y);

@@ -13,6 +13,9 @@ pub const WIDE: u16 = 1 << 3;
 /// default background, or with background-opacity-cells any but a selected
 /// or inverted cell's (ghostty's bg_alpha).
 pub const TRANSLUCENT: u16 = 1 << 4;
+/// The cell holds a grapheme cluster of several codepoints, kept in its
+/// grid's row (`Grid::cluster`); `ch` is its first.
+pub const CLUSTER: u16 = 1 << 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
@@ -59,6 +62,8 @@ pub struct Grid {
     rows: u16,
     cells: Vec<FrameCell>,
     dirty: Vec<bool>,
+    /// Each row's grapheme clusters by column.
+    clusters: Vec<Vec<(u16, Box<str>)>>,
 }
 
 impl Grid {
@@ -74,6 +79,7 @@ impl Grid {
             rows,
             cells: vec![FrameCell::blank(bg); cols as usize * rows as usize],
             dirty: vec![true; rows as usize],
+            clusters: vec![Vec::new(); rows as usize],
         }
     }
 
@@ -97,6 +103,18 @@ impl Grid {
         self.dirty[y as usize] = true;
         let start = y as usize * self.cols as usize;
         &mut self.cells[start..start + self.cols as usize]
+    }
+
+    /// Row `y` and its clusters, to fill both; marks it dirty.
+    pub fn row_and_clusters_mut(&mut self, y: u16) -> (&mut [FrameCell], &mut Vec<(u16, Box<str>)>) {
+        self.dirty[y as usize] = true;
+        let start = y as usize * self.cols as usize;
+        (&mut self.cells[start..start + self.cols as usize], &mut self.clusters[y as usize])
+    }
+
+    /// The grapheme cluster of the cell at (`x`, `y`) that has the CLUSTER flag.
+    pub fn cluster(&self, x: u16, y: u16) -> Option<&str> {
+        self.clusters[y as usize].iter().find(|c| c.0 == x).map(|c| &*c.1)
     }
 
     pub fn is_dirty(&self, y: u16) -> bool {
