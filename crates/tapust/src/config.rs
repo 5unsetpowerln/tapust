@@ -217,6 +217,10 @@ pub struct Config {
     /// `split-resize-transition`, tapust's: how long a divider takes to move
     /// to a ratio a key gave (resize-pane, a layout); zero moves it at once.
     pub split_resize_transition: Duration,
+    /// `split-resize-step`, tapust's: the logical pixels a resize by key of
+    /// five cells (pain-control's step) moves a divider, in either
+    /// direction; unset, five cell widths.
+    pub split_resize_step: Option<f64>,
 }
 
 impl Default for Config {
@@ -269,6 +273,7 @@ impl Default for Config {
             tmux_prefix: Some(mux::DEFAULT_PREFIX),
             tmux_mode_keys: None,
             split_resize_transition: Duration::ZERO,
+            split_resize_step: None,
         }
     }
 }
@@ -577,6 +582,7 @@ impl Loader<'_> {
                 c.tmux_prefix = or_default(value, default.tmux_prefix, |v| mux::parse_key(v).map_err(Error::Message))?
             }
             "tmux-mode-keys" => c.tmux_mode_keys = optional(value, |v| one_of(v, MODE_KEYS))?,
+            "split-resize-step" => c.split_resize_step = optional(value, pixels)?,
             "split-resize-transition" => {
                 c.split_resize_transition = or_default(value, default.split_resize_transition, duration)?
             }
@@ -926,6 +932,15 @@ fn decoration(value: &str) -> Result<Decoration, Error> {
 
 /// An opacity from `min` to 1, which ghostty would clamp to that range
 /// without a word.
+/// A positive length in pixels: `40px` or `40`.
+fn pixels(value: &str) -> Result<f64, Error> {
+    let v: f64 = value.strip_suffix("px").unwrap_or(value).parse().map_err(|_| Error::Invalid)?;
+    if !(v > 0.0 && v.is_finite()) {
+        return Err(Error::Hint("it must be more than 0".to_owned()));
+    }
+    Ok(v)
+}
+
 /// A duration in ghostty's syntax, with the units that make sense for a
 /// transition: `150ms`, `1s`, or `0`.
 fn duration(value: &str) -> Result<Duration, Error> {

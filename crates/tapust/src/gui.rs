@@ -2035,11 +2035,19 @@ impl Window {
         if width == 0 || height == 0 {
             return;
         }
-        // tmux counts cells; ghostty moves by logical pixels.
-        let scale = surface.area.native().and_then(|n| n.surface()).map_or(1.0, |s| s.scale());
-        let (cw, ch) = surface.cell_size().unwrap_or((1, 1));
-        let cell = if horizontal { f64::from(cw) } else { f64::from(ch) } / scale;
-        let amount = (f64::from(cells) * cell).round();
+        // tmux counts cells, which are taller than wide; here a cell is the
+        // cell's width either way, or split-resize-step for pain-control's
+        // five, so that both directions move as far (ghostty moves by
+        // logical pixels too).
+        let amount = match self.app.config().split_resize_step {
+            Some(step) => step * f64::from(cells) / 5.0,
+            None => {
+                let scale = surface.area.native().and_then(|n| n.surface()).map_or(1.0, |s| s.scale());
+                let (cw, _) = surface.cell_size().unwrap_or((1, 1));
+                f64::from(cells) * f64::from(cw) / scale
+            }
+        }
+        .round();
         let delta = amount / f64::from(if horizontal { width } else { height });
         let effects = self.state.borrow_mut().session.resize_split(pane, horizontal, delta);
         self.apply(effects);
