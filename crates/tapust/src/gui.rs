@@ -153,7 +153,8 @@ struct SplitWidget {
     bin: adw::Bin,
     paned: gtk::Paned,
     window: u32,
-    index: usize,
+    /// In-order index in the tree, which changes when splits come or go.
+    index: Cell<usize>,
     /// ghostty's priv.ratio: the tree's when built, then the last one written.
     ratio: Cell<f64>,
     /// The position was set to follow the tree's ratio (after a limit
@@ -182,7 +183,7 @@ impl SplitWidget {
             bin,
             paned,
             window,
-            index,
+            index: Cell::new(index),
             ratio: Cell::new(ratio),
             followed: Cell::new(false),
             pos_changed: Cell::new(false),
@@ -228,7 +229,8 @@ impl SplitWidget {
         *self.idle.borrow_mut() = Some(id);
     }
 
-    /// The tree got a new ratio (a resize by key): the divider moves to it.
+    /// The tree got a new ratio (a resize by key, or a split kept by a
+    /// rebuild): the divider moves to it.
     fn follow(self: &Rc<Self>, ratio: f64) {
         self.ratio.set(ratio);
         self.followed.set(true);
@@ -271,14 +273,46 @@ impl SplitWidget {
     fn set_tree_ratio(&self, ratio: f64) {
         self.ratio.set(ratio);
         if let Some(app) = self.app.upgrade() {
-            app.set_ratio(self.window, self.index, ratio);
+            app.set_ratio(self.window, self.index.get(), ratio);
         }
+    }
+}
+
+/// Takes the keyboard focus from inside `widget` before it leaves its
+/// parent. GTK would move the focus once the widget is gone, and a GtkPaned
+/// that stays in the window then warns that it cannot find the focused
+/// widget; the rebuild gives the focus to the active pane again.
+fn release_focus(widget: &gtk::Widget) {
+    if let Some(root) = widget.root()
+        && let Some(focus) = root.focus()
+        && (focus == *widget || focus.is_ancestor(widget))
+    {
+        root.set_focus(gtk::Widget::NONE);
+    }
+}
+
+/// Makes `child` the start or end child of `paned`, moving it only when it
+/// is not there already.
+fn put(paned: &gtk::Paned, start: bool, child: &gtk::Widget) {
+    let current = if start { paned.start_child() } else { paned.end_child() };
+    if current.as_ref() == Some(child) {
+        return;
+    }
+    if let Some(current) = &current {
+        release_focus(current);
+    }
+    detach(child);
+    if start {
+        paned.set_start_child(Some(child));
+    } else {
+        paned.set_end_child(Some(child));
     }
 }
 
 /// Removes a reused widget from its old parent (ghostty's detachWidget).
 fn detach(widget: &gtk::Widget) {
     let Some(parent) = widget.parent() else { return };
+    release_focus(widget);
     if let Some(paned) = parent.downcast_ref::<gtk::Paned>() {
         if paned.start_child().as_ref() == Some(widget) {
             paned.set_start_child(gtk::Widget::NONE);
@@ -2078,40 +2112,39 @@ impl Window {
         self.queue_geometry();
     }
 
-    /// Builds the tab's widgets again when its tree changed (ghostty's
-    /// onRebuild): new split widgets, the same surfaces.
+    /// Makes the tab's widgets show its tree when it changed (ghostty's
+    /// onRebuild). A split widget stays where the tree keeps a split the
+    /// same way, and a widget moves only when its place changed: moving one
+    /// realizes the GL areas of its panes again.
     fn rebuild(self: &Rc<Self>, index: u32, id: u32) {
         let (tree, zoomed) = {
             let st = self.state.borrow();
             let Some((tree, zoomed, _)) = st.session.tree(index) else { return };
             (tree.clone(), zoomed)
         };
-        let ratios_only = match self.state.borrow().tabs.get(&id).and_then(|t| t.built.as_ref()) {
-            Some((built, z)) if *z == zoomed && *built == tree => return,
-            Some((built, z)) => *z == zoomed && built.same_shape(&tree),
-            None => false,
-        };
-        if ratios_only {
-            // Only ratios changed: moving the dividers there are keeps every
-            // pane's GL area, which a rebuild would realize again.
-            let mut ratios = Vec::new();
-            tree.ratios(&mut ratios);
-            let splits = {
-                let mut st = self.state.borrow_mut();
-                let tab = st.tabs.get_mut(&id).expect("tab");
-                tab.built = Some((tree, zoomed));
-                tab.splits.clone()
+        let (old, tree_bin) = {
+            let st = self.state.borrow();
+            let tab = &st.tabs[&id];
+            let old = match &tab.built {
+                Some((built, z)) if *z == zoomed && *built == tree => return,
+                Some((built, z)) if *z == zoomed => {
+                    let mut by_index = vec![None; built.split_count()];
+                    for split in &tab.splits {
+                        by_index[split.index.get()] = Some(split.clone());
+                    }
+                    Some((built.clone(), by_index))
+                }
+                _ => None,
             };
-            for split in &splits {
-                split.follow(ratios[split.index]);
-            }
-            return;
-        }
+            (old, tab.tree_bin.clone())
+        };
         let mut splits = Vec::new();
-        let mut counter = 0;
         let widget = match zoomed {
-            Some(pane) => self.build_leaf(pane),
-            None => self.build_node(&tree, id, &mut counter, &mut splits),
+            Some(pane) => self.leaf(pane),
+            None => {
+                let (old_tree, reuse) = old.as_ref().map_or((None, &[][..]), |(t, r)| (Some((t, 0)), &r[..]));
+                self.place(&tree, old_tree, reuse, id, &mut 0, &mut splits)
+            }
         };
         let split = matches!(tree, Node::Split(_));
         let mut leaves = Vec::new();
@@ -2125,36 +2158,63 @@ impl Window {
         let tab = st.tabs.get_mut(&id).expect("tab");
         tab.built = Some((tree, zoomed));
         tab.splits = splits;
-        let tree_bin = tab.tree_bin.clone();
         drop(st);
-        if let Some(w) = &widget {
-            detach(w);
-        }
-        tree_bin.set_child(widget.as_ref());
-    }
-
-    fn build_leaf(&self, pane: PaneId) -> Option<gtk::Widget> {
-        let st = self.state.borrow();
-        let outer: gtk::Widget = st.panes.get(&pane)?.surface.outer.clone().upcast();
-        drop(st);
-        detach(&outer);
-        Some(outer)
-    }
-
-    fn build_node(self: &Rc<Self>, node: &Node, window: u32, counter: &mut usize, splits: &mut Vec<Rc<SplitWidget>>) -> Option<gtk::Widget> {
-        match node {
-            Node::Leaf(pane) => self.build_leaf(*pane),
-            Node::Split(s) => {
-                let first = self.build_node(&s.first, window, counter, splits)?;
-                let index = *counter;
-                *counter += 1;
-                let second = self.build_node(&s.second, window, counter, splits)?;
-                let split = SplitWidget::new(&self.app, window, index, s.horizontal, s.ratio, &first, &second);
-                let widget: gtk::Widget = split.bin.clone().upcast();
-                splits.push(split);
-                Some(widget)
+        if tree_bin.child() != widget {
+            if let Some(current) = tree_bin.child() {
+                release_focus(&current);
             }
+            if let Some(w) = &widget {
+                detach(w);
+            }
+            tree_bin.set_child(widget.as_ref());
         }
+    }
+
+    fn leaf(&self, pane: PaneId) -> Option<gtk::Widget> {
+        Some(self.state.borrow().panes.get(&pane)?.surface.outer.clone().upcast())
+    }
+
+    /// The widget for `node`. `old` is the node the built tree had in the
+    /// same place, with the in-order index of its first split; a split that
+    /// was a split the same way keeps its widget from `reuse`.
+    fn place(
+        self: &Rc<Self>,
+        node: &Node,
+        old: Option<(&Node, usize)>,
+        reuse: &[Option<Rc<SplitWidget>>],
+        window: u32,
+        counter: &mut usize,
+        splits: &mut Vec<Rc<SplitWidget>>,
+    ) -> Option<gtk::Widget> {
+        let s = match node {
+            Node::Leaf(pane) => return self.leaf(*pane),
+            Node::Split(s) => s,
+        };
+        let old = match old {
+            Some((Node::Split(o), base)) if o.horizontal == s.horizontal => Some((o, base, base + o.first.split_count())),
+            _ => None,
+        };
+        let first = self.place(&s.first, old.map(|(o, base, _)| (&o.first, base)), reuse, window, counter, splits)?;
+        let index = *counter;
+        *counter += 1;
+        let second = self.place(&s.second, old.map(|(o, _, at)| (&o.second, at + 1)), reuse, window, counter, splits)?;
+        let split = match old.and_then(|(_, _, at)| reuse[at].clone()) {
+            Some(split) => {
+                split.index.set(index);
+                put(&split.paned, true, &first);
+                put(&split.paned, false, &second);
+                split.follow(s.ratio);
+                split
+            }
+            None => {
+                detach(&first);
+                detach(&second);
+                SplitWidget::new(&self.app, window, index, s.horizontal, s.ratio, &first, &second)
+            }
+        };
+        let widget = split.bin.clone().upcast();
+        splits.push(split);
+        Some(widget)
     }
 
     /// ghostty's tab title: the title override, else the active pane's

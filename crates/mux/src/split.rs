@@ -89,27 +89,6 @@ impl Node {
         }
     }
 
-    /// Whether `other` has the same splits and panes in the same places, so
-    /// that the two can differ only in their ratios.
-    pub fn same_shape(&self, other: &Node) -> bool {
-        match (self, other) {
-            (Node::Leaf(a), Node::Leaf(b)) => a == b,
-            (Node::Split(a), Node::Split(b)) => {
-                a.horizontal == b.horizontal && a.first.same_shape(&b.first) && a.second.same_shape(&b.second)
-            }
-            _ => false,
-        }
-    }
-
-    /// The splits' ratios by in-order index (as [`Node::split_at`] numbers them).
-    pub fn ratios(&self, out: &mut Vec<f64>) {
-        if let Node::Split(s) = self {
-            s.first.ratios(out);
-            out.push(s.ratio);
-            s.second.ratios(out);
-        }
-    }
-
     /// Wraps this node in a split with `new` on `side`, halving its space
     /// (ghostty's new_split always uses the ratio 0.5).
     pub(crate) fn split(&mut self, new: PaneId, side: Side) {
@@ -238,7 +217,8 @@ impl Node {
         }
     }
 
-    fn split_count(&self) -> usize {
+    /// The number of splits in the tree.
+    pub fn split_count(&self) -> usize {
         match self {
             Node::Leaf(_) => 0,
             Node::Split(s) => 1 + s.first.split_count() + s.second.split_count(),
@@ -315,33 +295,6 @@ mod tests {
         for (x, expected) in table {
             assert_eq!(f16(x), expected, "{x}");
         }
-    }
-
-    #[test]
-    fn a_resize_keeps_the_shape_and_numbers_ratios_like_split_at() {
-        let mut tree = Node::Leaf(0);
-        tree.split(1, RIGHT);
-        tree.find_mut(0).unwrap().split(2, DOWN);
-        let before = tree.clone();
-        assert!(tree.resize(1, true, -0.1));
-        assert_ne!(tree, before);
-        assert!(tree.same_shape(&before));
-        let mut ratios = Vec::new();
-        tree.ratios(&mut ratios);
-        let by_index: Vec<f64> = (0..ratios.len()).map(|i| tree.split_at(i).unwrap().ratio).collect();
-        assert_eq!(ratios, by_index);
-
-        let mut swapped = before.clone();
-        swapped.relabel(&|p| match p {
-            1 => 2,
-            2 => 1,
-            p => p,
-        });
-        assert!(!swapped.same_shape(&before));
-        let mut turned = Node::Leaf(0);
-        turned.split(1, DOWN);
-        turned.find_mut(0).unwrap().split(2, DOWN);
-        assert!(!turned.same_shape(&before));
     }
 
     #[test]
