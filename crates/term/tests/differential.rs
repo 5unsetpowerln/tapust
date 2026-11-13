@@ -26,6 +26,10 @@
 //!   scrollback (the visible text is the same).
 //! - Synchronized updates (DECSET 2026): alacritty buffers the output until the
 //!   update ends, so comparisons are skipped while it is buffering.
+//! - Grapheme clusters (UAX #29) beyond zero-width marks: we join flags, emoji
+//!   modifiers, ZWJ sequences and the marks of the Indic and Southeast Asian
+//!   scripts into one cell, as ghostty does; alacritty does not. [`compared`]
+//!   takes the codepoints that can join that way out of the payloads.
 //!
 //! alacritty also has a chunk-boundary bug, worked around in [`run`].
 
@@ -173,6 +177,29 @@ fn run(payload: &Payload, seed: u64, max: usize) {
     pair.check(&format!("{} end", payload.name));
 }
 
+/// The payloads without the codepoints that can join a grapheme cluster
+/// although they have a width: regional indicators, emoji modifiers, ZWJ,
+/// and the Indic and Southeast Asian blocks.
+fn compared(mut payloads: Vec<Payload>) -> Vec<Payload> {
+    fn joins(c: char) -> bool {
+        matches!(c as u32, 0x0900..=0x0DFF | 0x0E00..=0x0EFF | 0x1000..=0x109F | 0x1780..=0x17FF | 0x200D | 0x1F1E6..=0x1F1FF | 0x1F3FB..=0x1F3FF)
+    }
+    let filter = |bytes: &[u8]| {
+        let mut out = Vec::with_capacity(bytes.len());
+        for chunk in bytes.utf8_chunks() {
+            let valid: String = chunk.valid().chars().filter(|&c| !joins(c)).collect();
+            out.extend_from_slice(valid.as_bytes());
+            out.extend_from_slice(chunk.invalid());
+        }
+        out
+    };
+    for p in &mut payloads {
+        p.setup = filter(&p.setup);
+        p.body = filter(&p.body);
+    }
+    payloads
+}
+
 fn run_all(payloads: &[Payload]) {
     for p in payloads {
         // Small chunks split most sequences; large ones exercise the fast paths.
@@ -183,7 +210,7 @@ fn run_all(payloads: &[Payload]) {
 
 #[test]
 fn vtebench_payloads() {
-    let payloads = payloads::vtebench(COLS, ROWS, 2);
+    let payloads = compared(payloads::vtebench(COLS, ROWS, 2));
     let names: Vec<_> = payloads.iter().map(|p| p.name).collect();
     if !names.contains(&"medium_cells") {
         eprintln!("vtebench recordings not found; skipping medium_cells and sync_medium_cells");
@@ -200,12 +227,12 @@ fn vtebench_payloads() {
 
 #[test]
 fn realistic_payloads() {
-    run_all(&payloads::realistic(COLS, ROWS, 1));
+    run_all(&compared(payloads::realistic(COLS, ROWS, 1)));
 }
 
 #[test]
 fn random_chunk_seeds() {
-    let payloads = payloads::realistic(COLS, ROWS, 1);
+    let payloads = compared(payloads::realistic(COLS, ROWS, 1));
     for seed in 10..14 {
         for p in &payloads {
             run(p, seed, 64);
@@ -215,7 +242,7 @@ fn random_chunk_seeds() {
 
 #[test]
 fn vtebench_payloads_in_one_feed() {
-    for p in payloads::vtebench(COLS, ROWS, 1).iter().chain(&payloads::realistic(COLS, ROWS, 1)) {
+    for p in compared(payloads::vtebench(COLS, ROWS, 1)).iter().chain(&compared(payloads::realistic(COLS, ROWS, 1))) {
         let mut pair = Pair::new();
         pair.feed(&p.setup);
         pair.feed(&p.body);

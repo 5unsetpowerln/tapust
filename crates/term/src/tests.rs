@@ -523,9 +523,11 @@ fn graphemes_survive_reuse_and_compaction() {
 #[test]
 fn zwj_and_variation_selectors() {
     let mut t = term(10, 2);
+    // A ZWJ sequence is one cluster, as wide as its first emoji.
     feed(&mut t, "\u{1f468}\u{200d}\u{1f469}");
-    assert_eq!(t.grapheme(0, 0), Some("\u{1f468}\u{200d}"));
-    assert_eq!(cell(&t, 2, 0).char(), Some('\u{1f469}'));
+    assert_eq!(t.grapheme(0, 0), Some("\u{1f468}\u{200d}\u{1f469}"));
+    assert_eq!(cell(&t, 0, 0).width(), Width::Wide);
+    assert_eq!(pos(&t), (2, 0));
     // VS16 widens a narrow emoji-capable character.
     feed(&mut t, "\r\n\u{2764}\u{fe0f}x");
     assert_eq!(cell(&t, 0, 1).width(), Width::Wide);
@@ -1875,4 +1877,40 @@ fn synchronized_update_begins_and_ends() {
     feed(&mut t, "\x1b[?2026h");
     t.resize(10, 3);
     assert_eq!(t.sync_begun(), None);
+}
+
+#[test]
+fn unicode_grapheme_clusters() {
+    let mut t = term(12, 6);
+    // Two regional indicators are a flag, two columns wide; a third starts another.
+    feed(&mut t, "\u{1f1ef}\u{1f1f5}\u{1f1fa}x");
+    assert_eq!(t.grapheme(0, 0), Some("\u{1f1ef}\u{1f1f5}"));
+    assert_eq!(cell(&t, 0, 0).width(), Width::Wide);
+    assert_eq!(cell(&t, 2, 0).char(), Some('\u{1f1fa}'));
+    assert_eq!(cell(&t, 3, 0).char(), Some('x'));
+    // An emoji modifier joins its emoji, and widens a narrow one.
+    feed(&mut t, "\r\n\u{1f44d}\u{1f3fd}\u{261d}\u{1f3fb}y");
+    assert_eq!(t.grapheme(1, 0), Some("\u{1f44d}\u{1f3fd}"));
+    assert_eq!(t.grapheme(1, 2), Some("\u{261d}\u{1f3fb}"));
+    assert_eq!(cell(&t, 2, 1).width(), Width::Wide);
+    assert_eq!(cell(&t, 4, 1).char(), Some('y'));
+    // A ZWJ sequence split across reads, and one starting with a narrow emoji.
+    feed(&mut t, "\r\n\u{1f468}\u{200d}");
+    feed(&mut t, "\u{1f469}\u{200d}\u{1f467}\u{1f3f3}\u{fe0f}\u{200d}\u{1f308}z");
+    assert_eq!(t.grapheme(2, 0), Some("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}"));
+    assert_eq!(t.grapheme(2, 2), Some("\u{1f3f3}\u{fe0f}\u{200d}\u{1f308}"));
+    assert_eq!(cell(&t, 4, 2).char(), Some('z'));
+    // A keycap, and a Devanagari syllable with a spacing vowel sign.
+    feed(&mut t, "\r\n1\u{fe0f}\u{20e3}\u{915}\u{93f}w");
+    assert_eq!(t.grapheme(3, 0), Some("1\u{fe0f}\u{20e3}"));
+    assert_eq!(t.grapheme(3, 2), Some("\u{915}\u{93f}"));
+    assert_eq!(cell(&t, 3, 3).char(), Some('w'));
+    // Plain wide and narrow text after a cluster takes cells of its own.
+    feed(&mut t, "\r\n\u{1f44d}\u{1f3fd}\u{4e2d}a");
+    assert_eq!(cell(&t, 2, 4).char(), Some('\u{4e2d}'));
+    assert_eq!(cell(&t, 4, 4).char(), Some('a'));
+    assert_wide_pairs(&t);
+    // Clusters are always on (DECRQM 2027).
+    feed(&mut t, "\x1b[?2027l\x1b[?2027$p");
+    assert_eq!(replies(&mut t), "\x1b[?2027;1$y");
 }

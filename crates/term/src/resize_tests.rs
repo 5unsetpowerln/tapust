@@ -1771,8 +1771,7 @@ fn pagelist_reflow_less_cols_wide_char_bulk_run_styled() {
 }
 
 // ghostty: "PageList resize reflow less cols to wrap a multi-codepoint grapheme
-// with a spacer head", with a combining mark: tapust does not cluster ZWJ
-// sequences into one cell.
+// with a spacer head", with a combining mark in place of the ZWJ sequence.
 #[test]
 fn pagelist_reflow_less_cols_to_wrap_a_multi_codepoint_grapheme_with_a_spacer_head() {
     let mut t = with_history(4, 2);
