@@ -1400,6 +1400,18 @@ mod tests {
     }
 
     #[test]
+    fn split_resize_transition() {
+        use std::time::Duration;
+        assert_eq!(Config::default().split_resize_transition, Duration::ZERO);
+        assert_eq!(ok("split-resize-transition = 150ms").split_resize_transition, Duration::from_millis(150));
+        assert_eq!(ok("split-resize-transition = 1s").split_resize_transition, Duration::from_secs(1));
+        assert_eq!(ok("split-resize-transition = 150ms\nsplit-resize-transition = 0").split_resize_transition, Duration::ZERO);
+        assert_eq!(ok("split-resize-transition = 150ms\nsplit-resize-transition =").split_resize_transition, Duration::ZERO);
+        assert_eq!(errors("split-resize-transition = ms"), ["/c/config:1:split-resize-transition: invalid value \"ms\""]);
+        assert_eq!(errors("split-resize-transition = 2m").len(), 1);
+    }
+
+    #[test]
     fn tmux_options() {
         let ctrl_a = mux::parse_key("C-a").unwrap();
         assert_eq!(ok("tmux-prefix = C-a").tmux_prefix, ctrl_a);
