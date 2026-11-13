@@ -200,6 +200,8 @@ pub struct Surface {
     /// The fonts while the GL area is unrealized (a rebuild moving it), so
     /// that realizing it again takes them instead of loading them.
     kept_fonts: RefCell<Option<Fonts>>,
+    /// A timer draws again when a synchronized update times out.
+    sync_timer: Rc<Cell<bool>>,
     config: RefCell<Rc<Config>>,
     cell_idle: Cell<bool>,
     handler: Handler,
@@ -274,6 +276,9 @@ fn button_of(number: u32) -> Option<mouse::Button> {
         _ => None,
     }
 }
+
+/// ghostty's sync_reset_ms: a synchronized update ends a second after it began.
+const SYNC_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn load_fonts(family: &str, points: f32, scale: f64) -> Option<Fonts> {
     Fonts::new(family, points, scale).inspect_err(|err| eprintln!("tapust: cannot load fonts: {err}")).ok()
@@ -534,6 +539,7 @@ impl Surface {
             font_adjusted: Cell::new(false),
             font_scale: Cell::new(0.0),
             kept_fonts: RefCell::new(None),
+            sync_timer: Rc::new(Cell::new(false)),
             config: RefCell::new(config),
             cell_idle: Cell::new(false),
             handler: handler.clone(),
@@ -2116,11 +2122,11 @@ impl Surface {
         let d = &mut *d;
         let Some(renderer) = d.renderer.as_mut() else { return };
         let Some(grid) = d.frame.grids.first_mut() else { return };
-        d.frame.cursors.clear();
         let focused = self.focused.get();
         if let Some(shared) = &d.shared
             && let Some(mode) = self.copy.borrow_mut().as_mut()
         {
+            d.frame.cursors.clear();
             // The I/O thread wakes the application again once this is clear.
             shared.dirty.store(false, std::sync::atomic::Ordering::Release);
             let (marks, current) = mode.marks();
@@ -2142,6 +2148,19 @@ impl Surface {
             shared.want_lock.store(true, Ordering::Release);
             let mut term = shared.term.lock();
             shared.want_lock.store(false, Ordering::Release);
+            // ghostty draws nothing new during a synchronized update (DECSET
+            // 2026), and ends one that lasted a second.
+            if let Some(begun) = term.sync_begun() {
+                let left = SYNC_TIMEOUT.saturating_sub(begun.elapsed());
+                if !left.is_zero() {
+                    drop(term);
+                    self.redraw_after(left);
+                    renderer.draw(&mut d.frame);
+                    return;
+                }
+                term.end_sync();
+            }
+            d.frame.cursors.clear();
             let selection = term.selection();
             let found = self.found.borrow();
             let config = self.config.borrow();
@@ -2166,6 +2185,21 @@ impl Surface {
         }
         d.full = false;
         renderer.draw(&mut d.frame);
+    }
+
+    /// Draws again when a synchronized update times out, unless a timer for
+    /// one is set.
+    fn redraw_after(&self, left: Duration) {
+        if self.sync_timer.replace(true) {
+            return;
+        }
+        let (area, timer) = (self.area.downgrade(), self.sync_timer.clone());
+        glib::timeout_add_local_once(left, move || {
+            timer.set(false);
+            if let Some(area) = area.upgrade() {
+                area.queue_render();
+            }
+        });
     }
 
     /// The surface's rectangle in `ancestor`'s coordinates, in logical pixels.
