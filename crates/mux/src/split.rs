@@ -89,6 +89,27 @@ impl Node {
         }
     }
 
+    /// Whether `other` has the same splits and panes in the same places, so
+    /// that the two can differ only in their ratios.
+    pub fn same_shape(&self, other: &Node) -> bool {
+        match (self, other) {
+            (Node::Leaf(a), Node::Leaf(b)) => a == b,
+            (Node::Split(a), Node::Split(b)) => {
+                a.horizontal == b.horizontal && a.first.same_shape(&b.first) && a.second.same_shape(&b.second)
+            }
+            _ => false,
+        }
+    }
+
+    /// The splits' ratios by in-order index (as [`Node::split_at`] numbers them).
+    pub fn ratios(&self, out: &mut Vec<f64>) {
+        if let Node::Split(s) = self {
+            s.first.ratios(out);
+            out.push(s.ratio);
+            s.second.ratios(out);
+        }
+    }
+
     /// Wraps this node in a split with `new` on `side`, halving its space
     /// (ghostty's new_split always uses the ratio 0.5).
     pub(crate) fn split(&mut self, new: PaneId, side: Side) {
