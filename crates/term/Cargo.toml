@@ -9,6 +9,7 @@ license.workspace = true
 name = "term"
 
 [dependencies]
+unicode-segmentation = "1.13"
 unicode-width = "0.2"
 
 [dev-dependencies]

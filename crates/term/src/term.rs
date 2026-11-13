@@ -5,7 +5,7 @@ use std::io::Write as _;
 use unicode_width::UnicodeWidthChar;
 
 use crate::cell::{Cell, Semantic, StyleId, Width};
-use crate::grid::{Grid, PromptMark, attach_mark, blankify};
+use crate::grid::{Grid, MAX_GRAPHEME, PromptMark, attach_mark, blankify};
 use crate::link::{LinkTable, MAX_ID, MAX_URI};
 use crate::palette::{default_palette, parse_color};
 use crate::parser::Params;
@@ -49,10 +49,89 @@ pub(crate) fn char_width(cp: u32) -> u8 {
     }
 }
 
-/// VS16 requests emoji presentation, two columns wide, of a narrow character.
+/// A codepoint with a width that can still join the previous grapheme
+/// cluster: a regional indicator (flags), an emoji modifier (skin tones),
+/// or a letter or spacing mark of the Indic and Southeast Asian scripts.
+/// An emoji can also join a cluster that ends with a ZWJ, which the caller
+/// sees from the previous cell.
+#[inline(always)]
+fn may_join(cp: u32) -> bool {
+    matches!(cp, 0x0900..=0x0DFF | 0x0E00..=0x0EFF | 0x1000..=0x109F | 0x1780..=0x17FF | 0x1F1E6..=0x1F1FF | 0x1F3FB..=0x1F3FF)
+}
+
+/// Extended_Pictographic, closely enough for ZWJ sequences: the emoji
+/// planes and the symbol blocks their pieces come from.
+#[inline(always)]
+fn pictographic(cp: u32) -> bool {
+    matches!(
+        cp,
+        0xA9 | 0xAE
+            | 0x203C
+            | 0x2049
+            | 0x2122
+            | 0x2139
+            | 0x2190..=0x21FF
+            | 0x2300..=0x23FF
+            | 0x24C2
+            | 0x25A0..=0x25FF
+            | 0x2600..=0x27BF
+            | 0x2934..=0x2935
+            | 0x2B00..=0x2BFF
+            | 0x3030
+            | 0x303D
+            | 0x3297
+            | 0x3299
+            | 0x1F000..=0x1FFFD
+    )
+}
+
+/// Whether `cp` after the grapheme cluster `base` continues it, by the
+/// Unicode rules (UAX #29), as ghostty clusters by default.
+fn continues(base: &str, cp: u32) -> bool {
+    use unicode_segmentation::UnicodeSegmentation;
+    let Some(c) = char::from_u32(cp) else { return false };
+    let mut buf = [0u8; MAX_GRAPHEME + 4];
+    let Some(head) = buf.get_mut(..base.len()) else { return false };
+    head.copy_from_slice(base.as_bytes());
+    let len = base.len() + c.encode_utf8(&mut buf[base.len()..]).len();
+    std::str::from_utf8(&buf[..len]).is_ok_and(|s| s.graphemes(true).nth(1).is_none())
+}
+
+/// Whether `cp`, which has a width, continues the grapheme cluster of the
+/// cell `base`; `cluster` gives the cluster's text when it has marks.
+fn joins_cluster<'a>(cp: u32, base: Cell, cluster: impl FnOnce() -> Option<&'a str>) -> bool {
+    if base.codepoint() == 0 {
+        return false;
+    }
+    match cp {
+        // An emoji modifier is an extending character (GB9).
+        0x1F3FB..=0x1F3FF => return true,
+        // Two regional indicators make a flag (GB12, GB13).
+        0x1F1E6..=0x1F1FF => return !base.has_grapheme() && (0x1F1E6..=0x1F1FF).contains(&base.codepoint()),
+        _ => {}
+    }
+    let cluster = if base.has_grapheme() { cluster() } else { None };
+    if let Some(cluster) = cluster
+        && cluster.ends_with('\u{200d}')
+    {
+        // A pictograph joins one before a ZWJ (GB11).
+        return pictographic(cp) && pictographic(base.codepoint());
+    }
+    if !may_join(cp) {
+        return false;
+    }
+    match cluster {
+        Some(cluster) => continues(cluster, cp),
+        None => char::from_u32(base.codepoint()).is_some_and(|c| continues(c.encode_utf8(&mut [0; 4]), cp)),
+    }
+}
+
+/// A narrow cluster that takes two columns once `cp` joins it: VS16 asks
+/// for emoji presentation, two regional indicators make a flag, and an
+/// emoji modifier makes an emoji.
 #[inline(always)]
 fn widens(cp: u32, base: Cell) -> bool {
-    cp == 0xFE0F && base.width() == Width::Narrow
+    base.width() == Width::Narrow && matches!(cp, 0xFE0F | 0x1F1E6..=0x1F1FF | 0x1F3FB..=0x1F3FF)
 }
 
 /// Makes the narrow cell `x` wide, taking cell `x + 1` for its tail.
@@ -597,10 +676,38 @@ impl Term {
             if !self.pending_wrap {
                 let (row, meta) = self.grid.row_meta_mut(y);
                 let left_tail = row[start].width() == Width::SpacerTail;
+                // A cluster ending with a ZWJ just before may take what follows.
+                let mut joiner = start > 0 && {
+                    let b = if row[start - 1].width() == Width::SpacerTail && start > 1 { start - 2 } else { start - 1 };
+                    row[b].has_grapheme() && meta.grapheme(b as u16).is_some_and(|c| c.ends_with('\u{200d}'))
+                };
                 let mut last = 0;
                 while i < cps.len() {
                     let cp = cps[i];
-                    match char_width(cp) {
+                    let width = char_width(cp);
+                    if width != 0 && (joiner || may_join(cp)) {
+                        // It may join the cluster of a cell written in this
+                        // run; the general path decides for the one before.
+                        if x == start {
+                            break;
+                        }
+                        let b = if row[x - 1].width() == Width::SpacerTail { x - 2 } else { x - 1 };
+                        let base = row[b];
+                        if joins_cluster(cp, base, || meta.grapheme(b as u16)) {
+                            if attach_mark(row, meta, b, cp) && widens(cp, base) && b + 1 == x && x < cols {
+                                widen(row, b);
+                                x += 1;
+                            }
+                            joiner = false;
+                            i += 1;
+                            if x == cols {
+                                break;
+                            }
+                            continue;
+                        }
+                        joiner = false;
+                    }
+                    match width {
                         1 => {
                             row[x] = Cell(tpl | cp as u64);
                             x += 1;
@@ -623,6 +730,7 @@ impl Term {
                                 widen(row, b);
                                 x += 1;
                             }
+                            joiner = cp == 0x200D;
                         }
                         _ => break,
                     }
@@ -661,11 +769,36 @@ impl Term {
     fn print_char(&mut self, cp: u32) {
         let cp = if self.slow { self.map_charset(cp) } else { cp };
         match char_width(cp) {
+            0 => self.combine(cp),
+            1 | 2 if self.joins(cp) => self.combine(cp),
             1 => self.put(cp, false),
             2 => self.put(cp, true),
-            0 => self.combine(cp),
             _ => {}
         }
+    }
+
+    /// The cell a codepoint printed now would join: the one before the
+    /// cursor, or the cursor's own while a wrap is pending.
+    fn previous_cell(&self) -> Option<usize> {
+        let mut x = if self.pending_wrap {
+            self.x
+        } else if self.x > 0 {
+            self.x - 1
+        } else {
+            return None;
+        };
+        if self.grid.slot_cells(self.grid.slot(self.y))[x].width() == Width::SpacerTail && x > 0 {
+            x -= 1;
+        }
+        Some(x)
+    }
+
+    /// Whether `cp`, which has a width, continues the previous cell's
+    /// grapheme cluster instead of taking cells of its own.
+    fn joins(&self, cp: u32) -> bool {
+        let Some(x) = self.previous_cell() else { return false };
+        let base = self.grid.slot_cells(self.grid.slot(self.y))[x];
+        joins_cluster(cp, base, || self.grid.meta(self.y).grapheme(x as u16))
     }
 
     fn map_charset(&mut self, cp: u32) -> u32 {
@@ -746,21 +879,12 @@ impl Term {
         }
     }
 
-    /// Attaches a zero-width codepoint to the previous cell's grapheme.
+    /// Attaches a codepoint to the previous cell's grapheme cluster.
     fn combine(&mut self, cp: u32) {
         let cols = self.cols;
-        let mut x = if self.pending_wrap {
-            self.x
-        } else if self.x > 0 {
-            self.x - 1
-        } else {
-            return;
-        };
+        let Some(x) = self.previous_cell() else { return };
         let y = self.y;
         let (row, meta) = self.grid.row_meta_mut(y);
-        if row[x].width() == Width::SpacerTail && x > 0 {
-            x -= 1;
-        }
         let base = row[x];
         if !attach_mark(row, meta, x, cp) {
             return;
@@ -1508,6 +1632,9 @@ impl Term {
             1007 => m.alternate_scroll,
             2004 => m.bracketed_paste,
             2026 => m.sync_update,
+            // Grapheme clusters are always on (ghostty's grapheme-width-method
+            // = unicode); a reset does not turn them off.
+            2027 => true,
             47 | 1047 | 1049 => self.alt_active,
             1048 => false,
             _ => return None,

@@ -9,7 +9,7 @@ use crate::cell::{Cell, StyleId, Width};
 /// Column of a grapheme entry whose cell was deleted.
 const FREE: u16 = u16::MAX;
 /// Upper bound of a grapheme cluster's UTF-8 length.
-const MAX_GRAPHEME: usize = 256;
+pub(crate) const MAX_GRAPHEME: usize = 256;
 
 /// ghostty's row semantic_prompt values.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
