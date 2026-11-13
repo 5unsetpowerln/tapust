@@ -1606,6 +1606,7 @@ impl Surface {
     /// Opens ghostty's context menu at (`x`, `y`) on the GLArea; closing it
     /// gives the surface its focus back.
     pub fn popup_menu(&self, x: f64, y: f64) {
+        let created = self.menu.borrow().is_none();
         let menu = self.menu.borrow_mut().get_or_insert_with(|| {
             let menu = gtk::PopoverMenu::from_model_full(&crate::gui::context_menu(), gtk::PopoverMenuFlags::NESTED);
             menu.set_halign(gtk::Align::Start);
@@ -1618,7 +1619,14 @@ impl Surface {
             menu
         }).clone();
         menu.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-        menu.popup();
+        if created {
+            // GTK adds the separators between a new menu's sections in an
+            // idle of default priority; a popup before that is sized without
+            // them, and its surface keeps that height.
+            glib::idle_add_local_once(move || menu.popup());
+        } else {
+            menu.popup();
+        }
     }
 
     /// ghostty's link hover: with exactly ctrl held (shift too while a
