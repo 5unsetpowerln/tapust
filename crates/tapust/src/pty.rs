@@ -32,6 +32,8 @@ pub trait Feed: Send + 'static {
     fn feed(&mut self, bytes: &[u8]);
     /// Bytes to send back to the application (query replies).
     fn take_replies(&mut self) -> Option<Vec<u8>>;
+    /// Whether the application must hear of a change besides the cells.
+    fn take_news(&mut self) -> bool;
 }
 
 impl Feed for term::Terminal {
@@ -41,6 +43,10 @@ impl Feed for term::Terminal {
 
     fn take_replies(&mut self) -> Option<Vec<u8>> {
         term::Terminal::take_replies(self)
+    }
+
+    fn take_news(&mut self) -> bool {
+        term::Terminal::take_news(self)
     }
 }
 
@@ -267,6 +273,9 @@ pub struct Shared<T> {
     pub term: Mutex<T>,
     /// Set by the I/O thread after it changed the terminal; cleared by the renderer.
     pub dirty: AtomicBool,
+    /// Set by the I/O thread when the terminal has news besides the cells
+    /// (Feed::take_news); cleared by the application when woken for it.
+    pub news: AtomicBool,
     /// Set by the renderer while it waits for the terminal lock.
     pub want_lock: AtomicBool,
     pub exited: OnceLock<ChildExit>,
@@ -332,6 +341,7 @@ impl<T: Feed> PaneIo<T> {
         let shared = Arc::new(Shared {
             term: Mutex::new(term),
             dirty: AtomicBool::new(false),
+            news: AtomicBool::new(false),
             want_lock: AtomicBool::new(false),
             exited: OnceLock::new(),
             pending: Mutex::new(VecDeque::new()),
@@ -427,12 +437,16 @@ fn io_loop<T: Feed>(shared: &Shared<T>, stop: &AtomicBool, (pidfd, started): (Ow
                 };
                 term.feed(&buf[..filled]);
                 let replies = term.take_replies();
+                let news = term.take_news();
                 drop(term);
                 filled = 0;
                 if let Some(replies) = replies {
                     shared.write(&replies);
                 }
-                if !shared.dirty.swap(true, Ordering::AcqRel) {
+                // Output the renderer has not drawn yet already woke the
+                // application, but news after that waking needs another.
+                let news = news && !shared.news.swap(true, Ordering::AcqRel);
+                if !shared.dirty.swap(true, Ordering::AcqRel) || news {
                     notify();
                 }
                 if eof || !got_data || shared.want_lock.load(Ordering::Acquire) {
@@ -492,6 +506,10 @@ mod tests {
 
         fn take_replies(&mut self) -> Option<Vec<u8>> {
             None
+        }
+
+        fn take_news(&mut self) -> bool {
+            false
         }
     }
 

@@ -1722,6 +1722,8 @@ impl Window {
         let mut st = self.state.borrow_mut();
         let Some(p) = st.panes.get_mut(&pane) else { return };
         let Some(io) = &p.io else { return };
+        // News from here on wakes this again.
+        io.shared.news.store(false, std::sync::atomic::Ordering::Release);
         let exit = io.shared.exited.get().copied().filter(|_| !p.child_exited);
         let (title, pwd, bell, messages) = {
             let mut term = io.shared.term.lock();

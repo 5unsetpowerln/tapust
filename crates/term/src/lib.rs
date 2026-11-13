@@ -183,6 +183,8 @@ impl Dirty {
 pub struct Terminal {
     parser: parser::Parser,
     term: term::Term,
+    /// The title and the working directory when take_news last looked.
+    told: (String, Option<String>),
 }
 
 impl Terminal {
@@ -192,6 +194,7 @@ impl Terminal {
         Terminal {
             parser: parser::Parser::new(),
             term: term::Term::new(cols.max(1) as usize, rows.max(1) as usize, scrollback_lines),
+            told: (String::new(), None),
         }
     }
 
@@ -201,7 +204,7 @@ impl Terminal {
     /// and the styles, links and colors to draw them. The copy has no
     /// selection and reports no mouse.
     pub fn snapshot(&self) -> Terminal {
-        Terminal { parser: parser::Parser::new(), term: self.term.snapshot() }
+        Terminal { parser: parser::Parser::new(), term: self.term.snapshot(), told: self.told.clone() }
     }
 
     /// Parses PTY output and applies it. Escape and UTF-8 sequences may be
@@ -359,6 +362,19 @@ impl Terminal {
     /// enabled later starts from it.
     pub fn set_focused(&mut self, focused: bool) {
         self.term.focused = focused;
+    }
+
+    /// Whether there is news besides the cells: a title or working directory
+    /// other than at the last call, or a bell or messages not taken yet. The
+    /// application reads these when woken, which it must be for them even
+    /// while the cells it was woken for are not drawn yet.
+    pub fn take_news(&mut self) -> bool {
+        let t = &self.term;
+        let moved = t.title != self.told.0 || t.cwd != self.told.1;
+        if moved {
+            self.told = (t.title.clone(), t.cwd.clone());
+        }
+        moved || t.bell || !t.messages.is_empty()
     }
 
     /// True once for each BEL received since the last call.
