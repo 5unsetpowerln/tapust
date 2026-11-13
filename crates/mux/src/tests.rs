@@ -465,6 +465,42 @@ fn repeat_within_repeat_time() {
 }
 
 #[test]
+fn held_key_repeats_its_binding_while_held() {
+    let t = Instant::now();
+    let mut s = new_session();
+    ok(&mut s, split(true));
+    select_index(&mut s, 0);
+    let resize = vec![Effect::ResizeSplit { pane: 0, horizontal: true, cells: 5 }];
+    s.key(ctrl('b'), t);
+    assert_eq!(resize_effect(s.key(ch('L'), t)), resize);
+    // Automatic repeats keep resizing past the repeat time.
+    let late = t + Duration::from_secs(2);
+    assert_eq!(resize_effect(s.key_repeat(ch('L'), late)), resize);
+    assert_eq!(s.deadline(), Some(late + Duration::from_millis(500)));
+    // Released, a press after the repeat time goes to the pane.
+    assert_eq!(s.key(ch('L'), late + Duration::from_millis(500)), KeyResult::Forward(0));
+}
+
+#[test]
+fn held_key_after_other_bindings_does_nothing() {
+    let t = Instant::now();
+    let mut s = new_session();
+    s.key(ctrl('b'), t);
+    s.key(ch('c'), t);
+    let windows = s.windows().len();
+    assert_eq!(s.key_repeat(ch('c'), t + Duration::from_secs(1)), KeyResult::Handled(vec![]));
+    assert_eq!(s.windows().len(), windows);
+    // Repeats of a key typed into the pane go to the pane.
+    assert!(matches!(s.key(ch('x'), t), KeyResult::Forward(_)));
+    assert!(matches!(s.key_repeat(ch('x'), t), KeyResult::Forward(_)));
+    // A repeat of the bound key after another key is a key like any other.
+    s.key(ctrl('b'), t);
+    s.key(ch('c'), t);
+    s.key(ch('y'), t);
+    assert!(matches!(s.key_repeat(ch('c'), t), KeyResult::Forward(_)));
+}
+
+#[test]
 fn key_after_repeat_time_goes_to_pane() {
     let t = Instant::now();
     let mut s = new_session();
