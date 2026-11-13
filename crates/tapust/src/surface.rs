@@ -279,6 +279,15 @@ fn button_of(number: u32) -> Option<mouse::Button> {
     }
 }
 
+/// The grid a size holds before the surface is realized, its fonts' cell
+/// size and the padding across and down, in device pixels (as
+/// Event::CellSize).
+pub struct Estimate {
+    pub grid: (u16, u16),
+    pub cell: (u32, u32),
+    pub padding: (u32, u32),
+}
+
 /// ghostty's sync_reset_ms: a synchronized update ends a second after it began.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -2117,6 +2126,21 @@ impl Surface {
 
     pub fn cell_size(&self) -> Option<(u32, u32)> {
         self.draw.borrow().renderer.as_ref().map(|r| r.cell_size())
+    }
+
+    /// Loads the fonts at `scale` ahead of the GL area, which takes them
+    /// when it is realized, and gives what `width` x `height` logical pixels
+    /// would hold with them: what a program can start in before the window
+    /// is shown.
+    pub fn estimate(&self, width: u32, height: u32, scale: f64) -> Option<Estimate> {
+        let fonts = load_fonts(self.config.borrow().font_family(), self.font_points.get(), scale)?;
+        let cell = (fonts.cell_width, fonts.cell_height);
+        *self.kept_fonts.borrow_mut() = Some(fonts);
+        let device = |px: u32| (f64::from(px) * scale).round() as u32;
+        let config = self.config.borrow();
+        let pad = explicit_padding(&config, scale);
+        let grid = layout(device(width), device(height), cell, pad, config.window_padding_balance).0;
+        Some(Estimate { grid, cell, padding: (pad.left + pad.right, pad.top + pad.bottom) })
     }
 
     /// The grid this surface's fonts would fit in `width` x `height`

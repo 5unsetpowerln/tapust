@@ -775,6 +775,7 @@ impl App {
         let window = self.add_window(session);
         window.apply(effects);
         window.reconcile();
+        window.start_early();
         window.window.present();
     }
 
@@ -1764,44 +1765,86 @@ impl Window {
                 let _ = io.pty.resize(cols, rows, cell);
                 p.surface.resize_copy_mode(cols, rows);
             }
-            None => {
-                let config = self.app.config();
-                let program = match (p.program.take(), &config.command) {
-                    (Some(argv), _) => Program::Argv(argv),
-                    (None, None) => Program::LoginShell,
-                    (None, Some(ConfigCommand::Shell(line))) => Program::ShellCommand(line.clone()),
-                    (None, Some(ConfigCommand::Direct(words))) => {
-                        Program::Argv(words.iter().map(OsString::from).collect())
-                    }
-                };
-                let blink = config.cursor_style_blink.unwrap_or(true);
-                let pty = match Pty::spawn(program, blink, cols, rows, cell, &p.cwd) {
-                    Ok(pty) => pty,
-                    Err(err) => {
-                        eprintln!("tapust: cannot start a shell: {err}");
-                        return;
-                    }
-                };
-                let mut terminal = term::Terminal::new(cols, rows, config.scrollback_lines);
-                terminal.set_default_palette(config.term_palette());
-                terminal.set_default_cursor(config.cursor_style, config.cursor_style_blink);
-                let io = match PaneIo::start(pty, terminal, move || {
-                    glib::idle_add_once(move || wake(pane));
-                }) {
-                    Ok(io) => io,
-                    Err(err) => {
-                        eprintln!("tapust: cannot start the pane's I/O: {err}");
-                        return;
-                    }
-                };
-                if let Some(name) = io.pty.foreground_name() {
-                    st.session.set_auto_name(pane, &name);
-                }
-                p.surface.attach(io.shared.clone());
-                p.io = Some(io);
-            }
+            None => self.spawn(st, pane, cols, rows, cell),
         }
         self.queue_geometry();
+    }
+
+    /// Starts the pane's program in a `cols` x `rows` terminal of `cell`
+    /// pixel cells.
+    fn spawn(&self, st: &mut State, pane: PaneId, cols: u16, rows: u16, cell: (u32, u32)) {
+        let Some(p) = st.panes.get_mut(&pane) else { return };
+        let config = self.app.config();
+        let program = match (p.program.take(), &config.command) {
+            (Some(argv), _) => Program::Argv(argv),
+            (None, None) => Program::LoginShell,
+            (None, Some(ConfigCommand::Shell(line))) => Program::ShellCommand(line.clone()),
+            (None, Some(ConfigCommand::Direct(words))) => {
+                Program::Argv(words.iter().map(OsString::from).collect())
+            }
+        };
+        let blink = config.cursor_style_blink.unwrap_or(true);
+        let pty = match Pty::spawn(program, blink, cols, rows, cell, &p.cwd) {
+            Ok(pty) => pty,
+            Err(err) => {
+                eprintln!("tapust: cannot start a shell: {err}");
+                return;
+            }
+        };
+        let mut terminal = term::Terminal::new(cols, rows, config.scrollback_lines);
+        terminal.set_default_palette(config.term_palette());
+        terminal.set_default_cursor(config.cursor_style, config.cursor_style_blink);
+        let io = match PaneIo::start(pty, terminal, move || {
+            glib::idle_add_once(move || wake(pane));
+        }) {
+            Ok(io) => io,
+            Err(err) => {
+                eprintln!("tapust: cannot start the pane's I/O: {err}");
+                return;
+            }
+        };
+        if let Some(name) = io.pty.foreground_name() {
+            st.session.set_auto_name(pane, &name);
+        }
+        p.surface.attach(io.shared.clone());
+        p.io = Some(io);
+    }
+
+    /// Starts the program of a new window's first pane before the window is
+    /// shown, in the grid it is likely to get (window-width x window-height,
+    /// else what the default size holds), so that it starts while GTK sets
+    /// the window and GL up; the pane's first resize gives it its size.
+    fn start_early(&self) {
+        let pane = {
+            let st = self.state.borrow();
+            let mut waiting = st.panes.iter().filter(|(_, p)| p.io.is_none());
+            match (waiting.next(), waiting.next()) {
+                (Some((&pane, _)), None) => pane,
+                _ => return,
+            }
+        };
+        let Some(surface) = self.state.borrow().panes.get(&pane).map(|p| p.surface.clone()) else { return };
+        let scale = gdk::Display::default()
+            .and_then(|d| d.monitors().item(0))
+            .and_then(|m| m.downcast::<gdk::Monitor>().ok())
+            .map_or(1.0, |m| m.scale());
+        let config = self.app.config();
+        let natural = |widget: &gtk::Widget| widget.measure(gtk::Orientation::Vertical, -1).1;
+        let content = self.toolbar.content().expect("the toolbar's content");
+        let bars = natural(self.toolbar.upcast_ref()) - natural(&content);
+        let (width, height) = self.window.default_size();
+        let Some(estimate) = surface.estimate(width.max(1) as u32, (height - bars).max(1) as u32, scale) else {
+            return;
+        };
+        let (cols, rows) = if config.window_width != 0 && config.window_height != 0 {
+            // The window opens in that size then, not resized once shown.
+            self.initial_size(estimate.cell, scale, estimate.padding);
+            (config.window_width as u16, config.window_height as u16)
+        } else {
+            estimate.grid
+        };
+        let mut st = self.state.borrow_mut();
+        self.spawn(&mut st, pane, cols, rows, estimate.cell);
     }
 
     /// The pane's terminal changed or its process exited.
