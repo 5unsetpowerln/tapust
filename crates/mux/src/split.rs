@@ -318,6 +318,33 @@ mod tests {
     }
 
     #[test]
+    fn a_resize_keeps_the_shape_and_numbers_ratios_like_split_at() {
+        let mut tree = Node::Leaf(0);
+        tree.split(1, RIGHT);
+        tree.find_mut(0).unwrap().split(2, DOWN);
+        let before = tree.clone();
+        assert!(tree.resize(1, true, -0.1));
+        assert_ne!(tree, before);
+        assert!(tree.same_shape(&before));
+        let mut ratios = Vec::new();
+        tree.ratios(&mut ratios);
+        let by_index: Vec<f64> = (0..ratios.len()).map(|i| tree.split_at(i).unwrap().ratio).collect();
+        assert_eq!(ratios, by_index);
+
+        let mut swapped = before.clone();
+        swapped.relabel(&|p| match p {
+            1 => 2,
+            2 => 1,
+            p => p,
+        });
+        assert!(!swapped.same_shape(&before));
+        let mut turned = Node::Leaf(0);
+        turned.split(1, DOWN);
+        turned.find_mut(0).unwrap().split(2, DOWN);
+        assert!(!turned.same_shape(&before));
+    }
+
+    #[test]
     fn removing_gives_the_parent_to_the_sibling_subtree() {
         let mut tree = Node::Leaf(0);
         tree.split(1, RIGHT);
