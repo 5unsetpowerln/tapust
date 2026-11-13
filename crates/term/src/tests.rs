@@ -1837,3 +1837,24 @@ fn a_snapshot_keeps_the_active_screen_as_it_was() {
     let s = t.snapshot();
     assert_eq!((screen(&s), s.history_len(), s.modes().alt_screen), (vec!["alt".to_owned()], 0, false));
 }
+
+#[test]
+fn news_besides_the_cells() {
+    let mut t = term(20, 3);
+    feed(&mut t, "text\r\n");
+    assert!(!t.take_news());
+    feed(&mut t, "\x1b]0;title\x07");
+    assert!(t.take_news());
+    assert!(!t.take_news(), "the same title is no news");
+    feed(&mut t, "\x1b]7;file://localhost/tmp\x07");
+    assert!(t.take_news());
+    feed(&mut t, "\x07");
+    assert!(t.take_news());
+    assert!(t.take_news(), "a bell not taken yet is still news");
+    assert!(t.take_bell());
+    assert!(!t.take_news());
+    feed(&mut t, "\x1b]9;4;1;50\x07");
+    assert!(t.take_news());
+    assert_eq!(t.take_messages().len(), 1);
+    assert!(!t.take_news());
+}
