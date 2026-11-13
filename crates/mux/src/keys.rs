@@ -30,6 +30,9 @@ pub(crate) struct KeyState {
     pub table: Table,
     /// `CLIENT_REPEAT`, with the expiry of the repeat timer.
     pub repeat: Option<Instant>,
+    /// The key whose press ran this prefix table binding, while the GUI
+    /// reports the key's automatic repeats (it is held down).
+    pub held: Option<(Key, Binding)>,
 }
 
 impl KeyState {
@@ -243,14 +246,30 @@ pub(crate) fn prefix_binding(key: Key) -> Option<Binding> {
 }
 
 impl Session {
-    /// server_client_handle_key followed by server_client_key_callback.
-    pub(crate) fn handle_key(&mut self, key: Key, now: Instant) -> KeyResult {
+    /// server_client_handle_key followed by server_client_key_callback;
+    /// `repeat` is an automatic repeat of a key held down. A key held after
+    /// it ran a prefix binding runs a `-r` binding again for as long as it is
+    /// held, whatever the repeat time, and its repeats do nothing after any
+    /// other binding: tmux cannot tell them from presses, which type into
+    /// the pane once the repeat time is over.
+    pub(crate) fn handle_key(&mut self, key: Key, now: Instant, repeat: bool) -> KeyResult {
         self.tick(now);
         if self.dead {
             return KeyResult::Handled(Vec::new());
         }
         if self.message.take().is_some() {
             self.generation += 1;
+        }
+        match self.keys.held.clone() {
+            Some((held, binding)) if repeat && held == key => {
+                if !binding.repeat {
+                    return KeyResult::Handled(Vec::new());
+                }
+                self.keys.table = Table::Prefix;
+                self.keys.repeat = Some(now + REPEAT_TIME);
+                return KeyResult::Handled(self.op(|s| s.dispatch(binding.action, now)));
+            }
+            _ => self.keys.held = None,
         }
         let mut effects = Vec::new();
         if self.prompt.is_some() {
@@ -298,6 +317,9 @@ impl Session {
                     first = Table::Root;
                     self.keys.repeat = None;
                     continue;
+                }
+                if table == Table::Prefix {
+                    self.keys.held = Some((key, binding.clone()));
                 }
                 if binding.repeat {
                     self.keys.repeat = Some(now + REPEAT_TIME);

@@ -517,7 +517,12 @@ impl Session {
 
     /// Offers a key to the key tables (prefix, repeat, prompts, copy mode).
     pub fn key(&mut self, key: Key, now: Instant) -> KeyResult {
-        self.handle_key(key, now)
+        self.handle_key(key, now, false)
+    }
+
+    /// An automatic repeat of `key`, held down since its last press.
+    pub fn key_repeat(&mut self, key: Key, now: Instant) -> KeyResult {
+        self.handle_key(key, now, true)
     }
 
     /// Runs what the prefix table binds `key` to, as the prefix and then
