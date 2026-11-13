@@ -11,6 +11,7 @@ use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use mux::{Key, ModeKeys};
 use term::{CursorShape, Palette, Rgb};
@@ -213,6 +214,9 @@ pub struct Config {
     /// `tmux-mode-keys`, tmux's `mode-keys`; unset, tmux's rule from
     /// $VISUAL and $EDITOR.
     pub tmux_mode_keys: Option<ModeKeys>,
+    /// `split-resize-transition`, tapust's: how long a divider takes to move
+    /// to a ratio a key gave (resize-pane, a layout); zero moves it at once.
+    pub split_resize_transition: Duration,
 }
 
 impl Default for Config {
@@ -264,6 +268,7 @@ impl Default for Config {
             scrollback_lines: 10_000,
             tmux_prefix: Some(mux::DEFAULT_PREFIX),
             tmux_mode_keys: None,
+            split_resize_transition: Duration::ZERO,
         }
     }
 }
@@ -572,6 +577,9 @@ impl Loader<'_> {
                 c.tmux_prefix = or_default(value, default.tmux_prefix, |v| mux::parse_key(v).map_err(Error::Message))?
             }
             "tmux-mode-keys" => c.tmux_mode_keys = optional(value, |v| one_of(v, MODE_KEYS))?,
+            "split-resize-transition" => {
+                c.split_resize_transition = or_default(value, default.split_resize_transition, duration)?
+            }
             "theme" => c.theme = optional(value, theme)?,
             "window-theme" => c.window_theme = or_default(value, default.window_theme, |v| one_of(v, WINDOW_THEMES))?,
             "window-titlebar-background" => c.window_titlebar_background = optional(value, color)?,
@@ -918,6 +926,21 @@ fn decoration(value: &str) -> Result<Decoration, Error> {
 
 /// An opacity from `min` to 1, which ghostty would clamp to that range
 /// without a word.
+/// A duration in ghostty's syntax, with the units that make sense for a
+/// transition: `150ms`, `1s`, or `0`.
+fn duration(value: &str) -> Result<Duration, Error> {
+    if value == "0" {
+        return Ok(Duration::ZERO);
+    }
+    let (digits, unit) = value.split_at(value.find(|c: char| !c.is_ascii_digit()).unwrap_or(value.len()));
+    let n: u64 = digits.parse().map_err(|_| Error::Invalid)?;
+    match unit {
+        "ms" => Ok(Duration::from_millis(n)),
+        "s" => Ok(Duration::from_secs(n)),
+        _ => Err(Error::Hint("it must be a duration such as 150ms".to_owned())),
+    }
+}
+
 fn fraction(value: &str, min: f64) -> Result<f64, Error> {
     let v: f64 = value.parse().map_err(|_| Error::Invalid)?;
     if !(min..=1.0).contains(&v) {

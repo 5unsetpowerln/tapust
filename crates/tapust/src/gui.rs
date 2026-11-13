@@ -164,7 +164,18 @@ struct SplitWidget {
     followed: Cell<bool>,
     pos_changed: Cell<bool>,
     idle: RefCell<Option<glib::SourceId>>,
+    /// The divider moving to `ratio` over split-resize-transition.
+    transition: Cell<Option<Transition>>,
     app: Weak<App>,
+}
+
+/// A divider on its way from the ratio `from`, which it showed at `start`
+/// (glib's monotonic time, as frame times are), over `duration` microseconds.
+#[derive(Clone, Copy)]
+struct Transition {
+    from: f64,
+    start: i64,
+    duration: i64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -190,6 +201,7 @@ impl SplitWidget {
             followed: Cell::new(false),
             pos_changed: Cell::new(false),
             idle: RefCell::new(None),
+            transition: Cell::new(None),
             app: Rc::downgrade(app),
         });
         for property in ["min-position", "max-position"] {
@@ -197,9 +209,12 @@ impl SplitWidget {
             split.paned.connect_notify_local(Some(property), move |_, _| {
                 if let Some(s) = weak.upgrade() {
                     // A resize of the paned or of a child's minimum: the
-                    // position follows the ratio right away.
+                    // position follows the ratio right away, or with the
+                    // next frame of a transition.
                     s.followed.set(true);
-                    s.sync(Sync::TreeToWidget);
+                    if s.transition.get().is_none() {
+                        s.sync(Sync::TreeToWidget);
+                    }
                     s.queue_idle();
                 }
             });
@@ -232,26 +247,71 @@ impl SplitWidget {
     }
 
     /// The tree got a new ratio (a resize by key, or a split kept by a
-    /// rebuild): the divider moves to it.
+    /// rebuild): the divider moves to it, over split-resize-transition from
+    /// where it is, also when it is on its way to another ratio.
     fn follow(self: &Rc<Self>, ratio: f64) {
+        if self.transition.get().is_some() && ratio == self.ratio.get() {
+            return;
+        }
+        let duration = self.app.upgrade().map_or(Duration::ZERO, |app| app.config().split_resize_transition);
+        let shown = self.extent().map(|(pos, _, _, size)| f64::from(pos) / f64::from(size));
         self.ratio.set(ratio);
-        self.followed.set(true);
-        self.sync(Sync::TreeToWidget);
-        self.queue_idle();
+        match shown {
+            Some(from) if !duration.is_zero() && (from - ratio).abs() > 0.001 => {
+                let start = glib::monotonic_time();
+                let next = Transition { from, start, duration: duration.as_micros() as i64 };
+                if self.transition.replace(Some(next)).is_none() {
+                    let weak = Rc::downgrade(self);
+                    self.paned.add_tick_callback(move |_, clock| {
+                        let going = weak.upgrade().is_some_and(|s| s.step(clock.frame_time()));
+                        if going { glib::ControlFlow::Continue } else { glib::ControlFlow::Break }
+                    });
+                }
+            }
+            _ => {
+                self.transition.set(None);
+                self.followed.set(true);
+                self.sync(Sync::TreeToWidget);
+                self.queue_idle();
+            }
+        }
+    }
+
+    /// Moves the divider along its transition at frame time `now`, easing
+    /// out (cubic); returns whether it goes on.
+    fn step(self: &Rc<Self>, now: i64) -> bool {
+        let Some(t) = self.transition.get() else { return false };
+        let done = ((now - t.start) as f64 / t.duration as f64).clamp(0.0, 1.0);
+        let eased = 1.0 - (1.0 - done).powi(3);
+        if let Some((_, min, max, size)) = self.extent() {
+            let ratio = t.from + (self.ratio.get() - t.from) * eased;
+            self.followed.set(true);
+            self.paned.set_position(((f64::from(size) * ratio).round() as i32).clamp(min, min.max(max)));
+            self.queue_idle();
+        }
+        if done < 1.0 {
+            return true;
+        }
+        self.transition.set(None);
+        false
+    }
+
+    /// The divider's position, its limits and the space it divides, once
+    /// the paned has a size.
+    fn extent(&self) -> Option<(i32, i32, i32, i32)> {
+        let p = &self.paned;
+        let (pos, min, max) = (p.position(), p.min_position(), p.max_position());
+        if max == i32::MAX {
+            return None;
+        }
+        let end_min = p.end_child().map_or(0, |c| c.measure(p.orientation(), -1).0);
+        let size = max + end_min;
+        (size != 0).then_some((pos, min, max, size))
     }
 
     /// ghostty's syncSplitRatio.
     fn sync(&self, direction: Sync) {
-        let p = &self.paned;
-        let (pos, min, max) = (p.position(), p.min_position(), p.max_position());
-        if max == i32::MAX {
-            return;
-        }
-        let end_min = p.end_child().map_or(0, |c| c.measure(p.orientation(), -1).0);
-        let size = max + end_min;
-        if size == 0 {
-            return;
-        }
+        let Some((pos, min, max, size)) = self.extent() else { return };
         let current = f64::from(pos) / f64::from(size);
         let desired = self.ratio.get();
         if (current - desired).abs() <= 0.001 {
@@ -261,7 +321,7 @@ impl SplitWidget {
         let desired_pos = d.round() as i32;
         let clamped = desired_pos.clamp(min, min.max(max));
         match direction {
-            Sync::TreeToWidget => p.set_position(clamped),
+            Sync::TreeToWidget => self.paned.set_position(clamped),
             Sync::WidgetToTree => self.set_tree_ratio(current),
             Sync::ClampedToTree => {
                 if clamped != desired_pos {
