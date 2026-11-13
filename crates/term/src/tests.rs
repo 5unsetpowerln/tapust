@@ -1858,3 +1858,21 @@ fn news_besides_the_cells() {
     assert_eq!(t.take_messages().len(), 1);
     assert!(!t.take_news());
 }
+
+#[test]
+fn synchronized_update_begins_and_ends() {
+    let mut t = term(20, 3);
+    assert_eq!(t.sync_begun(), None);
+    let before = std::time::Instant::now();
+    feed(&mut t, "\x1b[?2026h");
+    assert!(t.sync_begun().is_some_and(|begun| begun >= before));
+    feed(&mut t, "\x1b[?2026l");
+    assert_eq!(t.sync_begun(), None);
+    feed(&mut t, "\x1b[?2026h");
+    t.end_sync();
+    assert_eq!(t.sync_begun(), None);
+    assert!(!t.modes().sync_update);
+    feed(&mut t, "\x1b[?2026h");
+    t.resize(10, 3);
+    assert_eq!(t.sync_begun(), None);
+}
