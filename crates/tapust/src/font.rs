@@ -1,8 +1,11 @@
 //! Font loading and rasterization (FreeType and fontconfig through crossfont).
 
+use std::cell::RefCell;
 use std::ffi::CString;
 use std::io::{self, Write};
+use std::ops::Deref;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+use std::rc::{Rc, Weak};
 
 use crossfont::{
     BitmapBuffer, FontDesc, FontKey, GlyphKey, Rasterize, RasterizedGlyph, Rasterizer, Size, Slant,
@@ -124,8 +127,14 @@ pub struct Bitmap {
     pub rgba: Vec<u8>,
 }
 
-pub struct Fonts {
-    rasterizer: Rasterizer,
+/// The terminal font at one size and scale. Clones share it, and loading
+/// the same font while a pane holds it gives that one: loading takes several
+/// milliseconds (fontconfig and FreeType), which every new or moved pane paid.
+#[derive(Clone)]
+pub struct Fonts(Rc<Loaded>);
+
+pub struct Loaded {
+    rasterizer: RefCell<Rasterizer>,
     faces: [FontKey; 4],
     size: Size,
     pub cell_width: u32,
@@ -139,8 +148,38 @@ pub struct Fonts {
     pub strike_y: i32,
 }
 
+impl Deref for Fonts {
+    type Target = Loaded;
+
+    fn deref(&self) -> &Loaded {
+        &self.0
+    }
+}
+
+type Key = (String, u32, u64);
+
+thread_local! {
+    static LOADED: RefCell<Vec<(Key, Weak<Loaded>)>> = const { RefCell::new(Vec::new()) };
+}
+
 impl Fonts {
     pub fn new(family: &str, points: f32, scale: f64) -> Result<Fonts, crossfont::Error> {
+        let key = (family.to_owned(), points.to_bits(), scale.to_bits());
+        let held = LOADED.with_borrow(|l| l.iter().find(|(k, _)| *k == key).and_then(|(_, w)| w.upgrade()));
+        if let Some(loaded) = held {
+            return Ok(Fonts(loaded));
+        }
+        let loaded = Rc::new(Loaded::new(family, points, scale)?);
+        LOADED.with_borrow_mut(|l| {
+            l.retain(|(_, w)| w.strong_count() > 0);
+            l.push((key, Rc::downgrade(&loaded)));
+        });
+        Ok(Fonts(loaded))
+    }
+}
+
+impl Loaded {
+    fn new(family: &str, points: f32, scale: f64) -> Result<Loaded, crossfont::Error> {
         let mut rasterizer = Rasterizer::new()?;
         let size = Size::new(points * scale as f32);
         let desc = |slant, weight| FontDesc::new(family, Style::Description { slant, weight });
@@ -160,8 +199,8 @@ impl Fonts {
         let underline_thickness = metrics.underline_thickness.round().max(1.0) as i32;
         let underline_y = baseline - metrics.underline_position.round() as i32 - underline_thickness / 2;
         let strike_y = baseline - metrics.strikeout_position.round() as i32;
-        Ok(Fonts {
-            rasterizer,
+        Ok(Loaded {
+            rasterizer: RefCell::new(rasterizer),
             faces: [regular, bold, italic, bold_italic],
             size,
             cell_width,
@@ -175,9 +214,9 @@ impl Fonts {
 
     /// Rasterizes `ch` in `face`; a character missing from every font yields
     /// the replacement glyph.
-    pub fn rasterize(&mut self, ch: char, face: Face) -> Option<Bitmap> {
+    pub fn rasterize(&self, ch: char, face: Face) -> Option<Bitmap> {
         let key = GlyphKey { font_key: self.faces[face], character: ch, size: self.size };
-        let glyph = match self.rasterizer.get_glyph(key) {
+        let glyph = match self.rasterizer.borrow_mut().get_glyph(key) {
             Ok(glyph) | Err(crossfont::Error::MissingGlyph(glyph)) => glyph,
             Err(_) => return None,
         };

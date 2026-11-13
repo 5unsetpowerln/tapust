@@ -197,6 +197,9 @@ pub struct Surface {
     /// so a reload leaves it.
     font_adjusted: Cell<bool>,
     font_scale: Cell<f64>,
+    /// The fonts while the GL area is unrealized (a rebuild moving it), so
+    /// that realizing it again takes them instead of loading them.
+    kept_fonts: RefCell<Option<Fonts>>,
     config: RefCell<Rc<Config>>,
     cell_idle: Cell<bool>,
     handler: Handler,
@@ -530,6 +533,7 @@ impl Surface {
             font_base: Cell::new(font_points),
             font_adjusted: Cell::new(false),
             font_scale: Cell::new(0.0),
+            kept_fonts: RefCell::new(None),
             config: RefCell::new(config),
             cell_idle: Cell::new(false),
             handler: handler.clone(),
@@ -565,6 +569,7 @@ impl Surface {
             let scale = area.native().and_then(|n| n.surface()).map_or(1.0, |s| s.scale());
             let Some(fonts) = load_fonts(s.config.borrow().font_family(), s.font_points.get(), scale) else { return };
             s.draw.borrow_mut().renderer = Some(Renderer::new(crate::gl::context(), fonts));
+            s.kept_fonts.take();
             s.im.set_client_widget(Some(area));
             s.font_scale.set(scale);
             s.schedule_cell_size();
@@ -573,7 +578,9 @@ impl Surface {
         self.area.connect_unrealize(move |area| {
             if let Some(s) = weak.upgrade() {
                 area.make_current();
-                s.draw.borrow_mut().renderer = None;
+                let renderer = s.draw.borrow_mut().renderer.take();
+                *s.kept_fonts.borrow_mut() = renderer.as_ref().map(|r| r.fonts.clone());
+                drop(renderer);
                 s.im.set_client_widget(None::<&gtk::Widget>);
             }
         });
