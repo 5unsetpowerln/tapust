@@ -196,6 +196,14 @@ void main() {
 }
 "#;
 
+/// Compiles the renderer's programs and drops them.
+pub fn warm_up(gl: &glow::Context) {
+    for (vs, fs) in [(BG_VS, BG_FS), (FG_VS, FG_FS)] {
+        // SAFETY: the context is current.
+        unsafe { gl.delete_program(program(gl, vs, fs)) };
+    }
+}
+
 unsafe fn program(gl: &glow::Context, vs: &str, fs: &str) -> glow::Program {
     unsafe {
         let program = gl.create_program().expect("create program");

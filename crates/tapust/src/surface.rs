@@ -586,6 +586,8 @@ impl Surface {
             let scale = area.native().and_then(|n| n.surface()).map_or(1.0, |s| s.scale());
             let Some(fonts) = load_fonts(s.config.borrow().font_family(), s.font_points.get(), scale) else { return };
             s.draw.borrow_mut().renderer = Some(Renderer::new(crate::gl::context(), fonts));
+            // After the frame: destroying a context takes about a millisecond.
+            glib::idle_add_local_once(crate::gl::drop_warm_context);
             s.kept_fonts.take();
             s.im.set_client_widget(Some(area));
             s.font_scale.set(scale);
