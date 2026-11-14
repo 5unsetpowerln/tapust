@@ -31,6 +31,7 @@ use crate::input;
 use crate::notifications;
 use crate::palette::{self, Run};
 use crate::pty::{ChildExit, PaneIo, Program, Pty};
+use crate::stylesheet::Stylesheet;
 use crate::surface::{self, Event, Surface};
 use crate::theme;
 
@@ -98,6 +99,8 @@ pub struct App {
     /// The configuration was read for a dark style (ghostty's conditional
     /// theme state).
     theme_dark: Cell<bool>,
+    /// libadwaita's stylesheet when tapust loads it.
+    stylesheet: RefCell<Option<Rc<Stylesheet>>>,
     /// The stylesheet, whose runtime rules follow the configuration.
     css: gtk::CssProvider,
     /// The gtk-custom-css files, over the stylesheet.
@@ -538,6 +541,7 @@ impl App {
             command: RefCell::new(command),
             config: RefCell::new(Rc::new(Config::default())),
             theme_dark: Cell::new(false),
+            stylesheet: RefCell::new(None),
             css,
             custom_css: RefCell::new(Vec::new()),
             errors: RefCell::new(None),
@@ -548,6 +552,8 @@ impl App {
         let (config, mut diagnostics) = app.read_config();
         *app.config.borrow_mut() = Rc::new(config);
         diagnostics.extend(app.apply_config());
+        // Loaded once the configuration has set the color scheme.
+        *app.stylesheet.borrow_mut() = Stylesheet::follow(&display, &app.application.style_manager());
         app.add_actions();
         app.follow_style();
         app.new_window(None);

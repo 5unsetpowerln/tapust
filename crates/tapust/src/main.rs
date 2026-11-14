@@ -18,6 +18,7 @@ mod scroll;
 mod search;
 mod selection;
 mod shell;
+mod stylesheet;
 mod surface;
 mod theme;
 mod themes;
@@ -38,6 +39,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(_) => return Err("usage: tapust [-e PROGRAM [ARGS...]]".into()),
     };
     pty::disable_vulkan();
+    stylesheet::take_over();
     font::register_embedded_fonts()?;
     let application = adw::Application::builder()
         .application_id("dev.tapust.tapust")
