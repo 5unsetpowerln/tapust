@@ -565,7 +565,7 @@ impl App {
         font::Fonts::preload(config.font_family(), config.font_size, first_scale());
         // While the stylesheet is parsed, which creates no thread: creating
         // one waits for the drivers' dlopen to release the loader's lock.
-        crate::gl::preload_drivers();
+        crate::gl::prepare(&display);
         // Loaded once the configuration has set the color scheme.
         *app.stylesheet.borrow_mut() = Stylesheet::follow(&display, &app.application.style_manager());
         app.add_actions();
