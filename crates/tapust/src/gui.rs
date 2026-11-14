@@ -552,6 +552,9 @@ impl App {
         let (config, mut diagnostics) = app.read_config();
         *app.config.borrow_mut() = Rc::new(config);
         diagnostics.extend(app.apply_config());
+        // While the stylesheet is parsed, which creates no thread: creating
+        // one waits for the drivers' dlopen to release the loader's lock.
+        crate::gl::preload_drivers();
         // Loaded once the configuration has set the color scheme.
         *app.stylesheet.borrow_mut() = Stylesheet::follow(&display, &app.application.style_manager());
         app.add_actions();
