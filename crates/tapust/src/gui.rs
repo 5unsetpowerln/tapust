@@ -535,20 +535,6 @@ fn first_scale() -> f64 {
         .map_or(1.0, |m| m.scale())
 }
 
-/// Loads the icon theme on another thread. GTK starts loading it on one as
-/// it starts, but the icon path libadwaita adds then discards that, and the
-/// window's first icon would load it again on the main thread.
-fn load_icon_theme(display: &gdk::Display) {
-    // The display's icon theme lives as long as the display.
-    let theme = gtk::IconTheme::for_display(display).as_ptr() as usize;
-    // SAFETY: lookups are thread-safe once the theme is set up on the main
-    // thread (gtkicontheme.c), as GTK's own loading thread does.
-    let load = move || unsafe {
-        gtk::ffi::gtk_icon_theme_has_icon(theme as *mut gtk::ffi::GtkIconTheme, c"window-close-symbolic".as_ptr());
-    };
-    let _ = std::thread::Builder::new().name("icon-theme".into()).spawn(load);
-}
-
 impl App {
     pub fn build(application: &adw::Application, command: Option<Vec<OsString>>) -> Rc<App> {
         let display = gdk::Display::default().expect("display");
@@ -574,7 +560,6 @@ impl App {
         let (config, mut diagnostics) = app.read_config();
         *app.config.borrow_mut() = Rc::new(config);
         diagnostics.extend(app.apply_config());
-        load_icon_theme(&display);
         // The first window's pane takes these, before its window is shown.
         let config = app.config();
         font::Fonts::preload(config.font_family(), config.font_size, first_scale());
