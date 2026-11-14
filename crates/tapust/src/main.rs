@@ -48,6 +48,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     // tapust has no resources: without a base path, GtkApplication adds no
     // icon path for the icon theme to scan in each of its directories.
     application.set_resource_base_path(None);
+    // Every window's icon, set before GtkApplication starts, which otherwise
+    // waits for the icon theme to load to look for one named as the
+    // application id. gtk-rs wants GTK started for this, which GTK does not.
+    let icon = std::ffi::CString::new(theme::ICON).expect("icon name");
+    // SAFETY: a valid C string; GTK copies it.
+    unsafe { gtk::ffi::gtk_window_set_default_icon_name(icon.as_ptr()) };
     let command = std::cell::RefCell::new(command);
     application.connect_activate(move |application| {
         gui::App::build(application, command.borrow_mut().take());

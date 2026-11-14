@@ -1044,7 +1044,6 @@ impl Window {
             .build();
         window.set_property("handle-menubar-accel", false);
         window.add_css_class("window");
-        window.set_icon_name(Some(theme::ICON));
         // ghostty's handleActiveState: an active window needs no attention.
         let attention = app.attention.clone();
         window.connect_is_active_notify(move |w| {
