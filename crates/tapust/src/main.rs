@@ -40,7 +40,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     pty::disable_vulkan();
     stylesheet::take_over();
-    font::register_embedded_fonts()?;
+    // Registered as GTK starts, which needs no fonts until the
+    // configuration is read.
+    let fonts = std::thread::Builder::new().name("font-register".into()).spawn(font::register_embedded_fonts)?;
     let application = adw::Application::builder()
         .application_id("dev.tapust.tapust")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -55,7 +57,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     // SAFETY: a valid C string; GTK copies it.
     unsafe { gtk::ffi::gtk_window_set_default_icon_name(icon.as_ptr()) };
     let command = std::cell::RefCell::new(command);
+    let fonts = std::cell::RefCell::new(Some(fonts));
     application.connect_activate(move |application| {
+        if let Some(fonts) = fonts.take() {
+            let registered = fonts.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            if let Err(err) = registered {
+                eprintln!("tapust: cannot register the bundled fonts: {err}");
+                application.quit();
+                return;
+            }
+        }
         gui::App::build(application, command.borrow_mut().take());
     });
     application.run_with_args::<&str>(&[]);
