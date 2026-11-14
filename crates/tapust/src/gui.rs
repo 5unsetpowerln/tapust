@@ -527,6 +527,14 @@ fn main_menu() -> gio::Menu {
     menu
 }
 
+/// The scale of the first monitor, which a new window is likely shown on.
+fn first_scale() -> f64 {
+    gdk::Display::default()
+        .and_then(|d| d.monitors().item(0))
+        .and_then(|m| m.downcast::<gdk::Monitor>().ok())
+        .map_or(1.0, |m| m.scale())
+}
+
 /// Loads the icon theme on another thread. GTK starts loading it on one as
 /// it starts, but the icon path libadwaita adds then discards that, and the
 /// window's first icon would load it again on the main thread.
@@ -567,6 +575,9 @@ impl App {
         *app.config.borrow_mut() = Rc::new(config);
         diagnostics.extend(app.apply_config());
         load_icon_theme(&display);
+        // The first window's pane takes these, before its window is shown.
+        let config = app.config();
+        font::Fonts::preload(config.font_family(), config.font_size, first_scale());
         // While the stylesheet is parsed, which creates no thread: creating
         // one waits for the drivers' dlopen to release the loader's lock.
         crate::gl::preload_drivers();
@@ -1848,10 +1859,7 @@ impl Window {
             }
         };
         let Some(surface) = self.state.borrow().panes.get(&pane).map(|p| p.surface.clone()) else { return };
-        let scale = gdk::Display::default()
-            .and_then(|d| d.monitors().item(0))
-            .and_then(|m| m.downcast::<gdk::Monitor>().ok())
-            .map_or(1.0, |m| m.scale());
+        let scale = first_scale();
         let config = self.app.config();
         let natural = |widget: &gtk::Widget| widget.measure(gtk::Orientation::Vertical, -1).1;
         let content = self.toolbar.content().expect("the toolbar's content");
