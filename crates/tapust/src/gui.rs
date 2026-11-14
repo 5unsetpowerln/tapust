@@ -425,10 +425,11 @@ fn header_buttons(overview: &adw::TabOverview, flat: bool) -> (adw::SplitButton,
     overview.bind_property("open", &overview_toggle, "active").bidirectional().sync_create().build();
     let menu = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
-        .menu_model(&main_menu())
         .tooltip_text("Main Menu")
         .can_focus(false)
         .build();
+    // The menu's popover is made as it first opens, not with the window.
+    menu.set_create_popup_func(|menu| menu.set_menu_model(Some(&main_menu())));
     if flat {
         new_tab.add_css_class("flat");
         overview_toggle.add_css_class("flat");
