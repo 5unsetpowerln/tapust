@@ -45,6 +45,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .application_id("dev.tapust.tapust")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
+    // tapust has no resources: without a base path, GtkApplication adds no
+    // icon path for the icon theme to scan in each of its directories.
+    application.set_resource_base_path(None);
     let command = std::cell::RefCell::new(command);
     application.connect_activate(move |application| {
         gui::App::build(application, command.borrow_mut().take());
