@@ -19,7 +19,10 @@ use crate::font::{Bitmap, Face, Fonts, face_for};
 use crate::frame::{BOLD, CLUSTER, CursorStyle, Frame, FrameCell, Grid, ITALIC, STRIKE, TRANSLUCENT, WIDE};
 use crate::underline;
 
-const ATLAS_SIZE: i32 = 2048;
+/// The glyph atlas starts at this size and doubles as it fills, up to
+/// ATLAS_MAX: allocating the largest at once took 3 ms of the first frame.
+const ATLAS_START: i32 = 512;
+const ATLAS_MAX: i32 = 2048;
 const FLAG_COLORED: u32 = 1;
 const FLAG_RECT: u32 = 2;
 
@@ -45,6 +48,8 @@ struct Glyph {
 /// Shelf packer for the glyph atlas.
 struct Atlas {
     texture: glow::Texture,
+    /// The texture's width and height.
+    size: i32,
     x: i32,
     y: i32,
     shelf_height: i32,
@@ -52,15 +57,15 @@ struct Atlas {
 
 impl Atlas {
     fn reserve(&mut self, w: i32, h: i32) -> Option<(i32, i32)> {
-        if w > ATLAS_SIZE || h > ATLAS_SIZE {
+        if w > self.size || h > self.size {
             return None;
         }
-        if self.x + w > ATLAS_SIZE {
+        if self.x + w > self.size {
             self.y += self.shelf_height + 1;
             self.x = 0;
             self.shelf_height = 0;
         }
-        if self.y + h > ATLAS_SIZE {
+        if self.y + h > self.size {
             return None;
         }
         let pos = (self.x, self.y);
@@ -158,6 +163,7 @@ layout(location = 2) in uvec2 a_uv;
 layout(location = 3) in vec4 a_color;
 layout(location = 4) in uint a_flags;
 uniform vec2 u_viewport;
+uniform sampler2D u_atlas;
 out vec2 v_uv;
 flat out vec4 v_color;
 flat out uint v_flags;
@@ -166,7 +172,7 @@ void main() {
     vec2 px = vec2(a_pos) + corner * vec2(a_size);
     vec2 ndc = px / u_viewport * 2.0 - 1.0;
     gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
-    v_uv = (vec2(a_uv) + corner * vec2(a_size)) / 2048.0;
+    v_uv = (vec2(a_uv) + corner * vec2(a_size)) / vec2(textureSize(u_atlas, 0));
     v_color = a_color;
     v_flags = a_flags;
 }
@@ -315,7 +321,7 @@ impl Renderer {
             gl.bind_vertex_array(None);
 
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-            let atlas_texture = new_texture(&gl, ATLAS_SIZE, ATLAS_SIZE);
+            let atlas_texture = new_texture(&gl, ATLAS_START, ATLAS_START);
             gl.use_program(Some(bg_program));
             gl.uniform_1_i32(gl.get_uniform_location(bg_program, "u_bg").as_ref(), 0);
             gl.use_program(Some(fg_program));
@@ -335,7 +341,7 @@ impl Renderer {
                 fg_vao,
                 fg_buffer,
                 fg_capacity: 0,
-                atlas: Atlas { texture: atlas_texture, x: 0, y: 0, shelf_height: 0 },
+                atlas: Atlas { texture: atlas_texture, size: ATLAS_START, x: 0, y: 0, shelf_height: 0 },
                 ascii: Box::new([[None; 128]; 4]),
                 glyphs: HashMap::new(),
                 clusters: HashMap::new(),
@@ -420,7 +426,12 @@ impl Renderer {
     /// Copies a `width x height` RGBA bitmap into the atlas; returns its
     /// position there, or None when the atlas is full.
     fn add_to_atlas(&mut self, width: u32, height: u32, rgba: &[u8]) -> Option<[u16; 2]> {
-        let (x, y) = self.atlas.reserve(width as i32, height as i32)?;
+        let (x, y) = loop {
+            match self.atlas.reserve(width as i32, height as i32) {
+                Some(position) => break position,
+                None => self.grow_atlas()?,
+            }
+        };
         unsafe {
             self.gl.active_texture(glow::TEXTURE1);
             self.gl.bind_texture(glow::TEXTURE_2D, Some(self.atlas.texture));
@@ -437,6 +448,40 @@ impl Renderer {
             );
         }
         Some([x as u16, y as u16])
+    }
+
+    /// Doubles the atlas, keeping its glyphs where they are; None when it is
+    /// at its largest. Needs the GL context current.
+    fn grow_atlas(&mut self) -> Option<()> {
+        if self.atlas.size >= ATLAS_MAX {
+            return None;
+        }
+        let (old, size) = (self.atlas.size, self.atlas.size * 2);
+        unsafe {
+            let gl = &self.gl;
+            gl.active_texture(glow::TEXTURE1);
+            let texture = new_texture(gl, size, size);
+            // The old texture is read through a framebuffer, and the bound
+            // one (GTK's, during a render) is bound again.
+            let bound = gl.get_parameter_i32(glow::READ_FRAMEBUFFER_BINDING);
+            let framebuffer = gl.create_framebuffer().expect("create framebuffer");
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(framebuffer));
+            gl.framebuffer_texture_2d(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(self.atlas.texture),
+                0,
+            );
+            gl.copy_tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, 0, 0, old, old);
+            let bound = std::num::NonZeroU32::new(bound as u32).map(glow::NativeFramebuffer);
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, bound);
+            gl.delete_framebuffer(framebuffer);
+            gl.delete_texture(self.atlas.texture);
+            self.atlas.texture = texture;
+        }
+        self.atlas.size = size;
+        Some(())
     }
 
     /// Draws the underline kinds for the current fonts into the atlas, as
