@@ -655,4 +655,68 @@ mod tests {
         assert_eq!(parse_window_name("\"exec  /bin/zsh\" -l"), "zsh");
         assert_eq!(parse_window_name("python3 script.py"), "python3");
     }
+
+    /// A directory under the test binary's target directory, for a shell's
+    /// home and XDG directories.
+    fn scratch(name: &str) -> PathBuf {
+        let exe = std::env::current_exe().unwrap();
+        let target = exe.parent().and_then(Path::parent).unwrap();
+        let dir = target.join("test-scratch").join(format!("{name}-{}", std::process::id()));
+        for sub in ["config", "data", "run"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        dir
+    }
+
+    /// `shell` with tapust's shell integration, on a terminal, with its home
+    /// and XDG directories in a scratch directory.
+    fn start_shell(shell: &str) -> PaneIo<term::Terminal> {
+        let home = scratch(shell);
+        let mut env: shell::Env = [
+            ("PATH", std::env::var_os("PATH").unwrap_or_default()),
+            ("HOME", home.clone().into_os_string()),
+            ("XDG_CONFIG_HOME", home.join("config").into_os_string()),
+            ("XDG_DATA_HOME", home.join("data").into_os_string()),
+            ("XDG_RUNTIME_DIR", home.join("run").into_os_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (OsString::from(k), v))
+        .collect();
+        let argv = shell::prepare(vec![shell.into()], false, true, &mut env);
+        let mut command = Command::new(&argv[0]);
+        command.args(&argv[1..]).env_clear().envs(&env);
+        let pty = Pty::spawn_command(command, 80, 24, (8, 16), Path::new("/")).unwrap();
+        PaneIo::start(pty, term::Terminal::new(80, 24, 100), || {}).unwrap()
+    }
+
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// After `cd`, while the shell runs a program that is elsewhere, a split
+    /// pane starts where the shell is, not where the program is.
+    fn split_pane_starts_where_the_shell_is(shell: &str) {
+        let io = start_shell(shell);
+        io.shared.write(b"cd /usr/share\r");
+        io.shared.write(b"sh -c 'cd / && exec sleep 5'\r");
+        wait_until("sleep in the foreground", || io.pty.foreground_name().as_deref() == Some("sleep"));
+        assert_eq!(io.pty.foreground_cwd(), Some(PathBuf::from("/")));
+        assert_eq!(io.cwd(), Some(PathBuf::from("/usr/share")));
+    }
+
+    #[test]
+    #[cfg_attr(not(feature = "external-tests"), ignore = "runs fish")]
+    fn split_pane_starts_where_fish_is() {
+        split_pane_starts_where_the_shell_is("fish");
+    }
+
+    #[test]
+    #[cfg_attr(not(feature = "external-tests"), ignore = "runs bash")]
+    fn split_pane_starts_where_bash_is() {
+        split_pane_starts_where_the_shell_is("bash");
+    }
 }
