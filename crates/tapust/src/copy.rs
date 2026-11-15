@@ -2865,6 +2865,19 @@ mod tests {
         }
     }
 
+    /// scroll-up, which the wheel sends, moves the view into the history
+    /// at once, with the cursor on the bottom row as copy mode starts.
+    #[test]
+    fn scroll_up_moves_the_view_from_any_row() {
+        let mut m = mode(&seq(), ModeKeys::Vi);
+        assert_eq!((m.oy, m.cy), (0, 9));
+        run_n(&mut m, ScrollUp, 3);
+        assert_eq!(m.oy, 3);
+        assert_eq!(m.position().as_deref(), Some("[3/92]"));
+        run_n(&mut m, ScrollDown, 3);
+        assert_eq!(m.oy, 0);
+    }
+
     #[test]
     fn pages_and_history_ends_scroll_the_view() {
         let mut m = mode(&seq(), ModeKeys::Vi);

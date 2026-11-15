@@ -980,6 +980,39 @@ fn in_copy_mode(keys: ModeKeys) -> Session {
     s
 }
 
+/// tmux's WheelUpPane and WheelDownPane in the copy-mode tables (select-pane,
+/// then send -N -X scroll-up or scroll-down): the wheel scrolls the view by
+/// its lines, whatever row the cursor is on.
+#[test]
+fn the_wheel_scrolls_copy_mode() {
+    for keys in [ModeKeys::Emacs, ModeKeys::Vi] {
+        let mut s = in_copy_mode(keys);
+        assert_eq!(s.wheel(0, true, 3), copy(CopyCommand::ScrollUp, 3));
+        assert_eq!(s.wheel(0, false, 2), copy(CopyCommand::ScrollDown, 2));
+    }
+}
+
+/// The wheel over a pane in copy mode selects that pane first.
+#[test]
+fn the_wheel_selects_the_pane_under_it() {
+    let t = Instant::now();
+    let mut s = in_copy_mode(ModeKeys::Vi);
+    s.key(ctrl('b'), t);
+    s.key(ch('%'), t);
+    let active = |s: &Session| s.windows()[0].panes.iter().find(|p| p.active).map(|p| p.pane);
+    assert_eq!(active(&s), Some(1));
+    assert_eq!(s.wheel(0, true, 3), copy(CopyCommand::ScrollUp, 3));
+    assert_eq!(active(&s), Some(0));
+}
+
+/// Outside copy mode the wheel is not tmux's to handle.
+#[test]
+fn the_wheel_does_nothing_outside_copy_mode() {
+    let server = Server::new();
+    let mut s = Session::new(&server, None).0;
+    assert_eq!(s.wheel(0, true, 3), vec![]);
+}
+
 #[test]
 fn mode_keys_follow_visual_then_editor() {
     use std::ffi::OsStr;
