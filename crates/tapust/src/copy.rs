@@ -2850,6 +2850,21 @@ mod tests {
         assert_eq!(m.cx, 2);
     }
 
+    /// A pane's terminal is resized before copy mode starts (a pane takes
+    /// its size as it is shown, and a split halves it): copy mode still
+    /// reaches the first line of the history.
+    #[test]
+    fn history_survives_resizes_before_copy_mode() {
+        for (cols, rows) in [(20, 10), (10, 10), (20, 5), (30, 20)] {
+            let mut t = seq();
+            t.resize(cols, rows);
+            let mut m = mode(&t, ModeKeys::Vi);
+            run(&mut m, HistoryTop);
+            run(&mut m, SelectLine);
+            assert_eq!(copied(&run(&mut m, CopyPipeAndCancel)), "$ seq 1 100\n", "{cols}x{rows}");
+        }
+    }
+
     #[test]
     fn pages_and_history_ends_scroll_the_view() {
         let mut m = mode(&seq(), ModeKeys::Vi);
