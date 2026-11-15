@@ -532,6 +532,22 @@ impl Session {
         self.run_binding(key, now)
     }
 
+    /// The wheel over `pane` in copy mode, tmux's WheelUpPane and
+    /// WheelDownPane in the copy-mode tables: the pane is selected and its
+    /// view scrolls `lines` lines (send -N -X scroll-up or scroll-down),
+    /// whatever row the cursor is on. tmux scrolls 5 lines; the GUI gives
+    /// the lines the wheel scrolls the terminal by. Nothing outside copy mode.
+    pub fn wheel(&mut self, pane: PaneId, up: bool, lines: u32) -> Vec<Effect> {
+        if !self.in_mode(pane) {
+            return Vec::new();
+        }
+        let command = if up { CopyCommand::ScrollUp } else { CopyCommand::ScrollDown };
+        self.op(|s| {
+            s.focus(pane);
+            s.writes.push(Effect::CopyCommand { pane, command, count: lines });
+        })
+    }
+
     /// Whether the pane is in copy mode.
     pub fn in_mode(&self, pane: PaneId) -> bool {
         self.find_pane(pane).is_some_and(|p| p.mode.is_some())

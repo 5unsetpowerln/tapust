@@ -66,9 +66,9 @@ pub enum Event {
     CellSize { cell: (u32, u32), scale: f64, padding: (u32, u32) },
     /// The child exited banner's Close button: close without confirmation.
     ChildExitedClose { pane: PaneId },
-    /// The wheel in copy mode, sent as `count` presses of Up (or Down), as
-    /// ghostty's alternate scroll sends them to tmux on its alternate screen.
-    WheelKeys { pane: PaneId, up: bool, count: usize },
+    /// The wheel in copy mode, `lines` lines up or down: tmux's wheel in
+    /// copy mode scrolls the view.
+    CopyWheel { pane: PaneId, up: bool, lines: u32 },
 }
 
 pub type Handler = Rc<dyn Fn(Event) -> bool>;
@@ -1897,7 +1897,8 @@ impl Surface {
         self.pending_scroll.set(pending - amount * cell);
         let delta = amount.trunc() as isize;
         if self.in_copy_mode() {
-            (self.handler)(Event::WheelKeys { pane: self.pane, up: delta > 0, count: delta.unsigned_abs() });
+            let lines = u32::try_from(delta.unsigned_abs()).unwrap_or(u32::MAX);
+            (self.handler)(Event::CopyWheel { pane: self.pane, up: delta > 0, lines });
             return;
         }
         let mut term = shared.term.lock();

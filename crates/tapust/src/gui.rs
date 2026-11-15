@@ -1608,11 +1608,10 @@ impl Window {
                 self.close_pane(pane);
                 true
             }
-            Event::WheelKeys { pane, up, count } => {
-                let code = if up { mux::KeyCode::Up } else { mux::KeyCode::Down };
-                for _ in 0..count {
-                    self.send_key(pane, mux::Key { code, mods: mux::Mods::default() }, None, false);
-                }
+            Event::CopyWheel { pane, up, lines } => {
+                let effects = self.state.borrow_mut().session.wheel(pane, up, lines);
+                self.apply(effects);
+                self.queue_reconcile();
                 true
             }
         }
