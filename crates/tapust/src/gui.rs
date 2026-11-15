@@ -872,7 +872,7 @@ impl App {
         let cwd = parent
             .filter(|_| inherit_cwd)
             .and_then(|p| p.io.as_ref())
-            .and_then(|io| io.pty.foreground_cwd())
+            .and_then(|io| io.cwd())
             .unwrap_or_else(|| self.default_cwd());
         (points, cwd)
     }

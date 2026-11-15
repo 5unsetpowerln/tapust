@@ -347,6 +347,17 @@ impl<T> Shared<T> {
     }
 }
 
+impl PaneIo<term::Terminal> {
+    /// The directory a pane split from this one starts in: the one the
+    /// shell reported last (OSC 7, as ghostty inherits), which follows the
+    /// shell's `cd` whatever program it runs; else the foreground process's,
+    /// as tmux's pane_current_path.
+    pub fn cwd(&self) -> Option<PathBuf> {
+        let reported = self.shared.term.lock().reported_cwd().map(PathBuf::from);
+        reported.filter(|dir| dir.is_dir()).or_else(|| self.pty.foreground_cwd())
+    }
+}
+
 /// A running pane: its PTY and I/O thread.
 pub struct PaneIo<T> {
     pub pty: Pty,
