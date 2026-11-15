@@ -5,9 +5,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["external-tests"]
+# Tests that run software from outside this repository (a shell, tmux).
+# `cargo test --no-default-features` leaves them out.
+external-tests = []
+
 [dependencies]
 term = { package = "tapust-term", path = "../term" }
-mux = { package = "tapust-mux", path = "../mux" }
+mux = { package = "tapust-mux", path = "../mux", default-features = false }
 gtk = { package = "gtk4", version = "0.10", features = ["v4_20"] }
 adw = { package = "libadwaita", version = "0.8", features = ["v1_8"] }
 gdk-wayland = { package = "gdk4-wayland", version = "0.10", features = ["wayland_crate"] }

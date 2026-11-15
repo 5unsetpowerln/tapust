@@ -567,6 +567,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-tests"), ignore = "runs /bin/sh")]
     fn reads_output_and_detects_exit() {
         let (io, rx) = start("printf 'hello from pty'");
         let out = wait_for(&io, &rx, |_, exited| exited);
@@ -574,6 +575,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-tests"), ignore = "runs /bin/sh")]
     fn exit_reports_the_status_and_runtime() {
         let (io, rx) = start("exit 3");
         wait_for(&io, &rx, |_, exited| exited);
@@ -586,6 +588,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-tests"), ignore = "runs /bin/sh")]
     fn exit_does_not_wait_for_the_pty_to_close() {
         // The background sleep keeps the slave side open.
         let started = Instant::now();
@@ -597,6 +600,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-tests"), ignore = "runs /bin/sh")]
     fn window_size_reaches_the_child() {
         let (io, rx) = start("read _; stty size");
         io.pty.resize(100, 37, (8, 16)).unwrap();
@@ -606,6 +610,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-tests"), ignore = "runs /bin/sh")]
     fn foreground_cwd_and_name_follow_the_process() {
         let (io, rx) = start("cd /usr/share && printf ready; exec sleep 5");
         wait_for(&io, &rx, |out, _| out.ends_with(b"ready"));
@@ -618,6 +623,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-tests"), ignore = "runs /bin/sh")]
     fn large_input_does_not_block_the_writer() {
         let (io, rx) = start("stty -echo -icanon; printf ready; head -c 1048576 > /dev/null; printf done");
         wait_for(&io, &rx, |out, _| out.ends_with(b"ready"));

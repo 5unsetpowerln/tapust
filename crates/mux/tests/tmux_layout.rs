@@ -241,6 +241,7 @@ fn model_run((w, h): (u16, u16), n: usize, steps: &[Step]) -> Vec<Vec<String>> {
 }
 
 #[test]
+#[cfg_attr(not(feature = "external-tests"), ignore = "runs tmux")]
 fn layouts_match_tmux() {
     let version = Process::new("tmux").arg("-V").output().expect("run tmux -V");
     assert_eq!(String::from_utf8_lossy(&version.stdout).trim(), "tmux 3.6", "the test needs tmux 3.6");

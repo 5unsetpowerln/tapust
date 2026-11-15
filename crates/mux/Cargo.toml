@@ -8,4 +8,10 @@ license.workspace = true
 [lib]
 name = "mux"
 
+[features]
+default = ["external-tests"]
+# Tests that run software from outside this repository (a shell, tmux).
+# `cargo test --no-default-features` leaves them out.
+external-tests = []
+
 [dependencies]
