@@ -306,7 +306,7 @@ impl Session {
 
             let binding = match table {
                 Table::Prefix => prefix_binding(key),
-                Table::Mode => copy::binding(key, self.server.mode_keys())
+                Table::Mode => copy::binding(key, self.server.mode_keys(), self.server.copy_action())
                     .map(|action| Binding { repeat: false, action: Action::Mode(action) }),
                 Table::Root => None,
             };

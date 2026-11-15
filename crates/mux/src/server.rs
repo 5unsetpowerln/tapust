@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use crate::paste::Buffers;
-use crate::{Key, KeyCode, ModeKeys, Mods, PaneId};
+use crate::{CopyAction, Key, KeyCode, ModeKeys, Mods, PaneId};
 
 /// The state the sessions of one process share, as tmux's server holds it.
 /// Clones are handles to the same state.
@@ -26,6 +26,8 @@ struct Shared {
     history: RefCell<[Vec<String>; 2]>,
     /// The `mode-keys` option.
     mode_keys: Cell<ModeKeys>,
+    /// What the keys that copy the selection send.
+    copy_action: Cell<CopyAction>,
     /// The `prefix` option; `None` is tmux's `None`, no prefix key.
     prefix: Cell<Option<Key>>,
 }
@@ -41,6 +43,7 @@ impl Default for Shared {
             buffers: RefCell::default(),
             history: RefCell::default(),
             mode_keys: Cell::default(),
+            copy_action: Cell::default(),
             prefix: Cell::new(Some(DEFAULT_PREFIX)),
         }
     }
@@ -62,6 +65,16 @@ impl Server {
 
     pub fn mode_keys(&self) -> ModeKeys {
         self.0.mode_keys.get()
+    }
+
+    /// What the copy-mode keys that copy the selection send, tmux's
+    /// copy-pipe-and-cancel unless set.
+    pub fn set_copy_action(&self, action: CopyAction) {
+        self.0.copy_action.set(action);
+    }
+
+    pub fn copy_action(&self) -> CopyAction {
+        self.0.copy_action.get()
     }
 
     /// `set -g prefix`: the key that switches to the prefix table, and

@@ -33,7 +33,7 @@ mod window;
 #[cfg(test)]
 mod tests;
 
-pub use copy::{CopyCommand, ModeKeys, SearchArg};
+pub use copy::{CopyAction, CopyCommand, ModeKeys, SearchArg};
 pub use keys::{parse_key, prefix_command};
 pub use layout::Layout;
 pub use server::{DEFAULT_PREFIX, Server};

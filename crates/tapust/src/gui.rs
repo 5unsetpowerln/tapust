@@ -588,8 +588,7 @@ impl App {
         self.sync_css_scheme();
         self.css.load_from_string(&css(&config));
         let errors = self.load_custom_css(&config);
-        self.server.set_prefix(config.tmux_prefix);
-        self.server.set_mode_keys(mode_keys(&config));
+        apply_tmux_options(&self.server, &config);
         errors
     }
 
@@ -2971,6 +2970,13 @@ windowhandle:backdrop {{
         css.push_str(&format!(".window .split paned > separator {{\n  color: {color};\n  background: {color};\n}}\n"));
     }
     css
+}
+
+/// The tmux options the configuration sets on the server.
+fn apply_tmux_options(server: &Server, config: &Config) {
+    server.set_prefix(config.tmux_prefix);
+    server.set_mode_keys(mode_keys(config));
+    server.set_copy_action(config.tmux_copy_action);
 }
 
 /// tmux-mode-keys, else tmux's main's choice from $VISUAL or $EDITOR.

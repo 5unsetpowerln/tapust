@@ -733,10 +733,10 @@ fn clear_of(command: &CopyCommand) -> Clear {
     use CopyCommand::*;
     match command {
         AppendSelectionAndCancel | BackToIndentation | BeginSelection | Cancel | ClearSelection | CopyPipeAndCancel
-        | CopyPipeEndOfLineAndCancel | JumpToMark | NextMatchingBracket | PreviousMatchingBracket | RectangleToggle
+        | CopyPipeEndOfLineAndCancel | CopySelection | JumpToMark | NextMatchingBracket | PreviousMatchingBracket | RectangleToggle
         | RefreshFromPane | ScrollMiddle | SearchAgain | SearchBackward(_) | SearchBackwardIncremental(_)
         | SearchForward(_) | SearchForwardIncremental(_) | SearchReverse | SelectLine | SetMark => Clear::Always,
-        TogglePosition => Clear::Never,
+        CopySelectionNoClear | TogglePosition => Clear::Never,
         BottomLine | CursorCentreHorizontal | CursorCentreVertical | CursorDown | CursorLeft | CursorRight | CursorUp
         | EndOfLine | GotoLine(_) | HalfpageDown | HalfpageUp | HistoryBottom | HistoryTop | JumpAgain
         | JumpBackward(_) | JumpForward(_) | JumpReverse | JumpToBackward(_) | JumpToForward(_) | MiddleLine
@@ -1082,6 +1082,15 @@ impl CopyMode {
                 self.cursor_end_of_line();
                 self.copy_selection();
                 Action::Cancel
+            }
+            CopySelection => {
+                self.copy_selection();
+                self.clear_selection();
+                Action::Redraw
+            }
+            CopySelectionNoClear => {
+                self.copy_selection();
+                Action::Nothing
             }
             CursorCentreHorizontal => {
                 self.cx = self.sx() / 2;

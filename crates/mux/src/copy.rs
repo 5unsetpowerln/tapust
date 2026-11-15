@@ -49,6 +49,8 @@ pub enum CopyCommand {
     /// Without a command and with an empty `copy-command`, it copies.
     CopyPipeAndCancel,
     CopyPipeEndOfLineAndCancel,
+    CopySelection,
+    CopySelectionNoClear,
     CursorCentreHorizontal,
     CursorCentreVertical,
     CursorDown,
@@ -101,6 +103,29 @@ pub enum CopyCommand {
     TopLine,
 }
 
+/// What the keys that copy the selection send: Enter and C-j in
+/// `copy-mode-vi`, C-w and M-w in `copy-mode`. tmux's tables send
+/// copy-pipe-and-cancel, which copies and leaves copy mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CopyAction {
+    #[default]
+    CopyPipeAndCancel,
+    /// Copies and clears the selection, staying in copy mode.
+    CopySelection,
+    /// Copies and keeps the selection, staying in copy mode.
+    CopySelectionNoClear,
+}
+
+impl CopyAction {
+    fn command(self) -> CopyCommand {
+        match self {
+            CopyAction::CopyPipeAndCancel => CopyCommand::CopyPipeAndCancel,
+            CopyAction::CopySelection => CopyCommand::CopySelection,
+            CopyAction::CopySelectionNoClear => CopyCommand::CopySelectionNoClear,
+        }
+    }
+}
+
 /// What a copy-mode binding does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ModeAction {
@@ -137,12 +162,13 @@ fn prompt(kind: PromptKind) -> Option<ModeAction> {
     Some(ModeAction::Prompt(kind))
 }
 
-/// The binding of `key` in `copy-mode` or `copy-mode-vi`.
-pub(crate) fn binding(key: Key, keys: ModeKeys) -> Option<ModeAction> {
+/// The binding of `key` in `copy-mode` or `copy-mode-vi`, the keys that
+/// copy the selection sending `copy`.
+pub(crate) fn binding(key: Key, keys: ModeKeys, copy: CopyAction) -> Option<ModeAction> {
     let key = tmux_key(key);
     match keys {
-        ModeKeys::Emacs => emacs(key),
-        ModeKeys::Vi => vi(key),
+        ModeKeys::Emacs => emacs(key, copy),
+        ModeKeys::Vi => vi(key, copy),
     }
 }
 
@@ -182,7 +208,7 @@ fn common(key: Key) -> Option<ModeAction> {
 }
 
 /// The `copy-mode` table.
-fn emacs(key: Key) -> Option<ModeAction> {
+fn emacs(key: Key, copy: CopyAction) -> Option<ModeAction> {
     use CopyCommand::*;
     let m = key.mods;
     let none = m == Mods::default();
@@ -205,7 +231,7 @@ fn emacs(key: Key) -> Option<ModeAction> {
             'r' => search(false),
             's' => search(true),
             'v' => send(PageDown),
-            'w' => send(CopyPipeAndCancel),
+            'w' => send(copy.command()),
             _ => None,
         },
         KeyCode::Char(c) if meta => match c {
@@ -219,7 +245,7 @@ fn emacs(key: Key) -> Option<ModeAction> {
             'm' => send(BackToIndentation),
             'r' => send(MiddleLine),
             'v' => send(PageUp),
-            'w' => send(CopyPipeAndCancel),
+            'w' => send(copy.command()),
             '{' => send(PreviousParagraph),
             '}' => send(NextParagraph),
             _ => None,
@@ -238,7 +264,7 @@ fn emacs(key: Key) -> Option<ModeAction> {
 }
 
 /// The `copy-mode-vi` table.
-fn vi(key: Key) -> Option<ModeAction> {
+fn vi(key: Key, copy: CopyAction) -> Option<ModeAction> {
     use CopyCommand::*;
     let m = key.mods;
     let none = m == Mods::default();
@@ -251,7 +277,7 @@ fn vi(key: Key) -> Option<ModeAction> {
             'b' => send(PageUp),
             'f' => send(PageDown),
             'h' => send(CursorLeft),
-            'j' => send(CopyPipeAndCancel),
+            'j' => send(copy.command()),
             'u' => send(HalfpageUp),
             'v' => send(RectangleToggle),
             'y' => send(ScrollUp),
@@ -296,7 +322,7 @@ fn vi(key: Key) -> Option<ModeAction> {
             '%' => send(NextMatchingBracket),
             _ => None,
         },
-        KeyCode::Enter if none => send(CopyPipeAndCancel),
+        KeyCode::Enter if none => send(copy.command()),
         KeyCode::Escape if none => send(ClearSelection),
         KeyCode::Backspace if none => send(CursorLeft),
         _ => None,

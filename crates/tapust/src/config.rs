@@ -13,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use mux::{Key, ModeKeys};
+use mux::{CopyAction, Key, ModeKeys};
 use term::{CursorShape, Palette, Rgb};
 
 use crate::bindings::{Keybinds, MAX_POINTS, MIN_POINTS};
@@ -214,6 +214,10 @@ pub struct Config {
     /// `tmux-mode-keys`, tmux's `mode-keys`; unset, tmux's rule from
     /// $VISUAL and $EDITOR.
     pub tmux_mode_keys: Option<ModeKeys>,
+    /// `tmux-copy-action`, tapust's: what the copy-mode keys that copy the
+    /// selection (Enter and C-j with vi keys, C-w and M-w with emacs keys)
+    /// send; tmux's tables send copy-pipe-and-cancel.
+    pub tmux_copy_action: CopyAction,
     /// `split-resize-transition`, tapust's: how long a divider takes to move
     /// to a ratio a key gave (resize-pane, a layout); zero moves it at once.
     pub split_resize_transition: Duration,
@@ -272,6 +276,7 @@ impl Default for Config {
             scrollback_lines: 10_000,
             tmux_prefix: Some(mux::DEFAULT_PREFIX),
             tmux_mode_keys: None,
+            tmux_copy_action: CopyAction::CopyPipeAndCancel,
             split_resize_transition: Duration::ZERO,
             split_resize_step: None,
         }
@@ -582,6 +587,9 @@ impl Loader<'_> {
                 c.tmux_prefix = or_default(value, default.tmux_prefix, |v| mux::parse_key(v).map_err(Error::Message))?
             }
             "tmux-mode-keys" => c.tmux_mode_keys = optional(value, |v| one_of(v, MODE_KEYS))?,
+            "tmux-copy-action" => {
+                c.tmux_copy_action = or_default(value, default.tmux_copy_action, |v| one_of(v, COPY_ACTIONS))?;
+            }
             "split-resize-step" => c.split_resize_step = optional(value, pixels)?,
             "split-resize-transition" => {
                 c.split_resize_transition = or_default(value, default.split_resize_transition, duration)?
@@ -842,6 +850,12 @@ const COPY_ON_SELECT: &[(&str, CopyOnSelect)] = &[
 const CONFIRM_CLOSE: &[(&str, ConfirmClose)] =
     &[("false", ConfirmClose::False), ("true", ConfirmClose::True), ("always", ConfirmClose::Always)];
 const MODE_KEYS: &[(&str, ModeKeys)] = &[("emacs", ModeKeys::Emacs), ("vi", ModeKeys::Vi)];
+
+const COPY_ACTIONS: &[(&str, CopyAction)] = &[
+    ("copy-pipe-and-cancel", CopyAction::CopyPipeAndCancel),
+    ("copy-selection", CopyAction::CopySelection),
+    ("copy-selection-no-clear", CopyAction::CopySelectionNoClear),
+];
 const WINDOW_THEMES: &[(&str, WindowTheme)] = &[
     ("auto", WindowTheme::Auto),
     ("system", WindowTheme::System),
@@ -885,6 +899,7 @@ fn valid_values(key: &str) -> String {
         "copy-on-select" => names(COPY_ON_SELECT),
         "confirm-close-surface" => names(CONFIRM_CLOSE),
         "tmux-mode-keys" => names(MODE_KEYS),
+        "tmux-copy-action" => names(COPY_ACTIONS),
         "window-theme" => names(WINDOW_THEMES),
         "gtk-titlebar-style" => names(TITLEBAR_STYLES),
         "gtk-tabs-location" => names(TABS_LOCATIONS),
