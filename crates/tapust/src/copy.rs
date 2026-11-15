@@ -2865,6 +2865,18 @@ mod tests {
         }
     }
 
+    /// fish's Ctrl-L clears the screen (CUP, then ED 2): copy mode still
+    /// reaches what the screen showed before it.
+    #[test]
+    fn copy_mode_reaches_what_a_clear_erased() {
+        let mut t = term(20, 5, "$ echo before\nbefore\n$ ");
+        t.feed(b"\x1b[H\x1b[2J$ ");
+        let mut m = mode(&t, ModeKeys::Vi);
+        run(&mut m, HistoryTop);
+        run(&mut m, SelectLine);
+        assert_eq!(copied(&run(&mut m, CopyPipeAndCancel)), "$ echo before\n");
+    }
+
     /// scroll-up, which the wheel sends, moves the view into the history
     /// at once, with the cursor on the bottom row as copy mode starts.
     #[test]

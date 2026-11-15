@@ -212,6 +212,33 @@ fn erase_resets_pending_wrap() {
     assert_eq!(screen(&t), ["abcdx"]);
 }
 
+/// tmux's scroll-on-clear (on by default): erasing the whole primary screen
+/// (ED 2, which fish's Ctrl-L sends after CUP) first moves its lines, up to
+/// the last one in use, into the scrollback, where they stay reachable.
+#[test]
+fn erase_display_keeps_the_screen_in_the_scrollback() {
+    let mut t = term(5, 4);
+    feed(&mut t, "1\r\n2\r\n3");
+    assert_eq!(t.history_len(), 0);
+    feed(&mut t, "\x1b[H\x1b[2J");
+    assert_eq!(t.history_len(), 3);
+    assert_eq!(screen(&t), Vec::<String>::new());
+    assert_eq!((t.cursor().x, t.cursor().y), (0, 0));
+    t.scroll_view(3);
+    assert_eq!(screen(&t), ["1", "2", "3"]);
+}
+
+/// A blank screen adds nothing to the scrollback, and the alternate screen
+/// has none.
+#[test]
+fn erase_display_of_a_blank_or_alternate_screen_keeps_nothing() {
+    let mut t = term(5, 4);
+    feed(&mut t, "\x1b[2J");
+    assert_eq!(t.history_len(), 0);
+    feed(&mut t, "\x1b[?1049hx\r\ny\x1b[2J");
+    assert_eq!(t.history_len(), 0);
+}
+
 #[test]
 fn erase_scrollback() {
     let mut t = term(5, 2);
