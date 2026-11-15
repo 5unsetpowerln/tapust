@@ -3023,7 +3023,18 @@ fn shell_quote(word: &std::ffi::OsStr) -> OsString {
 
 #[cfg(test)]
 mod tests {
-    use super::encode_paste;
+    use super::{Config, Server, apply_tmux_options, encode_paste};
+    use mux::CopyAction;
+
+    #[test]
+    fn the_configuration_sets_the_copy_action() {
+        let server = Server::new();
+        let config = Config { tmux_copy_action: CopyAction::CopySelectionNoClear, ..Config::default() };
+        apply_tmux_options(&server, &config);
+        assert_eq!(server.copy_action(), CopyAction::CopySelectionNoClear);
+        apply_tmux_options(&server, &Config::default());
+        assert_eq!(server.copy_action(), CopyAction::CopyPipeAndCancel);
+    }
 
     #[test]
     fn paste_encoding_follows_ghostty() {

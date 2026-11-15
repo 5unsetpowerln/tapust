@@ -2796,6 +2796,49 @@ mod tests {
     }
 
     #[test]
+    fn copy_selection_copies_and_stays_in_copy_mode() {
+        // "97" and "98" selected with vi keys.
+        let selected = || {
+            let mut m = mode(&seq(), ModeKeys::Vi);
+            run_n(&mut m, CursorUp, 3);
+            run(&mut m, BeginSelection);
+            run(&mut m, CursorUp);
+            run(&mut m, StartOfLine);
+            m
+        };
+        // copy-selection copies and clears the selection.
+        let mut m = selected();
+        let r = run(&mut m, CopySelection);
+        assert!(!r.cancel);
+        assert_eq!(copied(&r), "97\n98\n");
+        assert_eq!(m.term_mut().selection(), None);
+        assert_eq!(pos(&m), (0, 97));
+        // copy-selection-no-clear keeps it: the keys go on extending it,
+        // and copying again takes the larger selection.
+        let mut m = selected();
+        let before = m.term_mut().selection();
+        let r = run(&mut m, CopySelectionNoClear);
+        assert!(!r.cancel);
+        assert_eq!(copied(&r), "97\n98\n");
+        assert_eq!(m.term_mut().selection(), before);
+        run(&mut m, CursorUp);
+        assert_eq!(copied(&run(&mut m, CopySelectionNoClear)), "96\n97\n98\n");
+    }
+
+    #[test]
+    fn only_copy_selection_clears_the_search_marks() {
+        for (command, kept) in [(CopySelectionNoClear, true), (CopySelection, false)] {
+            let mut m = mode(&seq(), ModeKeys::Vi);
+            run(&mut m, CursorUp);
+            run(&mut m, BeginSelection);
+            run(&mut m, SearchBackward(SearchArg::Text("95".to_owned())));
+            assert!(!m.marks().0.is_empty());
+            run(&mut m, command.clone());
+            assert_eq!(!m.marks().0.is_empty(), kept, "{command:?}");
+        }
+    }
+
+    #[test]
     fn copying_without_a_selection_takes_nothing_and_cancels() {
         let mut m = mode(&seq(), ModeKeys::Vi);
         let r = run(&mut m, CopyPipeAndCancel);

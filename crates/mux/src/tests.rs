@@ -1408,3 +1408,39 @@ fn kill_session_destroys_every_pane() {
     let (s1, _) = Session::new(&server, None);
     assert_eq!(s1.name, "1");
 }
+
+#[test]
+fn the_copy_keys_send_the_copy_action() {
+    use CopyCommand::*;
+    let t = Instant::now();
+    assert_eq!(Server::new().copy_action(), CopyAction::CopyPipeAndCancel);
+    for (action, command) in [
+        (CopyAction::CopyPipeAndCancel, CopyPipeAndCancel),
+        (CopyAction::CopySelection, CopySelection),
+        (CopyAction::CopySelectionNoClear, CopySelectionNoClear),
+    ] {
+        let tables = [
+            (ModeKeys::Vi, vec![key(KeyCode::Enter), ctrl('m'), ctrl('j')]),
+            (ModeKeys::Emacs, vec![ctrl('w'), meta(KeyCode::Char('w'))]),
+        ];
+        for (keys, copy_keys) in tables {
+            let server = Server::new();
+            server.set_mode_keys(keys);
+            server.set_copy_action(action);
+            let mut s = Session::new(&server, None).0;
+            s.key(ctrl('b'), t);
+            s.key(ch('['), t);
+            for k in copy_keys {
+                assert_eq!(handled(s.key(k, t)), copy(command.clone(), 1), "{action:?} {k:?}");
+            }
+            // The other keys that copy keep their commands.
+            let others = match keys {
+                ModeKeys::Vi => vec![(ch('D'), CopyPipeEndOfLineAndCancel), (ch('A'), AppendSelectionAndCancel)],
+                ModeKeys::Emacs => vec![(ctrl('k'), CopyPipeEndOfLineAndCancel)],
+            };
+            for (k, other) in others {
+                assert_eq!(handled(s.key(k, t)), copy(other, 1), "{action:?} {k:?}");
+            }
+        }
+    }
+}

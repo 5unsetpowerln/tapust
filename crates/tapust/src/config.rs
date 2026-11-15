@@ -1462,6 +1462,15 @@ mod tests {
         assert_eq!(ok("tmux-mode-keys = vi\ntmux-mode-keys =").tmux_mode_keys, None);
         let invalid = "/c/config:1:tmux-mode-keys: invalid value \"Vi\", valid values are: emacs, vi";
         assert_eq!(errors("tmux-mode-keys = Vi"), [invalid]);
+        // The copy keys copy and leave copy mode, as tmux's tables bind them.
+        assert_eq!(Config::default().tmux_copy_action, CopyAction::CopyPipeAndCancel);
+        assert_eq!(ok("tmux-copy-action = copy-selection").tmux_copy_action, CopyAction::CopySelection);
+        assert_eq!(ok("tmux-copy-action = copy-selection-no-clear").tmux_copy_action, CopyAction::CopySelectionNoClear);
+        let reset = ok("tmux-copy-action = copy-selection\ntmux-copy-action =");
+        assert_eq!(reset.tmux_copy_action, CopyAction::CopyPipeAndCancel);
+        let invalid = "/c/config:1:tmux-copy-action: invalid value \"copy-pipe\", valid values are: \
+                       copy-pipe-and-cancel, copy-selection, copy-selection-no-clear";
+        assert_eq!(errors("tmux-copy-action = copy-pipe"), [invalid]);
     }
 
     #[test]
