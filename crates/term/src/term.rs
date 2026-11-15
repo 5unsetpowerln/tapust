@@ -1279,6 +1279,20 @@ impl Term {
             2 => {
                 self.pending_wrap = false;
                 let blank = self.blank();
+                // tmux's scroll-on-clear (on by default): the primary
+                // screen's rows up to the last one in use go to the
+                // scrollback first (grid_view_clear_history).
+                if !self.alt_active {
+                    let used = (0..self.rows).rev().find(|&y| self.grid.meta(y).occ != 0).map_or(0, |y| y + 1);
+                    if used != 0 {
+                        let row0 = self.grid.pushed();
+                        let pushed = self.grid.scroll_up(0, self.rows - 1, used, blank, true);
+                        if pushed != 0 && self.view_offset != 0 {
+                            self.view_offset = (self.view_offset + pushed).min(self.grid.hist_len());
+                        }
+                        self.scroll_selection(row0, 0, self.rows - 1, used, true, pushed);
+                    }
+                }
                 for y in 0..self.rows {
                     self.grid.clear_row(y, blank);
                 }
