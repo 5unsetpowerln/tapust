@@ -12,6 +12,8 @@
 
 use std::collections::HashMap;
 
+use std::num::NonZeroU32;
+
 use glow::HasContext;
 use term::Underline;
 
@@ -110,6 +112,9 @@ pub struct Renderer {
     underlines: Vec<Instance>,
     upload: Vec<Instance>,
     viewport: (u32, u32),
+    /// The framebuffer frames are drawn into, then copied to GtkGLArea's,
+    /// and the size of its texture.
+    target: Option<(glow::Framebuffer, glow::Texture, (u32, u32))>,
 }
 
 const BG_VS: &str = r#"#version 330 core
@@ -342,6 +347,7 @@ impl Renderer {
                 underlines: Vec::new(),
                 upload: Vec::new(),
                 viewport: (1, 1),
+                target: None,
             }
         }
     }
@@ -590,8 +596,48 @@ impl Renderer {
         }
     }
 
-    /// Draws the frame and clears its grids' dirty marks.
+    /// Draws the frame into the bound framebuffer and clears its grids'
+    /// dirty marks. GtkGLArea binds one of its pooled textures for each
+    /// frame, and with Mesa's Intel driver nothing drawn into the one a GL
+    /// area gets when it is shown again (another tab selected) lands, while
+    /// a copy does: the frame is drawn into a texture of the renderer's own
+    /// and copied.
     pub fn draw(&mut self, frame: &mut Frame) {
+        let gl = &self.gl;
+        let (w, h) = self.viewport;
+        let area = unsafe { gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING) };
+        let area = NonZeroU32::new(area as u32).map(glow::NativeFramebuffer);
+        let target = match self.target {
+            Some((framebuffer, texture, size)) => {
+                if size != (w, h) {
+                    unsafe { allocate_target(gl, texture, w, h) };
+                    self.target = Some((framebuffer, texture, (w, h)));
+                }
+                framebuffer
+            }
+            None => unsafe {
+                let texture = gl.create_texture().expect("a texture");
+                allocate_target(gl, texture, w, h);
+                let framebuffer = gl.create_framebuffer().expect("a framebuffer");
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+                gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(texture), 0);
+                self.target = Some((framebuffer, texture, (w, h)));
+                framebuffer
+            },
+        };
+        unsafe { self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(target)) };
+        self.paint(frame);
+        let gl = &self.gl;
+        let (w, h) = (w as i32, h as i32);
+        unsafe {
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(target));
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, area);
+            gl.blit_framebuffer(0, 0, w, h, 0, 0, w, h, glow::COLOR_BUFFER_BIT, glow::NEAREST);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, area);
+        }
+    }
+
+    fn paint(&mut self, frame: &mut Frame) {
         let gl = &self.gl;
         self.grids.retain(|id, cache| {
             let keep = frame.grids.iter().any(|g| g.id == *id);
@@ -706,6 +752,16 @@ impl Renderer {
             }
         }
         self.upload = upload;
+    }
+}
+
+/// Gives the renderer's target texture `width` x `height` texels.
+unsafe fn allocate_target(gl: &glow::Context, texture: glow::Texture, width: u32, height: u32) {
+    unsafe {
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        let data = glow::PixelUnpackData::Slice(None);
+        let (w, h) = (width as i32, height as i32);
+        gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, w, h, 0, glow::RGBA, glow::UNSIGNED_BYTE, data);
     }
 }
 
