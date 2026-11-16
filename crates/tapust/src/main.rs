@@ -7,6 +7,8 @@ mod font;
 mod frame;
 mod gl;
 mod gui;
+#[cfg(test)]
+mod headless;
 mod input;
 mod links;
 mod mouse;

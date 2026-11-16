@@ -216,6 +216,9 @@ pub struct Surface {
     pad: Cell<Padding>,
     /// The GLArea's size in device pixels.
     pixels: Cell<(i32, i32)>,
+    /// The `render` signals so far.
+    #[cfg(test)]
+    renders: Cell<u32>,
 }
 
 /// Zig's std.fs.path.resolve for an absolute `dir`: `path` joined to it
@@ -568,6 +571,8 @@ impl Surface {
             size: Cell::new((0, 0)),
             pad: Cell::new(Padding::default()),
             pixels: Cell::new((0, 0)),
+            #[cfg(test)]
+            renders: Cell::new(0),
         });
         surface.connect(handler);
         surface
@@ -2159,6 +2164,8 @@ impl Surface {
     }
 
     fn render(&self) {
+        #[cfg(test)]
+        self.renders.set(self.renders.get() + 1);
         let mut d = self.draw.borrow_mut();
         let d = &mut *d;
         let Some(renderer) = d.renderer.as_mut() else { return };
@@ -2253,6 +2260,48 @@ impl Surface {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pane shown again draws itself even when it does not get the focus,
+    /// as the panes beside the active one in a tab that gets selected.
+    #[test]
+    #[cfg_attr(not(feature = "external-tests"), ignore = "runs sway")]
+    fn a_pane_shown_again_draws_itself() {
+        crate::headless::run("surface::tests::shown_again_in_sway");
+    }
+
+    #[test]
+    #[ignore = "run in a headless sway by a_pane_shown_again_draws_itself"]
+    fn shown_again_in_sway() {
+        use crate::headless::{settle, wait_until};
+        gtk::init().expect("GTK in the headless sway");
+        adw::init().expect("libadwaita");
+        crate::font::register_embedded_fonts().expect("the bundled fonts");
+        let surface = Surface::new(0, Rc::new(Config::default()), 12.0, Rc::new(|_| true));
+        let entry = gtk::Entry::new();
+        let tabs = adw::TabView::new();
+        let pane_tab = tabs.append(&surface.outer);
+        let other_tab = tabs.append(&gtk::Label::new(None));
+        tabs.set_selected_page(&pane_tab);
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        column.append(&entry);
+        column.append(&tabs);
+        let window = gtk::Window::builder().default_width(400).default_height(300).child(&column).build();
+        // The headless sway gives the window no keyboard, so the pane gets
+        // no focus events, as a pane beside the active one.
+        GtkWindowExt::set_focus(&window, Some(&entry));
+        window.present();
+        wait_until("the first frame", || surface.renders.get() > 0);
+        settle(|| surface.renders.get());
+        for round in 0..5 {
+            tabs.set_selected_page(&other_tab);
+            wait_until("the pane hidden", || !surface.area.is_mapped());
+            settle(|| surface.renders.get());
+            let before = surface.renders.get();
+            tabs.set_selected_page(&pane_tab);
+            wait_until(&format!("a frame of the pane shown again (round {round})"), || surface.renders.get() > before);
+            settle(|| surface.renders.get());
+        }
+    }
 
     #[test]
     fn paths_resolve_like_zig() {
