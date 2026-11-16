@@ -219,6 +219,9 @@ pub struct Surface {
     /// The `render` signals so far.
     #[cfg(test)]
     renders: Cell<u32>,
+    /// The bright pixels of the GL area's framebuffer after the last frame.
+    #[cfg(test)]
+    drawn: Cell<Option<usize>>,
 }
 
 /// Zig's std.fs.path.resolve for an absolute `dir`: `path` joined to it
@@ -573,6 +576,8 @@ impl Surface {
             pixels: Cell::new((0, 0)),
             #[cfg(test)]
             renders: Cell::new(0),
+            #[cfg(test)]
+            drawn: Cell::new(None),
         });
         surface.connect(handler);
         surface
@@ -2233,6 +2238,8 @@ impl Surface {
         }
         d.full = false;
         renderer.draw(&mut d.frame);
+        #[cfg(test)]
+        self.drawn.set(Some(tests::bright_pixels(self.pixels.get())));
     }
 
     /// Draws again when a synchronized update times out, unless a timer for
@@ -2260,6 +2267,85 @@ impl Surface {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bright pixels of the bound framebuffer, `size` large.
+    pub(super) fn bright_pixels((width, height): (i32, i32)) -> usize {
+        use glow::HasContext;
+        let gl = crate::gl::context();
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        let data = glow::PixelPackData::Slice(Some(&mut pixels));
+        unsafe { gl.read_pixels(0, 0, width, height, glow::RGBA, glow::UNSIGNED_BYTE, data) };
+        pixels.chunks(4).filter(|p| p[..3].iter().any(|&c| c > 150)).count()
+    }
+
+    /// The panes of a tab selected again draw their content, also the one
+    /// moved into a split, whose GL area was realized again.
+    #[test]
+    #[cfg_attr(not(feature = "external-tests"), ignore = "runs sway")]
+    fn panes_of_a_tab_selected_again_draw_their_content() {
+        crate::headless::run("surface::tests::tabs_in_sway");
+    }
+
+    #[test]
+    #[ignore = "run in a headless sway by panes_of_a_tab_selected_again_draw_their_content"]
+    fn tabs_in_sway() {
+        use crate::headless::{settle, wait_until};
+        gtk::init().expect("GTK in the headless sway");
+        adw::init().expect("libadwaita");
+        crate::font::register_embedded_fonts().expect("the bundled fonts");
+        let config = Rc::new(Config::default());
+        let text: String = (1..=30).map(|i| format!("line {i} of the pane\r\n")).collect();
+        let mut panes = Vec::new();
+        let surfaces: Vec<Rc<Surface>> = (0..4)
+            .map(|pane| {
+                let surface = Surface::new(pane, config.clone(), 12.0, Rc::new(|_| true));
+                let mut sleep = std::process::Command::new("sleep");
+                sleep.arg("60");
+                let pty = crate::pty::Pty::spawn_command(sleep, 80, 24, (8, 16), std::path::Path::new("/")).expect("a pty");
+                let io = crate::pty::PaneIo::start(pty, term::Terminal::new(80, 24, 100), || {}).expect("the I/O");
+                io.shared.term.lock().feed(text.as_bytes());
+                surface.attach(io.shared.clone());
+                panes.push(io);
+                surface
+            })
+            .collect();
+        let split = |a: &Surface, b: &Surface| {
+            let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+            paned.set_start_child(Some(&a.outer));
+            paned.set_end_child(Some(&b.outer));
+            paned.set_position(400);
+            paned
+        };
+        let renders = || surfaces.iter().map(|s| s.renders.get()).sum::<u32>();
+        let tabs = adw::TabView::new();
+        let first = tabs.append(&split(&surfaces[0], &surfaces[1]));
+        // The second tab gets its split later, which moves its first pane.
+        let second_tree = adw::Bin::new();
+        second_tree.set_child(Some(&surfaces[2].outer));
+        let second = tabs.append(&second_tree);
+        let window = gtk::Window::builder().default_width(800).default_height(400).child(&tabs).build();
+        window.present();
+        tabs.set_selected_page(&second);
+        wait_until("the second tab drawn", || surfaces[2].drawn.get().is_some());
+        settle(renders);
+        second_tree.set_child(None::<&gtk::Widget>);
+        second_tree.set_child(Some(&split(&surfaces[2], &surfaces[3])));
+        wait_until("the split drawn", || surfaces[3].drawn.get().is_some());
+        settle(renders);
+        for round in 0..6 {
+            let (page, shown) = if round % 2 == 0 { (&first, [0, 1]) } else { (&second, [2, 3]) };
+            for &i in &shown {
+                surfaces[i].drawn.set(None);
+            }
+            tabs.set_selected_page(page);
+            wait_until("a frame of each pane", || shown.iter().all(|&i| surfaces[i].drawn.get().is_some()));
+            settle(renders);
+            for &i in &shown {
+                let drawn = surfaces[i].drawn.get().unwrap();
+                assert!(drawn > 0, "pane {i} drew nothing when its tab was selected (round {round})");
+            }
+        }
+    }
 
     /// A pane shown again draws itself even when it does not get the focus,
     /// as the panes beside the active one in a tab that gets selected.
