@@ -10,5 +10,5 @@ A terminal emulator with tmux-style panes and key bindings built in.
 - fontconfig
 - FreeType
 
-The tests also run `/bin/sh`, `bash`, `fish`, `tmux` (3.6), `timeout` and
-`pkill`.
+The tests also run `/bin/sh`, `bash`, `fish`, `tmux` (3.6), `timeout`,
+`pkill` and `sway` (`TAPUST_TEST_SWAY` names another).
