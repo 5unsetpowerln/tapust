@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use gtk::glib;
@@ -14,12 +15,19 @@ pub fn run(name: &str) {
     let exe = std::env::current_exe().expect("the test binary");
     // target/<profile>/deps/<binary>: the files go under target/tmp.
     let target = exe.ancestors().nth(3).expect("the target directory");
-    let dir = Dir(target.join("tmp").join(format!("sway-{}", std::process::id())));
+    // Tests run in parallel, each with its own sway; the socket's path must
+    // stay within the 108 bytes of a Unix socket address.
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+    let run = RUNS.fetch_add(1, Ordering::Relaxed);
+    let dir = Dir(target.join("tmp").join(format!("sway-{}-{run}", std::process::id())));
     let dir = &dir.0;
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir.join("config")).expect("the sway directory");
     let sway_config = dir.join("sway.conf");
-    std::fs::write(&sway_config, "output HEADLESS-1 resolution 1280x800\n").expect("the sway configuration");
+    // sway runs `exec` once it has started, when clients can show windows.
+    let ready = dir.join("ready");
+    let config = format!("output HEADLESS-1 resolution 1280x800\nexec touch '{}'\n", ready.display());
+    std::fs::write(&sway_config, config).expect("the sway configuration");
     let program = std::env::var_os("TAPUST_TEST_SWAY").unwrap_or_else(|| "sway".into());
     let mut sway = Sway(
         Command::new(&program)
@@ -33,13 +41,12 @@ pub fn run(name: &str) {
             .spawn()
             .unwrap_or_else(|err| panic!("cannot run {program:?} ({err}); set TAPUST_TEST_SWAY to a sway")),
     );
-    let socket = dir.join("wayland-1");
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !socket.exists() {
+    while !ready.exists() {
         if let Some(status) = sway.0.try_wait().expect("sway's status") {
-            panic!("{program:?} exited ({status}) before it made a Wayland socket; set TAPUST_TEST_SWAY to a sway");
+            panic!("{program:?} exited ({status}) before it started; set TAPUST_TEST_SWAY to a sway");
         }
-        assert!(Instant::now() < deadline, "{program:?} made no Wayland socket in 10 s");
+        assert!(Instant::now() < deadline, "{program:?} did not start in 10 s");
         std::thread::sleep(Duration::from_millis(20));
     }
     let status = Command::new(&exe)
