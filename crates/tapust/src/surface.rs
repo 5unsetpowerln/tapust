@@ -616,7 +616,11 @@ impl Surface {
         });
 
         let h = handler.clone();
-        self.area.connect_map(move |_| {
+        self.area.connect_map(move |area| {
+            // A GtkGLArea shown again at its old size gets no size_allocate,
+            // and drawn without a render request it shows one of its pooled
+            // textures, not necessarily the last frame, or a blank new one.
+            area.queue_render();
             h(Event::Mapped);
         });
         let (pane, h) = (self.pane, handler.clone());
