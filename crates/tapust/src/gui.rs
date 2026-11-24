@@ -3074,6 +3074,65 @@ mod tests {
     use super::{Config, Server, apply_tmux_options, encode_paste};
     use mux::CopyAction;
 
+    /// A pane stays in copy mode while zooming, unzooming and splitting
+    /// resize it. Resizing the copy mode redraws it, and the redraw's
+    /// SelectionChanged reached the window while it was resizing the pane.
+    #[test]
+    #[cfg_attr(not(feature = "external-tests"), ignore = "runs sway and /bin/sh")]
+    fn a_pane_in_copy_mode_survives_resizes() {
+        crate::headless::run("gui::tests::copy_mode_resized_in_sway");
+    }
+
+    #[test]
+    #[ignore = "run in a headless sway by a_pane_in_copy_mode_survives_resizes"]
+    fn copy_mode_resized_in_sway() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use adw::prelude::*;
+        use gtk::gio;
+
+        use super::{App, Command, PaneId, Window};
+        use crate::headless::wait_until;
+
+        // The headless sway's child has an empty configuration directory.
+        let dir = std::path::PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").expect("a configuration directory"));
+        std::fs::create_dir_all(dir.join("tapust")).unwrap();
+        std::fs::write(dir.join("tapust/config"), "command = exec sleep 600\n").unwrap();
+        crate::font::register_embedded_fonts().unwrap();
+        let application =
+            adw::Application::builder().application_id("dev.tapust.test").flags(gio::ApplicationFlags::NON_UNIQUE).build();
+        application.register(None::<&gio::Cancellable>).expect("the application registered");
+        let built: Rc<RefCell<Option<Rc<App>>>> = Rc::default();
+        let slot = built.clone();
+        application.connect_activate(move |application| *slot.borrow_mut() = Some(App::build(application, None)));
+        application.activate();
+        let app = built.borrow().clone().expect("the application built");
+        wait_until("a window", || !app.windows().is_empty());
+        let win: Rc<Window> = app.windows()[0].clone();
+
+        let active = |win: &Window| -> PaneId { win.state.borrow().session.active_pane() };
+        let cols = |win: &Window, pane: PaneId| -> Option<u16> {
+            let st = win.state.borrow();
+            st.panes.get(&pane).and_then(|p| p.io.as_ref()).map(|io| io.shared.term.lock().cols())
+        };
+        let split = || Command::SplitWindow { horizontal: true, before: false, full: false, cwd_of_active: true };
+        win.command(split());
+        let pane = active(&win);
+        wait_until("the split's program", || cols(&win, pane).is_some());
+        win.command(Command::CopyMode { page_up: false });
+        let surface = win.state.borrow().panes[&pane].surface.clone();
+        assert!(surface.in_copy_mode());
+
+        let mut width = cols(&win, pane);
+        for (what, command) in [("zoomed", Command::ZoomPane), ("unzoomed", Command::ZoomPane), ("split", split())] {
+            win.command(command);
+            wait_until(what, || cols(&win, pane) != width);
+            width = cols(&win, pane);
+            assert!(surface.in_copy_mode(), "{what}: the pane left copy mode");
+        }
+    }
+
     #[test]
     fn the_configuration_sets_the_copy_action() {
         let server = Server::new();
