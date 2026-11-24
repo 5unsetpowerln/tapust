@@ -5,7 +5,7 @@
 //! windows move their tmux windows between the sessions.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -89,6 +89,13 @@ pub struct App {
     windows: RefCell<Vec<Rc<Window>>>,
     /// The window showing each pane, which gets the pane's events.
     owners: RefCell<HashMap<PaneId, Weak<Window>>>,
+    /// Surface events waiting for the one being handled, or for their
+    /// window's state to be free, in the order they came (see `handle`).
+    deferred: RefCell<VecDeque<(PaneId, Event)>>,
+    /// A surface event is being handled.
+    handling: Cell<bool>,
+    /// An idle will handle the deferred events.
+    idle_scheduled: Cell<bool>,
     /// The directory tapust started in (working-directory = inherit).
     cwd: PathBuf,
     /// What the next new pane runs instead of the configured command: `-e`
@@ -534,6 +541,9 @@ impl App {
             server: Server::new(),
             windows: RefCell::new(Vec::new()),
             owners: RefCell::new(HashMap::new()),
+            deferred: RefCell::new(VecDeque::new()),
+            handling: Cell::new(false),
+            idle_scheduled: Cell::new(false),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             command: RefCell::new(command),
             config: RefCell::new(Rc::new(Config::default())),
@@ -849,9 +859,47 @@ impl App {
         self.owners.borrow_mut().insert(pane, Rc::downgrade(window));
     }
 
-    /// A surface's event goes to the window that shows its pane.
-    fn handle(&self, pane: PaneId, event: Event) -> bool {
-        self.owner(pane).is_some_and(|window| window.handle(event))
+    /// A surface's event goes to the window that shows its pane, one event
+    /// at a time. Handling an event can make a surface send another at once
+    /// (a resize redraws the copy mode, which reports the selection), and so
+    /// can a surface called while a window's state is borrowed: such an
+    /// event waits until the one being handled is done, or until the next
+    /// idle, so that no handler runs while the state is borrowed. Events
+    /// that come while others wait queue behind them. A deferred event
+    /// counts as handled.
+    fn handle(self: &Rc<Self>, pane: PaneId, event: Event) -> bool {
+        let Some(window) = self.owner(pane) else { return false };
+        if self.handling.get() || !self.deferred.borrow().is_empty() || window.state.try_borrow_mut().is_err() {
+            self.defer(pane, event);
+            return true;
+        }
+        self.handling.set(true);
+        let handled = window.handle(event);
+        self.handling.set(false);
+        self.handle_deferred();
+        handled
+    }
+
+    fn defer(self: &Rc<Self>, pane: PaneId, event: Event) {
+        self.deferred.borrow_mut().push_back((pane, event));
+        // The event being handled handles the deferred ones when it is done.
+        if !self.handling.get() && !self.idle_scheduled.replace(true) {
+            let weak = Rc::downgrade(self);
+            glib::idle_add_local_once(move || {
+                if let Some(app) = weak.upgrade() {
+                    app.idle_scheduled.set(false);
+                    app.handle_deferred();
+                }
+            });
+        }
+    }
+
+    /// The deferred events in order, each with the ones it defers in turn.
+    fn handle_deferred(self: &Rc<Self>) {
+        let events = std::mem::take(&mut *self.deferred.borrow_mut());
+        for (pane, event) in events {
+            self.handle(pane, event);
+        }
     }
 
     fn wake(&self, pane: PaneId) {
