@@ -6,6 +6,7 @@ use std::io::{self, Write};
 use std::ops::Deref;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::rc::{Rc, Weak};
+use std::thread::JoinHandle;
 
 use crossfont::{
     BitmapBuffer, FontDesc, FontKey, GlyphKey, Rasterize, RasterizedGlyph, Rasterizer, Size, Slant,
@@ -161,18 +162,38 @@ impl Deref for Fonts {
 
 type Key = (String, u32, u64);
 
+type Loading = JoinHandle<Result<Loaded, crossfont::Error>>;
+
 thread_local! {
     static LOADED: RefCell<Vec<(Key, Weak<Loaded>)>> = const { RefCell::new(Vec::new()) };
+    /// Fonts `preload` is loading, which `new` takes.
+    static LOADING: RefCell<Vec<(Key, Loading)>> = const { RefCell::new(Vec::new()) };
 }
 
 impl Fonts {
+    /// Starts loading a font on another thread, for the `new` that will ask
+    /// for it, which then waits for it rather than loading it.
+    pub fn preload(family: &str, points: f32, scale: f64) {
+        let key = (family.to_owned(), points.to_bits(), scale.to_bits());
+        let family = family.to_owned();
+        let load = move || Loaded::new(&family, points, scale);
+        if let Ok(loading) = std::thread::Builder::new().name("font-load".into()).spawn(load) {
+            LOADING.with_borrow_mut(|l| l.push((key, loading)));
+        }
+    }
+
     pub fn new(family: &str, points: f32, scale: f64) -> Result<Fonts, crossfont::Error> {
         let key = (family.to_owned(), points.to_bits(), scale.to_bits());
         let held = LOADED.with_borrow(|l| l.iter().find(|(k, _)| *k == key).and_then(|(_, w)| w.upgrade()));
         if let Some(loaded) = held {
             return Ok(Fonts(loaded));
         }
-        let loaded = Rc::new(Loaded::new(family, points, scale)?);
+        let loading = LOADING.with_borrow_mut(|l| l.iter().position(|(k, _)| *k == key).map(|i| l.remove(i).1));
+        let loaded = match loading {
+            Some(loading) => loading.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))?,
+            None => Loaded::new(family, points, scale)?,
+        };
+        let loaded = Rc::new(loaded);
         LOADED.with_borrow_mut(|l| {
             l.retain(|(_, w)| w.strong_count() > 0);
             l.push((key, Rc::downgrade(&loaded)));

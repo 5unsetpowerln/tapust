@@ -31,6 +31,7 @@ use crate::input;
 use crate::notifications;
 use crate::palette::{self, Run};
 use crate::pty::{ChildExit, PaneIo, Program, Pty};
+use crate::stylesheet::Stylesheet;
 use crate::surface::{self, Event, Surface};
 use crate::theme;
 
@@ -105,6 +106,8 @@ pub struct App {
     /// The configuration was read for a dark style (ghostty's conditional
     /// theme state).
     theme_dark: Cell<bool>,
+    /// libadwaita's stylesheet when tapust loads it.
+    stylesheet: RefCell<Option<Rc<Stylesheet>>>,
     /// The stylesheet, whose runtime rules follow the configuration.
     css: gtk::CssProvider,
     /// The gtk-custom-css files, over the stylesheet.
@@ -429,10 +432,11 @@ fn header_buttons(overview: &adw::TabOverview, flat: bool) -> (adw::SplitButton,
     overview.bind_property("open", &overview_toggle, "active").bidirectional().sync_create().build();
     let menu = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
-        .menu_model(&main_menu())
         .tooltip_text("Main Menu")
         .can_focus(false)
         .build();
+    // The menu's popover is made as it first opens, not with the window.
+    menu.set_create_popup_func(|menu| menu.set_menu_model(Some(&main_menu())));
     if flat {
         new_tab.add_css_class("flat");
         overview_toggle.add_css_class("flat");
@@ -531,6 +535,14 @@ fn main_menu() -> gio::Menu {
     menu
 }
 
+/// The scale of the first monitor, which a new window is likely shown on.
+fn first_scale() -> f64 {
+    gdk::Display::default()
+        .and_then(|d| d.monitors().item(0))
+        .and_then(|m| m.downcast::<gdk::Monitor>().ok())
+        .map_or(1.0, |m| m.scale())
+}
+
 impl App {
     pub fn build(application: &adw::Application, command: Option<Vec<OsString>>) -> Rc<App> {
         let display = gdk::Display::default().expect("display");
@@ -548,6 +560,7 @@ impl App {
             command: RefCell::new(command),
             config: RefCell::new(Rc::new(Config::default())),
             theme_dark: Cell::new(false),
+            stylesheet: RefCell::new(None),
             css,
             custom_css: RefCell::new(Vec::new()),
             errors: RefCell::new(None),
@@ -558,6 +571,14 @@ impl App {
         let (config, mut diagnostics) = app.read_config();
         *app.config.borrow_mut() = Rc::new(config);
         diagnostics.extend(app.apply_config());
+        // The first window's pane takes these, before its window is shown.
+        let config = app.config();
+        font::Fonts::preload(config.font_family(), config.font_size, first_scale());
+        // While the stylesheet is parsed, which creates no thread: creating
+        // one waits for the drivers' dlopen to release the loader's lock.
+        crate::gl::prepare(&display);
+        // Loaded once the configuration has set the color scheme.
+        *app.stylesheet.borrow_mut() = Stylesheet::follow(&display, &app.application.style_manager());
         app.add_actions();
         app.follow_style();
         app.new_window(None);
@@ -1056,7 +1077,6 @@ impl Window {
             .build();
         window.set_property("handle-menubar-accel", false);
         window.add_css_class("window");
-        window.set_icon_name(Some(theme::ICON));
         // ghostty's handleActiveState: an active window needs no attention.
         let attention = app.attention.clone();
         window.connect_is_active_notify(move |w| {
@@ -1870,10 +1890,7 @@ impl Window {
             }
         };
         let Some(surface) = self.state.borrow().panes.get(&pane).map(|p| p.surface.clone()) else { return };
-        let scale = gdk::Display::default()
-            .and_then(|d| d.monitors().item(0))
-            .and_then(|m| m.downcast::<gdk::Monitor>().ok())
-            .map_or(1.0, |m| m.scale());
+        let scale = first_scale();
         let config = self.app.config();
         let natural = |widget: &gtk::Widget| widget.measure(gtk::Orientation::Vertical, -1).1;
         let content = self.toolbar.content().expect("the toolbar's content");
