@@ -35,28 +35,49 @@ use std::path::PathBuf;
 use adw::prelude::*;
 use gtk::gio;
 
-const USAGE: &str = "usage: tapust [--load-layout FILE | -e PROGRAM [ARGS...]]
+const USAGE: &str = "usage: tapust [--fork] [--load-layout FILE | -e PROGRAM [ARGS...]]
        tapust --save-layout FILE";
 
 /// What the command line asks for.
 #[derive(Debug, PartialEq)]
 enum Cli {
     /// Run with the first pane running `command` instead of the configured
-    /// command, or with the windows of the layout file `layout`.
-    Run { command: Option<Vec<OsString>>, layout: Option<PathBuf> },
+    /// command, or with the windows of the layout file `layout`; with
+    /// `fork`, as a process of its own that outlives the command line.
+    Run { fork: bool, command: Option<Vec<OsString>>, layout: Option<PathBuf> },
     /// Ask the tapust running this pane to write its layout to the file.
     SaveLayout(PathBuf),
 }
 
 fn parse_args(args: &[OsString]) -> Option<Cli> {
-    let (command, layout) = match args {
+    let fork = args.first().is_some_and(|flag| flag == "--fork");
+    let (command, layout) = match &args[usize::from(fork)..] {
         [] => (None, None),
-        [flag, file] if flag == "--save-layout" => return Some(Cli::SaveLayout(file.into())),
+        [flag, file] if flag == "--save-layout" && !fork => return Some(Cli::SaveLayout(file.into())),
         [flag, file] if flag == "--load-layout" => (None, Some(file.into())),
         [flag, program @ ..] if flag == "-e" && !program.is_empty() => (Some(program.to_vec()), None),
         _ => return None,
     };
-    Some(Cli::Run { command, layout })
+    Some(Cli::Run { fork, command, layout })
+}
+
+/// Runs tapust again with `args` in a new session, which has no
+/// controlling terminal: closing the terminal the command line ran in
+/// sends it no SIGHUP, and it writes nowhere that could go away.
+fn fork(args: &[OsString]) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let mut command = Command::new(std::env::current_exe()?);
+    command.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    // SAFETY: setsid is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| match libc::setsid() {
+            -1 => Err(std::io::Error::last_os_error()),
+            _ => Ok(()),
+        });
+    }
+    command.spawn().map(drop)
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -70,7 +91,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Ok(());
         }
         // Read before anything starts, so that a bad file is all that happens.
-        Cli::Run { command, layout } => (command, layout.map(|file| layout::Layout::read(&file)).transpose()?),
+        Cli::Run { fork: false, command, layout } => {
+            (command, layout.map(|file| layout::Layout::read(&file)).transpose()?)
+        }
+        Cli::Run { fork: true, layout, .. } => {
+            if let Some(file) = layout {
+                layout::Layout::read(&file)?;
+            }
+            fork(&args[1..])?;
+            return Ok(());
+        }
     };
     pty::disable_vulkan();
     stylesheet::take_over();
@@ -118,9 +148,9 @@ mod tests {
 
     #[test]
     fn command_lines() {
-        assert_eq!(parse(&[]), Some(Cli::Run { command: None, layout: None }));
-        assert_eq!(parse(&["-e", "vim", "-R"]), Some(Cli::Run { command: Some(vec!["vim".into(), "-R".into()]), layout: None }));
-        assert_eq!(parse(&["--load-layout", "f"]), Some(Cli::Run { command: None, layout: Some("f".into()) }));
+        assert_eq!(parse(&[]), Some(Cli::Run { fork: false, command: None, layout: None }));
+        assert_eq!(parse(&["-e", "vim", "-R"]), Some(Cli::Run { fork: false, command: Some(vec!["vim".into(), "-R".into()]), layout: None }));
+        assert_eq!(parse(&["--load-layout", "f"]), Some(Cli::Run { fork: false, command: None, layout: Some("f".into()) }));
         assert_eq!(parse(&["--save-layout", "f"]), Some(Cli::SaveLayout("f".into())));
         for bad in [&["-e"][..], &["--load-layout"], &["--save-layout"], &["--load-layout", "f", "-e", "sh"], &["-x"]] {
             assert_eq!(parse(bad), None, "{bad:?}");
