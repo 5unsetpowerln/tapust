@@ -30,6 +30,8 @@ pub enum Binding {
     /// open_config: os_open, or new_window.
     OpenConfig { new_window: bool },
     ReloadConfig,
+    /// previous_tab, or next_tab when `next`.
+    Tab { next: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -324,6 +326,8 @@ fn parse_action(input: &str) -> Option<Option<Binding>> {
         ("open_config", None | Some("os_open")) => Binding::OpenConfig { new_window: false },
         ("open_config", Some("new_window")) => Binding::OpenConfig { new_window: true },
         ("reload_config", None) => Binding::ReloadConfig,
+        ("previous_tab", None) => Binding::Tab { next: false },
+        ("next_tab", None) => Binding::Tab { next: true },
         _ => return None,
     }))
 }

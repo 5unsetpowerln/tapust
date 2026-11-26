@@ -1729,7 +1729,22 @@ impl Window {
             Binding::ToggleCommandPalette => self.open_palette(pane),
             Binding::OpenConfig { new_window } => self.app.open_config(new_window),
             Binding::ReloadConfig => self.app.reload_config(),
+            Binding::Tab { next } => return self.select_tab(next),
         }
+        true
+    }
+
+    /// ghostty's selectTab for previous_tab and next_tab: the tab before or
+    /// after the selected one, wrapping around; false when there is no
+    /// other tab.
+    fn select_tab(&self, next: bool) -> bool {
+        let Some(page) = self.tab_view.selected_page() else { return false };
+        let (current, total) = (self.tab_view.page_position(&page), self.tab_view.n_pages());
+        let goto = if next { (current + 1) % total } else { (current + total - 1) % total };
+        if goto == current {
+            return false;
+        }
+        self.tab_view.set_selected_page(&self.tab_view.nth_page(goto));
         true
     }
 
