@@ -74,6 +74,19 @@ impl Split {
 }
 
 impl Node {
+    /// The tree with its leaves numbered by `next`, in the tree's order.
+    pub(crate) fn renumbered(&self, next: &mut impl FnMut() -> PaneId) -> Node {
+        match self {
+            Node::Leaf(_) => Node::Leaf(next()),
+            Node::Split(split) => Node::Split(Box::new(Split {
+                horizontal: split.horizontal,
+                ratio: split.ratio,
+                first: split.first.renumbered(next),
+                second: split.second.renumbered(next),
+            })),
+        }
+    }
+
     fn split_node(horizontal: bool, first: Node, second: Node) -> Node {
         Node::Split(Box::new(Split { horizontal, ratio: 0.5, first, second }))
     }

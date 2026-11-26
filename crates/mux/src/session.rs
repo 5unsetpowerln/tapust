@@ -8,7 +8,7 @@ use crate::keys::KeyState;
 use crate::layout::Layout;
 use crate::split::Side;
 use crate::window::{Pane, Window};
-use crate::{format, paste, Command, CopyCommand, Direction, Effect, NewAt, PaneId, Server, Session};
+use crate::{format, paste, Command, CopyCommand, Direction, Effect, NewAt, Node, PaneId, Server, Session};
 
 /// session_create: a session with no window yet.
 pub(crate) fn blank(server: &Server) -> Session {
@@ -39,6 +39,22 @@ pub(crate) fn new_session(server: &Server, parent: Option<PaneId>) -> (Session, 
         s.curw = idx;
     });
     (s, effects)
+}
+
+/// new-session with a window for each of `tabs`, split trees whose leaves
+/// stand for the panes to make; the first window is current. Returns the
+/// new panes in the trees' order.
+pub(crate) fn restore(server: &Server, tabs: &[Node]) -> (Session, Vec<Effect>, Vec<PaneId>) {
+    let mut s = blank(server);
+    let mut made = Vec::new();
+    let effects = s.op(|s| {
+        for tree in tabs {
+            let idx = s.free_index();
+            s.restore_window(idx, tree, &mut made);
+        }
+        s.curw = *s.winlinks.keys().next().expect("a tab to restore");
+    });
+    (s, effects, made)
 }
 
 impl Drop for Session {
@@ -146,6 +162,27 @@ impl Session {
         point.set(point.get().wrapping_add(1));
         self.winlinks.insert(idx, w);
         self.spawned.push((id, parent, inherit_cwd));
+    }
+
+    /// A window at `idx` shaped as `tree`, with a new pane for each leaf,
+    /// the first active, as spawn_window makes its pane; the panes are
+    /// added to `made`.
+    fn restore_window(&mut self, idx: u32, tree: &Node, made: &mut Vec<PaneId>) {
+        let first = made.len();
+        let tree = tree.renumbered(&mut || {
+            let id = self.server.new_pane_id();
+            made.push(id);
+            id
+        });
+        let mut panes = made[first..].iter().map(|&id| Pane::new(id));
+        let mut w = Window::new(self.server.new_window_id(), panes.next().expect("a pane"));
+        w.panes.extend(panes);
+        w.tree = tree;
+        let point = self.server.active_point();
+        w.panes[0].active_point = point.get();
+        point.set(point.get().wrapping_add(1));
+        self.winlinks.insert(idx, w);
+        self.spawned.extend(made[first..].iter().map(|&id| (id, None, false)));
     }
 
     /// winlink_shuffle_up: frees index `idx` by moving the windows from

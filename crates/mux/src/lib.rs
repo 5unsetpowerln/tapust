@@ -416,6 +416,15 @@ impl Session {
         session::new_session(server, parent)
     }
 
+    /// A session with a window for each of `tabs`, as a saved layout has
+    /// them: split trees whose leaves stand for the panes to make (their
+    /// numbers do not matter). The first window is current and the first
+    /// pane of each window active. Returns the new panes' `Spawn` effects,
+    /// from outside, and the panes in the trees' order.
+    pub fn restore(server: &Server, tabs: &[Node]) -> (Session, Vec<Effect>, Vec<PaneId>) {
+        session::restore(server, tabs)
+    }
+
     /// move-window -s @`id` -t `dst`: the window, its panes as they are,
     /// leaves this session for `dst`, where it goes at `position` among the
     /// windows in index order (`-b` before the window there, or `-a` after
