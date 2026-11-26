@@ -148,11 +148,28 @@ mod tests {
 
     #[test]
     fn command_lines() {
-        assert_eq!(parse(&[]), Some(Cli::Run { fork: false, command: None, layout: None }));
-        assert_eq!(parse(&["-e", "vim", "-R"]), Some(Cli::Run { fork: false, command: Some(vec!["vim".into(), "-R".into()]), layout: None }));
-        assert_eq!(parse(&["--load-layout", "f"]), Some(Cli::Run { fork: false, command: None, layout: Some("f".into()) }));
+        let run = |fork, command: Option<&[&str]>, layout: Option<&str>| {
+            let command = command.map(|words| words.iter().map(Into::into).collect());
+            Some(Cli::Run { fork, command, layout: layout.map(Into::into) })
+        };
+        assert_eq!(parse(&[]), run(false, None, None));
+        assert_eq!(parse(&["-e", "vim", "-R"]), run(false, Some(&["vim", "-R"]), None));
+        assert_eq!(parse(&["--load-layout", "f"]), run(false, None, Some("f")));
         assert_eq!(parse(&["--save-layout", "f"]), Some(Cli::SaveLayout("f".into())));
-        for bad in [&["-e"][..], &["--load-layout"], &["--save-layout"], &["--load-layout", "f", "-e", "sh"], &["-x"]] {
+        assert_eq!(parse(&["--fork"]), run(true, None, None));
+        assert_eq!(parse(&["--fork", "--load-layout", "f"]), run(true, None, Some("f")));
+        assert_eq!(parse(&["--fork", "-e", "--fork"]), run(true, Some(&["--fork"]), None));
+        let bad: [&[&str]; 8] = [
+            &["-e"],
+            &["--load-layout"],
+            &["--save-layout"],
+            &["--load-layout", "f", "-e", "sh"],
+            &["-x"],
+            &["--fork", "--save-layout", "f"],
+            &["--load-layout", "f", "--fork"],
+            &["--fork", "--fork"],
+        ];
+        for bad in bad {
             assert_eq!(parse(bad), None, "{bad:?}");
         }
     }
