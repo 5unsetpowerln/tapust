@@ -650,6 +650,20 @@ mod tests {
         }
     }
 
+    /// ghostty binds ctrl+page_up and ctrl+page_down to the tabs; tapust
+    /// leaves them to the terminal unless the configuration binds them.
+    #[test]
+    fn tabs_are_switched_by_configured_keys_only() {
+        assert_eq!(bound(&Keybinds::default(), K::Page_Up, CTRL), None);
+        assert_eq!(bound(&Keybinds::default(), K::Page_Down, CTRL), None);
+        let k = keybinds(&["ctrl+page_up=previous_tab", "performable:ctrl+page_down=next_tab"]);
+        let previous = Bound { binding: Binding::Tab { next: false }, performable: false, consumed: true };
+        assert_eq!(bound(&k, K::Page_Up, CTRL), Some(previous));
+        let next = Bound { binding: Binding::Tab { next: true }, performable: true, consumed: true };
+        assert_eq!(bound(&k, K::Page_Down, CTRL), Some(next));
+        assert_eq!(parse_action("next_tab:1"), None);
+    }
+
     #[test]
     fn keybinds_set_unbind_and_clear() {
         let k = keybinds(&[

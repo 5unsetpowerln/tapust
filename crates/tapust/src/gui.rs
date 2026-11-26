@@ -3115,22 +3115,21 @@ mod tests {
         crate::headless::run("gui::tests::copy_mode_resized_in_sway");
     }
 
-    #[test]
-    #[ignore = "run in a headless sway by a_pane_in_copy_mode_survives_resizes"]
-    fn copy_mode_resized_in_sway() {
+    /// The application in the headless sway, with `config` as its
+    /// configuration file, and its first window.
+    fn app_in_sway(config: &str) -> (std::rc::Rc<super::App>, std::rc::Rc<super::Window>) {
         use std::cell::RefCell;
         use std::rc::Rc;
 
         use adw::prelude::*;
         use gtk::gio;
 
-        use super::{App, Command, PaneId, Window};
-        use crate::headless::wait_until;
+        use super::App;
 
         // The headless sway's child has an empty configuration directory.
         let dir = std::path::PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").expect("a configuration directory"));
         std::fs::create_dir_all(dir.join("tapust")).unwrap();
-        std::fs::write(dir.join("tapust/config"), "command = exec sleep 600\n").unwrap();
+        std::fs::write(dir.join("tapust/config"), config).unwrap();
         crate::font::register_embedded_fonts().unwrap();
         let application =
             adw::Application::builder().application_id("dev.tapust.test").flags(gio::ApplicationFlags::NON_UNIQUE).build();
@@ -3140,9 +3139,18 @@ mod tests {
         application.connect_activate(move |application| *slot.borrow_mut() = Some(App::build(application, None)));
         application.activate();
         let app = built.borrow().clone().expect("the application built");
-        wait_until("a window", || !app.windows().is_empty());
-        let win: Rc<Window> = app.windows()[0].clone();
+        crate::headless::wait_until("a window", || !app.windows().is_empty());
+        let win = app.windows()[0].clone();
+        (app, win)
+    }
 
+    #[test]
+    #[ignore = "run in a headless sway by a_pane_in_copy_mode_survives_resizes"]
+    fn copy_mode_resized_in_sway() {
+        use super::{Command, PaneId, Window};
+        use crate::headless::wait_until;
+
+        let (_app, win) = app_in_sway("command = exec sleep 600\n");
         let active = |win: &Window| -> PaneId { win.state.borrow().session.active_pane() };
         let cols = |win: &Window, pane: PaneId| -> Option<u16> {
             let st = win.state.borrow();
@@ -3162,6 +3170,42 @@ mod tests {
             wait_until(what, || cols(&win, pane) != width);
             width = cols(&win, pane);
             assert!(surface.in_copy_mode(), "{what}: the pane left copy mode");
+        }
+    }
+
+    /// previous_tab and next_tab select the tab before and after, wrapping
+    /// around as ghostty's do, and the window's session follows; with one
+    /// tab they do nothing, so that a performable binding's key goes on.
+    #[test]
+    #[cfg_attr(not(feature = "external-tests"), ignore = "runs sway and /bin/sh")]
+    fn previous_and_next_tab_wrap_around() {
+        crate::headless::run("gui::tests::tabs_switched_in_sway");
+    }
+
+    #[test]
+    #[ignore = "run in a headless sway by previous_and_next_tab_wrap_around"]
+    fn tabs_switched_in_sway() {
+        use super::{Binding, Command, NewAt};
+        use crate::headless::wait_until;
+
+        let (_app, win) = app_in_sway("command = exec sleep 600\n");
+        let active = || win.state.borrow().session.active_pane();
+        let tab = || win.tab_view.selected_page().map(|page| win.tab_view.page_position(&page));
+        let first = active();
+        assert!(!win.perform(first, Binding::Tab { next: true }));
+        assert!(!win.perform(first, Binding::Tab { next: false }));
+
+        let mut panes = vec![first];
+        for n in 2..=3 {
+            win.command(Command::NewWindow { cwd_of_active: false, at: NewAt::AfterLast });
+            wait_until("the new tab", || win.tab_view.n_pages() == n);
+            panes.push(active());
+        }
+        assert_eq!(tab(), Some(2));
+        for (next, position) in [(true, 0), (true, 1), (false, 0), (false, 2), (false, 1)] {
+            assert!(win.perform(active(), Binding::Tab { next }));
+            assert_eq!(tab(), Some(position), "next: {next}");
+            assert_eq!(active(), panes[position as usize], "the session's window, next: {next}");
         }
     }
 
