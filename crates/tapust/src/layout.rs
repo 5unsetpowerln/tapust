@@ -226,3 +226,80 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Vec<u8>> {
     }
     Some(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pane(dir: &str) -> Tree {
+        Tree::Pane(Some(PathBuf::from(dir)))
+    }
+
+    fn split(horizontal: bool, ratio: f64, first: Tree, second: Tree) -> Tree {
+        Tree::Split { horizontal, ratio, first: Box::new(first), second: Box::new(second) }
+    }
+
+    #[test]
+    fn layouts_are_read_back_as_written() {
+        let layout = Layout {
+            windows: vec![
+                vec![
+                    split(true, 0.25, pane("/home/me/src"), split(false, 0.333251953125, pane("/tmp"), Tree::Pane(None))),
+                    pane("/home/me/a b"),
+                ],
+                vec![pane("/odd/100%\ndir")],
+            ],
+        };
+        let bytes = layout.to_bytes();
+        let text = "tapust-layout 1\nwindow\ntab\nsplit horizontal 0.25\npane /home/me/src\n\
+                    split vertical 0.333251953125\npane /tmp\npane\ntab\npane /home/me/a b\n\
+                    window\ntab\npane /odd/100%25%0Adir\n";
+        assert_eq!(String::from_utf8(bytes.clone()).unwrap(), text);
+        assert_eq!(Layout::parse(&bytes), Ok(layout));
+    }
+
+    #[test]
+    fn bad_layouts_say_where() {
+        let parse = |text: &str| Layout::parse(text.as_bytes());
+        assert_eq!(parse("tapust-layout 2\nwindow\ntab\npane\n"), Err("not a tapust layout file".to_owned()));
+        assert_eq!(parse("tapust-layout 1\n"), Err("the layout has no window".to_owned()));
+        assert_eq!(parse("tapust-layout 1\ntab\npane\n"), Err("line 2: a window was expected".to_owned()));
+        assert_eq!(parse("tapust-layout 1\nwindow\nwindow\n"), Err("line 2: the window has no tab".to_owned()));
+        assert_eq!(parse("tapust-layout 1\nwindow\ntab\nsplit diagonal 0.5\n").unwrap_err(), "line 4: a split is horizontal or vertical");
+        assert_eq!(
+            parse("tapust-layout 1\nwindow\ntab\nsplit vertical 1.5\npane\npane\n").unwrap_err(),
+            "line 4: a split's ratio is a number from 0 to 1"
+        );
+        assert_eq!(parse("tapust-layout 1\nwindow\ntab\nsplit vertical 0.5\npane\n").unwrap_err(), "the layout ends in a tab's tree");
+        assert_eq!(parse("tapust-layout 1\nwindow\ntab\nwindow\n").unwrap_err(), "line 4: a pane or split was expected");
+        assert_eq!(parse("tapust-layout 1\nwindow\ntab\npane /a%2\n").unwrap_err(), "line 4: a bad % escape in the directory");
+    }
+
+    /// A tab's tree goes to mux with its leaves numbered in order and back
+    /// with the directories of the panes mux made.
+    #[test]
+    fn trees_go_to_mux_and_back() {
+        let tree = split(false, 0.5, pane("/a"), split(true, 0.75, Tree::Pane(None), pane("/c")));
+        let mut dirs = vec![Some(PathBuf::from("/before"))];
+        let node = tree.to_node(&mut dirs);
+        let leaf = Node::Leaf;
+        let mux_split = |horizontal, ratio, first, second| Node::Split(Box::new(Split { horizontal, ratio, first, second }));
+        assert_eq!(node, mux_split(false, 0.5, leaf(1), mux_split(true, 0.75, leaf(2), leaf(3))));
+        assert_eq!(dirs, [Some("/before".into()), Some("/a".into()), None, Some("/c".into())]);
+        let back = Tree::of(&node, &|pane| dirs[pane as usize].clone());
+        assert_eq!(back, tree);
+    }
+
+    #[test]
+    fn layouts_are_written_whole() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-layout-write");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("layout");
+        let layout = Layout { windows: vec![vec![pane("/x")]] };
+        layout.write(&file).unwrap();
+        assert_eq!(Layout::read(&file), Ok(layout));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temporary file is left");
+        assert!(Layout::read(&dir.join("missing")).unwrap_err().starts_with("cannot read "));
+    }
+}

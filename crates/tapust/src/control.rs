@@ -108,3 +108,43 @@ fn request(socket: &Path, file: &Path) -> Result<(), String> {
         reply => Err(reply.strip_prefix("error ").unwrap_or("tapust did not answer").to_owned()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A client's request reaches `serve` with the path it named, and the
+    /// reply, success or the reason of a failure, comes back.
+    #[test]
+    fn requests_are_answered() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-control");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("s.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let asked = std::cell::RefCell::new(Vec::new());
+            for result in [Ok(()), Err("disk full\nreally".to_owned())] {
+                let (stream, _) = listener.accept().unwrap();
+                serve(&stream, &|path: &Path| {
+                    asked.borrow_mut().push(path.to_owned());
+                    result.clone()
+                });
+            }
+            asked.into_inner()
+        });
+        let file = Path::new("/home/me/100% sure\nlayout");
+        assert_eq!(request(&socket, file), Ok(()));
+        assert_eq!(request(&socket, Path::new("/x")), Err("disk full really".to_owned()));
+        assert_eq!(server.join().unwrap(), [file.to_owned(), PathBuf::from("/x")]);
+        assert!(request(&dir.join("none.sock"), file).unwrap_err().starts_with("cannot reach tapust at "));
+    }
+
+    #[test]
+    fn requests_name_an_absolute_path() {
+        assert_eq!(parse_request(b"save-layout /a%25b\n"), Some(PathBuf::from("/a%b")));
+        assert_eq!(parse_request(b"save-layout a\n"), None);
+        assert_eq!(parse_request(b"save-layout /a"), None);
+        assert_eq!(parse_request(b"load-layout /a\n"), None);
+    }
+}

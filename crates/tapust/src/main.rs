@@ -107,3 +107,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     application.run_with_args::<&str>(&[]);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, parse_args};
+
+    fn parse(args: &[&str]) -> Option<Cli> {
+        parse_args(&args.iter().map(Into::into).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn command_lines() {
+        assert_eq!(parse(&[]), Some(Cli::Run { command: None, layout: None }));
+        assert_eq!(parse(&["-e", "vim", "-R"]), Some(Cli::Run { command: Some(vec!["vim".into(), "-R".into()]), layout: None }));
+        assert_eq!(parse(&["--load-layout", "f"]), Some(Cli::Run { command: None, layout: Some("f".into()) }));
+        assert_eq!(parse(&["--save-layout", "f"]), Some(Cli::SaveLayout("f".into())));
+        for bad in [&["-e"][..], &["--load-layout"], &["--save-layout"], &["--load-layout", "f", "-e", "sh"], &["-x"]] {
+            assert_eq!(parse(bad), None, "{bad:?}");
+        }
+    }
+}

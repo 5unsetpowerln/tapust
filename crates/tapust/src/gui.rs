@@ -3170,7 +3170,10 @@ mod tests {
 
     /// The application in the headless sway, with `config` as its
     /// configuration file, and its first window.
-    fn app_in_sway(config: &str) -> (std::rc::Rc<super::App>, std::rc::Rc<super::Window>) {
+    fn app_in_sway(
+        config: &str,
+        layout: Option<crate::layout::Layout>,
+    ) -> (std::rc::Rc<super::App>, std::rc::Rc<super::Window>) {
         use std::cell::RefCell;
         use std::rc::Rc;
 
@@ -3189,7 +3192,7 @@ mod tests {
         application.register(None::<&gio::Cancellable>).expect("the application registered");
         let built: Rc<RefCell<Option<Rc<App>>>> = Rc::default();
         let slot = built.clone();
-        application.connect_activate(move |application| *slot.borrow_mut() = Some(App::build(application, None, None)));
+        application.connect_activate(move |application| *slot.borrow_mut() = Some(App::build(application, None, layout.clone())));
         application.activate();
         let app = built.borrow().clone().expect("the application built");
         crate::headless::wait_until("a window", || !app.windows().is_empty());
@@ -3203,7 +3206,7 @@ mod tests {
         use super::{Command, PaneId, Window};
         use crate::headless::wait_until;
 
-        let (_app, win) = app_in_sway("command = exec sleep 600\n");
+        let (_app, win) = app_in_sway("command = exec sleep 600\n", None);
         let active = |win: &Window| -> PaneId { win.state.borrow().session.active_pane() };
         let cols = |win: &Window, pane: PaneId| -> Option<u16> {
             let st = win.state.borrow();
@@ -3226,6 +3229,58 @@ mod tests {
         }
     }
 
+    /// A layout's windows, tabs, splits and directories are restored: the
+    /// application reports the layout it was given, first from the
+    /// directories the panes start in and, once every tab was shown, from
+    /// where their programs run.
+    #[test]
+    #[cfg_attr(not(feature = "external-tests"), ignore = "runs sway and /bin/sh")]
+    fn a_layout_is_restored() {
+        crate::headless::run("gui::tests::layout_restored_in_sway");
+    }
+
+    #[test]
+    #[ignore = "run in a headless sway by a_layout_is_restored"]
+    fn layout_restored_in_sway() {
+        use crate::headless::wait_until;
+        use crate::layout::{Layout, Tree};
+
+        let config_home = std::path::PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").expect("a configuration directory"));
+        let dirs = config_home.parent().expect("the test's directory").join("dirs");
+        let dir = |name: &str| {
+            let dir = dirs.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            Tree::Pane(Some(dir))
+        };
+        let split = |horizontal, ratio, first, second| Tree::Split {
+            horizontal,
+            ratio,
+            first: Box::new(first),
+            second: Box::new(second),
+        };
+        let layout = Layout {
+            windows: vec![
+                vec![split(true, 0.25, dir("a"), split(false, 0.75, dir("b"), dir("c d"))), dir("e")],
+                vec![dir("f")],
+            ],
+        };
+        let (app, _) = app_in_sway("command = exec sleep 600\n", Some(layout.clone()));
+        assert_eq!(app.layout(), layout);
+
+        let windows = app.windows();
+        assert_eq!(windows.len(), 2);
+        for win in &windows {
+            for i in 0..win.tab_view.n_pages() {
+                win.tab_view.set_selected_page(&win.tab_view.nth_page(i));
+                let started = || win.state.borrow().session.windows()[i as usize].panes.iter().all(|p| {
+                    win.state.borrow().panes.get(&p.pane).is_some_and(|pane| pane.io.is_some())
+                });
+                wait_until("the tab's programs", started);
+            }
+        }
+        wait_until("the programs in their directories", || app.layout() == layout);
+    }
+
     /// previous_tab and next_tab select the tab before and after, wrapping
     /// around as ghostty's do, and the window's session follows; with one
     /// tab they do nothing, so that a performable binding's key goes on.
@@ -3241,7 +3296,7 @@ mod tests {
         use super::{Binding, Command, NewAt};
         use crate::headless::wait_until;
 
-        let (_app, win) = app_in_sway("command = exec sleep 600\n");
+        let (_app, win) = app_in_sway("command = exec sleep 600\n", None);
         let active = || win.state.borrow().session.active_pane();
         let tab = || win.tab_view.selected_page().map(|page| win.tab_view.page_position(&page));
         let first = active();
