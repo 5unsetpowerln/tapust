@@ -207,6 +207,12 @@ impl Pty {
         for var in OTHER_TERMINALS {
             command.env_remove(var);
         }
+        // `tapust --save-layout` in the pane asks this tapust, not the one
+        // tapust may have been started from.
+        match crate::control::path() {
+            Some(socket) => command.env(crate::control::ENV, socket),
+            None => command.env_remove(crate::control::ENV),
+        };
         // GTK programs started in the pane get the variables tapust found.
         for (name, found) in FOUND.lock().iter() {
             match found {

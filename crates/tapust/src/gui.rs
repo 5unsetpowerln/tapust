@@ -27,7 +27,9 @@ use crate::config::{
     TabsLocation, Theme, TitlebarStyle, WindowTheme, WorkingDirectory,
 };
 use crate::font;
+use crate::control;
 use crate::input;
+use crate::layout::{Layout, Tree};
 use crate::notifications;
 use crate::palette::{self, Run};
 use crate::pty::{ChildExit, PaneIo, Program, Pty};
@@ -90,6 +92,8 @@ pub struct App {
     windows: RefCell<Vec<Rc<Window>>>,
     /// The window showing each pane, which gets the pane's events.
     owners: RefCell<HashMap<PaneId, Weak<Window>>>,
+    /// The directories of a restored layout's panes, which they start in.
+    restored_cwds: RefCell<HashMap<PaneId, PathBuf>>,
     /// Surface events waiting for the one being handled, or for their
     /// window's state to be free, in the order they came (see `handle`).
     deferred: RefCell<VecDeque<(PaneId, Event)>>,
@@ -544,7 +548,8 @@ fn first_scale() -> f64 {
 }
 
 impl App {
-    pub fn build(application: &adw::Application, command: Option<Vec<OsString>>) -> Rc<App> {
+    /// The application with its first window, or the windows of `layout`.
+    pub fn build(application: &adw::Application, command: Option<Vec<OsString>>, layout: Option<Layout>) -> Rc<App> {
         let display = gdk::Display::default().expect("display");
         let css = gtk::CssProvider::new();
         gtk::style_context_add_provider_for_display(&display, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -553,6 +558,7 @@ impl App {
             server: Server::new(),
             windows: RefCell::new(Vec::new()),
             owners: RefCell::new(HashMap::new()),
+            restored_cwds: RefCell::new(HashMap::new()),
             deferred: RefCell::new(VecDeque::new()),
             handling: Cell::new(false),
             idle_scheduled: Cell::new(false),
@@ -581,7 +587,17 @@ impl App {
         *app.stylesheet.borrow_mut() = Stylesheet::follow(&display, &app.application.style_manager());
         app.add_actions();
         app.follow_style();
-        app.new_window(None);
+        // Listening before the first pane starts, which gets the socket.
+        let weak = Rc::downgrade(&app);
+        let save = move |path: &Path| weak.upgrade().ok_or("tapust is ending")?.layout().write(path);
+        if let Err(err) = control::listen(save) {
+            eprintln!("tapust: {err}");
+        }
+        application.connect_shutdown(|_| control::remove());
+        match layout {
+            Some(layout) => app.restore(&layout),
+            None => app.new_window(None),
+        }
         // ghostty shows the errors of the configuration it starts with on
         // their own, not knowing whether a window will come.
         app.show_errors(&diagnostics);
@@ -802,6 +818,40 @@ impl App {
     /// takes the directory and font size of `parent`.
     fn new_window(self: &Rc<Self>, parent: Option<PaneId>) {
         let (session, effects) = Session::new(&self.server, parent);
+        self.show_session(session, effects);
+    }
+
+    /// A window for each of `layout`'s, with its tabs and splits, whose
+    /// panes start in their directories.
+    fn restore(self: &Rc<Self>, layout: &Layout) {
+        for tabs in &layout.windows {
+            let mut dirs = Vec::new();
+            let trees: Vec<Node> = tabs.iter().map(|tree| tree.to_node(&mut dirs)).collect();
+            let (session, effects, panes) = Session::restore(&self.server, &trees);
+            let known = panes.into_iter().zip(dirs).filter_map(|(pane, dir)| Some((pane, dir?)));
+            self.restored_cwds.borrow_mut().extend(known);
+            self.show_session(session, effects);
+        }
+    }
+
+    /// The windows, tabs and splits, with each pane's directory: its
+    /// foreground process's, which a split would start in, or the one it
+    /// starts in when its program has not started (a tab not shown yet).
+    pub fn layout(&self) -> Layout {
+        let windows = self.windows().into_iter().map(|window| {
+            let st = window.state.borrow();
+            let cwd = |pane| {
+                let p = st.panes.get(&pane)?;
+                p.io.as_ref().and_then(|io| io.cwd()).or_else(|| Some(p.cwd.clone()))
+            };
+            let tabs = st.session.windows().into_iter();
+            tabs.filter_map(|w| Some(Tree::of(st.session.tree(w.index)?.0, &cwd))).collect::<Vec<_>>()
+        });
+        Layout { windows: windows.filter(|tabs| !tabs.is_empty()).collect() }
+    }
+
+    /// A window showing `session`, whose effects start its panes.
+    fn show_session(self: &Rc<Self>, session: Session, effects: Vec<Effect>) {
         let window = self.add_window(session);
         window.apply(effects);
         window.reconcile();
@@ -2058,6 +2108,9 @@ impl Window {
             match effect {
                 Effect::Spawn { pane, parent, inherit_cwd } => {
                     let (points, cwd) = self.app.origin(parent, inherit_cwd);
+                    // A restored pane's directory, while it is still there.
+                    let restored = self.app.restored_cwds.borrow_mut().remove(&pane).filter(|dir| dir.is_dir());
+                    let cwd = restored.unwrap_or(cwd);
                     self.app.set_owner(pane, self);
                     let weak = Rc::downgrade(&self.app);
                     let handler: crate::surface::Handler =
@@ -3136,7 +3189,7 @@ mod tests {
         application.register(None::<&gio::Cancellable>).expect("the application registered");
         let built: Rc<RefCell<Option<Rc<App>>>> = Rc::default();
         let slot = built.clone();
-        application.connect_activate(move |application| *slot.borrow_mut() = Some(App::build(application, None)));
+        application.connect_activate(move |application| *slot.borrow_mut() = Some(App::build(application, None, None)));
         application.activate();
         let app = built.borrow().clone().expect("the application built");
         crate::headless::wait_until("a window", || !app.windows().is_empty());
