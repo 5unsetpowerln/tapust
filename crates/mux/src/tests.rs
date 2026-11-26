@@ -1444,3 +1444,26 @@ fn the_copy_keys_send_the_copy_action() {
         }
     }
 }
+
+/// A saved layout's split trees become windows with new panes in the
+/// trees' order, each started from outside; the first window is current.
+#[test]
+fn restore_makes_windows_of_split_trees() {
+    let server = Server::new();
+    // Panes the server already numbered are not reused.
+    let (_other, _) = Session::new(&server, None);
+    let split = |horizontal, ratio, first, second| Node::Split(Box::new(Split { horizontal, ratio, first, second }));
+    let tree = split(true, 0.25, Node::Leaf(7), split(false, 0.75, Node::Leaf(7), Node::Leaf(0)));
+    let (s, effects, panes) = Session::restore(&server, &[tree, Node::Leaf(0)]);
+
+    assert_eq!(panes, [1, 2, 3, 4]);
+    let restored = split(true, 0.25, Node::Leaf(1), split(false, 0.75, Node::Leaf(2), Node::Leaf(3)));
+    assert_eq!(s.tree(0), Some((&restored, None, 1)));
+    assert_eq!(s.tree(1), Some((&Node::Leaf(4), None, 4)));
+    let spawns: Vec<Effect> =
+        panes.iter().map(|&pane| Effect::Spawn { pane, parent: None, inherit_cwd: false }).collect();
+    assert_eq!(effects, spawns);
+    let windows = s.windows();
+    assert_eq!(windows.iter().map(|w| (w.index, w.active)).collect::<Vec<_>>(), [(0, true), (1, false)]);
+    assert_eq!(s.active_pane(), 1);
+}
